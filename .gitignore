@@ -1,0 +1,5 @@
+# Ignore the main environment file
+.env
+.env.*
+models
+sessions
