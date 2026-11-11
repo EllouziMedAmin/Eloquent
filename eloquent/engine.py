@@ -26,6 +26,7 @@ import numpy as np
 
 from .cleaner import Cleaner
 from .llm import make_provider
+from .llm.prompts import build_format_instruction
 from .session import Session
 from .speech import (SAMPLE_RATE, WINDOW, build_recognizer, build_vad, ensure_asr_model,
                      ensure_vad_model, read_wav_16k, transcribe)
@@ -284,3 +285,63 @@ class Engine:
         d = str(self.session.dir)
         self._set_status("idle")
         self._emit("session_ended", {"dir": d})
+
+    # ------------------------------------------------------------------ #
+    # post-session document generation
+    # ------------------------------------------------------------------ #
+    def generate_report(self, format_id: str, custom_prompt: str = "", blocking: bool = False):
+        """Format or summarize the current transcript with the LLM and save to the session folder."""
+        text = self.state.full_text(raw=False).strip()
+        if not text:
+            self.state.set_report({
+                "format_id": format_id, "label": "No transcript",
+                "status": "error", "text": "", "file": "",
+                "error": "No transcript text to format yet.",
+            })
+            return False
+
+        provider = self.provider
+        if provider is None:
+            provider, reason = make_provider(self.settings, force=True)
+            if provider is None:
+                self.state.set_report({
+                    "format_id": format_id, "label": "LLM unavailable",
+                    "status": "error", "text": "", "file": "", "error": reason,
+                })
+                return False
+
+        label, filename, instruction = build_format_instruction(format_id, custom_prompt)
+        self.state.set_report({
+            "format_id": format_id, "label": label,
+            "status": "generating", "text": "", "file": "", "error": "",
+        })
+        self.log(f"Generating {label}...")
+
+        def work():
+            try:
+                out = provider.generate(instruction, text)
+                if not out:
+                    raise RuntimeError("Empty response from LLM")
+                out_path = ""
+                if self.last_session_dir:
+                    p = Path(self.last_session_dir) / filename
+                    p.write_text(out + "\n", encoding="utf-8")
+                    out_path = str(p)
+                self.state.set_report({
+                    "format_id": format_id, "label": label,
+                    "status": "done", "text": out, "file": out_path, "error": "",
+                })
+                self.log(f"{label} saved to {out_path}" if out_path else f"{label} ready")
+            except Exception as e:
+                msg = f"{type(e).__name__}: {str(e)[:180]}"
+                self.state.set_report({
+                    "format_id": format_id, "label": label,
+                    "status": "error", "text": "", "file": "", "error": msg,
+                })
+                self.log(f"Could not generate {label}: {msg}", "error")
+
+        if blocking:
+            work()
+        else:
+            threading.Thread(target=work, daemon=True, name="eloquent-report").start()
+        return True

@@ -15,13 +15,18 @@ import sys
 
 from . import APP_NAME, __version__
 from .config import SETTINGS_FILE, Settings
+from .llm.prompts import REPORT_FORMATS
 
 
 def build_parser(s: Settings) -> argparse.ArgumentParser:
+    fmt_ids = [f["id"] for f in REPORT_FORMATS]
     p = argparse.ArgumentParser(prog="eloquent", description=f"{APP_NAME} {__version__} - live transcription on CPU")
     p.add_argument("--ui", choices=["widget", "terminal", "web"], default=None,
                    help=f"interface (default from settings: {s.ui})")
     p.add_argument("--input", metavar="WAV", help="transcribe a WAV file instead of the microphone")
+    p.add_argument("--format", choices=fmt_ids, default=None,
+                   help="generate a formatted document at the end of the session (summary, bullets, meeting, lecture, report, article)")
+    p.add_argument("--prompt", default="", help="custom LLM instruction to run at the end of the session")
     p.add_argument("--no-start", action="store_true", help="terminal/web: wait for Space / Start instead of recording at once")
     audio = p.add_mutually_exclusive_group()
     audio.add_argument("--save-audio", dest="save_audio", action="store_true", default=None,
@@ -96,7 +101,9 @@ def main(argv=None):
         return 0
 
     from .ui.terminal import run_terminal
-    run_terminal(engine, wav_path=args.input, auto_start=not args.no_start)
+    run_terminal(engine, wav_path=args.input, auto_start=not args.no_start,
+                 auto_format=args.format or ("custom" if args.prompt else None),
+                 custom_prompt=args.prompt)
     return 0
 
 

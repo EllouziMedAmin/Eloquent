@@ -28,6 +28,7 @@ class State:
             self.loose = []        # finalized sentences not yet in a paragraph: {"t","ts","text"}
             self.partial = ""
             self.error = ""
+            self.report = None     # {"format_id","label","status","text","file","error"}
             self.next_id = 1
             self.rev += 1
         if notify:
@@ -65,12 +66,19 @@ class State:
             self.rev += 1
         self.emit("error", err)
 
+    def set_report(self, report: dict):
+        with self.lock:
+            self.report = dict(report) if report else None
+            self.rev += 1
+        self.emit("report", self.report)
+
     # -- readers ----------------------------------------------------------
     def _build(self) -> dict:
         return {
             "rev": self.rev,
             "partial": self.partial,
             "error": self.error,
+            "report": dict(self.report) if self.report else None,
             "loose": [{"t": x["t"], "text": x["text"]} for x in self.loose],
             "paragraphs": [
                 {"id": p["id"], "time": p["time"], "raw": p["raw"], "tokens": p["tokens"],
