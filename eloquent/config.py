@@ -38,6 +38,7 @@ class Settings:
     min_similarity: float = 0.5
     # --- speech ---
     threads: int = 0                  # 0 = auto
+    diarize: bool = True              # background multi-speaker identification (Speaker 1, 2, ...)
     device: Optional[int] = None      # None = system default microphone
     silence: float = 0.5
     max_utterance: float = 15.0
@@ -78,7 +79,11 @@ class Settings:
 
     # ------------------------------------------------------------------ #
     def resolved_threads(self) -> int:
-        return self.threads if self.threads and self.threads > 0 else default_threads()
+        if self.threads and self.threads > 0:
+            return self.threads
+        th = default_threads()
+        # Reserve 1 core for background diarization so Parakeet never suffers thread contention
+        return max(2, th - 1) if self.diarize and th >= 4 else th
 
     def resolved_sessions_dir(self) -> Path:
         return Path(self.sessions_dir) if self.sessions_dir else ROOT / "sessions"

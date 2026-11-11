@@ -25,11 +25,12 @@ from pathlib import Path
 import numpy as np
 
 from .cleaner import Cleaner
+from .diarizer import Diarizer, build_speaker_extractor, ensure_speaker_model
 from .llm import make_provider
 from .llm.prompts import build_format_instruction
 from .session import Session
 from .speech import (SAMPLE_RATE, WINDOW, build_recognizer, build_vad, ensure_asr_model,
-                     ensure_vad_model, read_wav_16k, transcribe)
+                     ensure_vad_model, read_wav_16k, transcribe, transcribe_detailed)
 from .state import State, fmt_time
 
 
@@ -45,7 +46,10 @@ class Engine:
         self.last_session_dir = None
         self.recognizer = None
         self.vad_path = None
+        self.extractor = None
+        self.diarizer = None
         self.provider = None
+        self._diar_lock = threading.Lock()
         self._provider_key = None
         self._listeners = []
         self._stop = threading.Event()
@@ -95,8 +99,27 @@ class Engine:
         self.recognizer = build_recognizer(model_dir, threads)
         self._loaded = True
         self.log(f"Speech model ready in {time.time() - t0:.1f}s")
+        if s.diarize:
+            self._load_speaker_extractor(models)
         self.refresh_provider()
         self._set_status("idle")
+
+    def _load_speaker_extractor(self, models_dir: Path = None):
+        with self._diar_lock:
+            if self.extractor is not None:
+                return
+            try:
+                mdir = models_dir or self.settings.resolved_models_dir()
+                spk_path = ensure_speaker_model(mdir, self.log)
+                self.extractor = build_speaker_extractor(spk_path, threads=1)
+                self.log("[diarize] Multi-speaker identification ready (1 background thread)")
+            except Exception as e:
+                self.log(f"[diarize] Disabled ({type(e).__name__}: {e})", "warn")
+
+    def sync_diarizer(self):
+        """Lazy-load speaker extractor in the background if diarization was toggled ON after startup."""
+        if self.settings.diarize and self._loaded and self.extractor is None:
+            threading.Thread(target=self._load_speaker_extractor, daemon=True, name="eloquent-diar-load").start()
 
     def refresh_provider(self, force: bool = False):
         """(Re)create the LLM provider when its settings changed. The key check runs in the background."""
@@ -144,6 +167,13 @@ class Engine:
         self.session = Session(s.resolved_sessions_dir(), save_audio=s.save_audio)
         self.last_session_dir = self.session.dir
         self.vad = build_vad(self.vad_path, s.vad_threshold, s.silence, s.max_utterance)
+        if s.diarize and self.extractor is None:
+            self._load_speaker_extractor()
+        self.diarizer = Diarizer(self.extractor, self.state, self.session, log=self.log) if (
+            s.diarize and self.extractor is not None
+        ) else None
+        if self.diarizer is not None:
+            self.diarizer.start()
         self.cleaner = Cleaner(self.state, self.session, self.provider, s, log=self.log)
         self.cleaner.start()
         # per-session pipeline state
@@ -256,13 +286,19 @@ class Engine:
             seg = np.asarray(vad.front.samples, dtype=np.float32)
             vad.pop()
             t1 = time.time()
-            text = transcribe(self.recognizer, seg)
+            text, words = transcribe_detailed(self.recognizer, seg)
             dur = len(seg) / SAMPLE_RATE
             decode = time.time() - t1
             if text:
-                stamp = fmt_time(self._samples / SAMPLE_RATE - dur)
+                t0 = max(0.0, self._samples / SAMPLE_RATE - dur)
+                stamp = fmt_time(t0)
                 self.session.add_raw(stamp, text)
-                self.state.add_segment(text, stamp, {"audio_sec": dur, "decode_sec": decode})
+                seg_id = self.state.add_segment(
+                    text, stamp, {"audio_sec": dur, "decode_sec": decode},
+                    start_sec=t0, spk_ready=(self.diarizer is None),
+                )
+                if self.diarizer is not None:
+                    self.diarizer.submit(seg_id, t0, stamp, seg, text, words)
             else:
                 self.state.set_partial("")
             self._buf.clear()
@@ -271,7 +307,7 @@ class Engine:
             self._last_partial = ""
 
     def _finish(self):
-        """Finish the sentence in progress, then the last paragraph, then close the files."""
+        """Finish the sentence in progress, then diarization & cleanup, then close the files."""
         self._set_status("stopping")
         self.level = 0.0
         try:
@@ -280,7 +316,12 @@ class Engine:
         except Exception as e:
             self.log(f"Flush error: {e}", "error")
         self.state.set_partial("")
+        if self.diarizer is not None:
+            self.diarizer.flush_and_wait()
         self.cleaner.flush_and_wait()
+        if self.diarizer is not None:
+            self.session.sync_from_state(self.state)
+        self.diarizer = None
         self.session.close()
         d = str(self.session.dir)
         self._set_status("idle")

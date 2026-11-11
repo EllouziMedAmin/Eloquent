@@ -219,6 +219,12 @@ class SettingsDialog(QDialog):
         self.audio.setChecked(s.save_audio)
         lay.addWidget(self.audio)
 
+        self.diarize = QCheckBox("Identify speakers (Speaker 1, Speaker 2, …)")
+        self.diarize.setChecked(s.diarize)
+        lay.addWidget(self.diarize)
+        lay.addWidget(_label("Labels speakers on 1 background thread so live caption speed is unaffected.",
+                             "hint", wrap=True))
+
         row = QHBoxLayout()
         self.folder = QLineEdit(str(s.resolved_sessions_dir()))
         browse = QPushButton("Browse…")
@@ -294,6 +300,7 @@ class SettingsDialog(QDialog):
         s.cleanup = self.cleanup.isChecked()
         s.keep_fillers = self.fillers.isChecked()
         s.save_audio = self.audio.isChecked()
+        s.diarize = self.diarize.isChecked()
         s.device = self.mic.currentData()
         s.hotkey = hk
         folder = self.folder.text().strip()

@@ -23,6 +23,7 @@ Optionally, a free **Gemini 3.1 Flash-Lite** API key polishes the transcript in 
 ## Highlights
 
 - **Fast on CPU, zero recognition lag:** Powered by NVIDIA **Parakeet TDT 0.6B v3 (INT8)** and **Silero VAD** via `sherpa-onnx`. Supports 25 European languages automatically.
+- **Multi-speaker diarization:** Identifies **Speaker 1, Speaker 2, …** on a low-priority background thread (`3D-Speaker CAM++`) with zero impact on live speech latency, including mid-turn speaker handoffs using Parakeet word timestamps.
 - **Background LLM proofreading:** Every few sentences, Gemini 3.1 Flash-Lite fixes misheard words, punctuation, and spoken fillers in a background thread without slowing down live captions. If offline or if the model rewrites too much, raw text is kept automatically.
 - **3 Interfaces, 1 Engine:**
   - **Floating Widget (`Eloquent.bat`, default):** Always-on-top compact pill with live audio meter, live captions, expandable transcript drawer (`⤢`), and global hotkeys.
@@ -100,6 +101,7 @@ python -m eloquent --ui terminal --save-audio      # terminal UI + save audio.wa
 python -m eloquent --ui web                        # browser UI at http://127.0.0.1:8765
 python -m eloquent --input lecture.wav --format lecture   # transcribe WAV & generate lecture_notes.md
 python -m eloquent --no-clean                      # raw ASR only, no LLM
+python -m eloquent --no-diarize                    # disable multi-speaker identification
 python -m eloquent --list-devices                  # list microphone indices
 ```
 
@@ -111,7 +113,7 @@ All sessions are saved to `sessions/<YYYY-MM-DD_HH-MM-SS>/` with `raw.txt`, `cle
 
 - [x] Shared low-latency engine + Widget, Terminal, and SSE Web UIs
 - [x] Post-session generation (Summary, Bullets, Meeting Minutes, Lecture Notes, Report, Memo, Custom Prompt)
-- [ ] Multi-speaker diarization (`Speaker 1`, `Speaker 2`, …)
+- [x] Multi-speaker diarization (`Speaker 1`, `Speaker 2`, …)
 - [ ] Local LLM backend (Ollama / LM Studio / `llama.cpp` OpenAI-compatible endpoints)
 - [ ] Standalone Windows installer (`.exe`)
 

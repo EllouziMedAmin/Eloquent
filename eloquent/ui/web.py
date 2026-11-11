@@ -32,6 +32,9 @@ main{max-width:860px;margin:0 auto;padding:20px 20px 120px}
 .para.cleaning p{color:var(--mut);font-style:italic}
 .para.cleaning .time::after{content:" - polishing...";color:var(--acc)}
 .para .note{display:block;font-size:12px;color:var(--warn);margin-top:4px}
+.spk{display:inline-block;font-size:11px;font-weight:600;padding:0 6px;border-radius:4px;margin-right:8px;background:rgba(128,128,128,.15)}
+.spk0{color:#2b6cb0}.spk1{color:#1f7a4c}.spk2{color:#a15c00}.spk3{color:#9d2d6b}.spk4{color:#6b46c1}.spk5{color:#c05621}
+@media (prefers-color-scheme: dark){.spk0{color:#7db4ff}.spk1{color:#6ee7b7}.spk2{color:#fbbf24}.spk3{color:#f472b6}.spk4{color:#c084fc}.spk5{color:#fb923c}}
 .fix{border-bottom:2px solid var(--fix)}
 .fresh .fix{animation:flash 3.5s ease-out}
 @keyframes flash{0%{background:var(--fix)}100%{background:transparent}}
@@ -63,9 +66,14 @@ main{max-width:860px;margin:0 auto;padding:20px 20px 120px}
 let state=null, showRaw=false; const seenDone=new Set();
 const $=id=>document.getElementById(id);
 function el(tag,cls,text){const e=document.createElement(tag); if(cls)e.className=cls; if(text!==undefined)e.textContent=text; return e;}
+function spkBadge(spk){if(!spk)return null;const n=parseInt((spk.split(' ').pop())||'1',10)||1;return el('span','spk spk'+((n-1)%6),spk);}
 function allText(s){
-  const out=s.paragraphs.map(p=>p.tokens?p.tokens.map(t=>t[0]).join(' '):p.raw);
-  if(s.loose.length) out.push(s.loose.map(l=>l.text).join(' ')); return out.join('\n\n');
+  const out=s.paragraphs.map(p=>{
+    const txt=(p.tokens&&!showRaw)?p.tokens.map(t=>t[0]).join(' '):p.raw;
+    return (s.multi_speaker&&p.speaker)?(p.speaker+': '+txt):txt;
+  });
+  if(s.loose.length) out.push(s.loose.map(l=>(s.multi_speaker&&l.speaker)?(l.speaker+': '+l.text):l.text).join(' '));
+  return out.join('\n\n');
 }
 function render(s){
   const nearBottom=window.innerHeight+window.scrollY>=document.body.offsetHeight-120;
@@ -78,7 +86,10 @@ function render(s){
   }
   for(const p of s.paragraphs){
     const d=el('div','para '+p.status);
-    d.append(el('span','time',p.time));
+    const meta=el('span','time');
+    if(s.multi_speaker&&p.speaker){const b=spkBadge(p.speaker); if(b)meta.append(b);}
+    meta.append(document.createTextNode(p.time));
+    d.append(meta);
     const body=el('p');
     if(p.tokens && !showRaw){
       const fresh=!seenDone.has(p.id); if(fresh){d.classList.add('fresh'); seenDone.add(p.id);}
@@ -88,7 +99,12 @@ function render(s){
     if(p.note) d.append(el('span','note',p.note));
     box.append(d);
   }
-  for(const l of s.loose){const d=el('div','loose'); d.append(el('span','time',l.t), document.createTextNode(l.text)); box.append(d);}
+  for(const l of s.loose){
+    const d=el('div','loose');
+    if(s.multi_speaker&&l.speaker){const b=spkBadge(l.speaker); if(b)d.append(b);}
+    d.append(el('span','time',l.t), document.createTextNode(l.text));
+    box.append(d);
+  }
   if(s.partial) box.append(el('div','partial','... '+s.partial));
   $('err').textContent=s.error?('LLM: '+s.error):'';
   $('dot').className='dot '+s.status; $('status').textContent=s.status;
