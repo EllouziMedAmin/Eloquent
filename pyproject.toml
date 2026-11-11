@@ -20,6 +20,10 @@ dependencies = [
     "PySide6-Essentials>=6.6",
 ]
 
+[project.urls]
+Homepage = "https://axbuilt.net"
+Repository = "https://github.com/EllouziMedAmin/Eloquent"
+
 [project.scripts]
 eloquent = "eloquent.__main__:main"
 

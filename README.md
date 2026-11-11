@@ -8,6 +8,7 @@
 [![Platform: Windows](https://img.shields.io/badge/Platform-Windows%2010%2F11-0078d4.svg)]()
 [![Python: 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue.svg)]()
 [![ASR: Parakeet TDT 0.6B v3 INT8](https://img.shields.io/badge/ASR-Parakeet%200.6B%20v3%20INT8%20(CPU)-76b900.svg)]()
+[![Built by axbuilt.net](https://img.shields.io/badge/Built%20by-axbuilt.net-0d1b2a.svg)](https://axbuilt.net)
 
 **Open-source live speech-to-text for Windows that runs fast on an ordinary CPU.**
 Built for **meetings, classes, lectures, interviews, calls, and voice notes**. Speech recognition runs **100% locally on your CPU** (no GPU required, audio never leaves your PC).
@@ -43,8 +44,8 @@ Optionally, a free **Gemini 3.1 Flash-Lite** API key polishes the transcript in 
 Requirements: **Windows 10/11** and **Python 3.10+** ([download](https://www.python.org/downloads/), tick *"Add python.exe to PATH"*). No GPU needed.
 
 ```bat
-git clone https://github.com/<your-username>/eloquent.git
-cd eloquent
+git clone https://github.com/EllouziMedAmin/Eloquent.git
+cd Eloquent
 setup.bat
 ```
 
@@ -118,6 +119,7 @@ All sessions are saved to `sessions/<YYYY-MM-DD_HH-MM-SS>/` with `raw.txt`, `cle
 
 ## License & Credits
 
+- **Built by:** [axbuilt.net](https://axbuilt.net) · [GitHub](https://github.com/EllouziMedAmin/Eloquent)
 - **Code:** [MIT License](LICENSE)
 - **ASR Model:** [NVIDIA Parakeet TDT 0.6B v3](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3) (CC-BY-4.0), INT8 ONNX export via [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx)
 - **VAD:** [Silero VAD](https://github.com/snakers4/silero-vad)
