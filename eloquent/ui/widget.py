@@ -30,12 +30,13 @@ if sys.platform == "win32":
 from PySide6.QtCore import QObject, QPoint, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QAction, QColor, QDesktopServices, QFont, QGuiApplication, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
-                               QFormLayout, QFrame, QHBoxLayout, QLabel, QLineEdit, QMenu, QMessageBox,
-                               QPushButton, QSizeGrip, QSystemTrayIcon, QTextBrowser, QToolButton, QVBoxLayout,
-                               QWidget)
+                               QFormLayout, QFrame, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QMenu,
+                               QMessageBox, QPushButton, QSizeGrip, QSystemTrayIcon, QTextBrowser, QToolButton,
+                               QVBoxLayout, QWidget)
 
 from .. import APP_NAME, __version__
 from ..config import SETTINGS_FILE, config_dir
+from ..llm.prompts import REPORT_FORMATS
 
 WM_HOTKEY = 0x0312
 HOTKEY_ID = 1
@@ -280,6 +281,7 @@ class EloquentWidget(QWidget):
         super().__init__()
         self.engine, self.s = engine, settings
         self.show_raw = False
+        self.view_mode = "transcript"
         self.dirty = True
         self.drag_offset = None
         self.quitting = False
@@ -354,19 +356,32 @@ class EloquentWidget(QWidget):
         bottom = QHBoxLayout()
         self.chk_raw = QCheckBox("show raw")
         self.chk_raw.toggled.connect(self._set_raw)
+        self.btn_back = QPushButton("← Transcript")
+        self.btn_back.clicked.connect(self._switch_view)
+        self.btn_back.hide()
         self.lbl_llm = QLabel(objectName="llm")
+        self.btn_gen = QPushButton("Generate ▾")
+        self.btn_gen.clicked.connect(self._show_gen_menu)
         btn_copy = QPushButton("Copy")
         btn_copy.clicked.connect(self._copy)
         btn_folder = QPushButton("Open folder")
         btn_folder.clicked.connect(self._open_folder)
         bottom.addWidget(self.chk_raw)
+        bottom.addWidget(self.btn_back)
         bottom.addWidget(self.lbl_llm, 1)
+        bottom.addWidget(self.btn_gen)
         bottom.addWidget(btn_copy)
         bottom.addWidget(btn_folder)
         bottom.addWidget(QSizeGrip(self), 0, Qt.AlignBottom | Qt.AlignRight)
         pv.addLayout(bottom)
         self.panel.hide()
         v.addWidget(self.panel, 1)
+
+        self.gen_menu = QMenu(self)
+        for fmt in REPORT_FORMATS:
+            self.gen_menu.addAction(fmt["label"], lambda fid=fmt["id"]: self._trigger_gen(fid))
+        self.gen_menu.addSeparator()
+        self.gen_menu.addAction("Custom Prompt…", self._trigger_custom_gen)
 
         self.setMinimumWidth(380)
         self.compact_height = self.sizeHint().height()
@@ -431,6 +446,21 @@ class EloquentWidget(QWidget):
         elif kind in ("paragraph", "reset"):
             if kind == "reset":
                 self.last_final = ""
+                self.view_mode = "transcript"
+            self._mark_dirty()
+        elif kind == "report":
+            if data and data.get("status") in ("generating", "done", "error"):
+                self.view_mode = "report"
+                if not self.panel.isVisible():
+                    self.toggle_panel()
+                if data["status"] == "generating":
+                    self._caption(f"Generating {data['label']}…", "hint")
+                elif data["status"] == "done":
+                    self._caption(f"{data['label']} ready (saved in session folder)", "hint")
+                    self.caption_reset.start()
+                elif data["status"] == "error":
+                    self._caption(data.get("error", "Could not generate output"), "error")
+                    self.caption_reset.start()
             self._mark_dirty()
         elif kind == "session_started":
             self._caption("Listening…", "hint")
@@ -514,12 +544,57 @@ class EloquentWidget(QWidget):
     def _rebuild(self):
         if not self.panel.isVisible():
             return
-        sb = self.view.verticalScrollBar()
-        at_bottom = sb.value() >= sb.maximum() - 30
-        keep = sb.value()
-        self.view.setHtml(transcript_html(self.engine.state.snapshot(), self.show_raw))
-        sb.setValue(sb.maximum() if at_bottom else keep)
+        snap = self.engine.state.snapshot()
+        rep = snap.get("report")
+        has_rep = bool(rep and rep.get("status") in ("generating", "done", "error"))
+        if self.view_mode == "report" and has_rep:
+            self.chk_raw.hide()
+            self.btn_back.setText("← Transcript")
+            self.btn_back.show()
+            st = rep["status"]
+            if st == "generating":
+                self.view.setHtml(
+                    f'<p style="color:#7db4ff"><i>Generating {html.escape(rep["label"])}…</i></p>')
+            elif st == "error":
+                self.view.setHtml(
+                    f'<p style="color:#ff8a80"><b>{html.escape(rep["label"])}</b><br>'
+                    f'{html.escape(rep.get("error", ""))}</p>')
+            else:
+                self.view.setMarkdown(f"# {rep['label']}\n\n{rep['text']}")
+        else:
+            self.view_mode = "transcript"
+            self.chk_raw.show()
+            if has_rep and rep.get("status") == "done":
+                self.btn_back.setText(f"View {rep['label']} →")
+                self.btn_back.show()
+            else:
+                self.btn_back.hide()
+            sb = self.view.verticalScrollBar()
+            at_bottom = sb.value() >= sb.maximum() - 30
+            keep = sb.value()
+            self.view.setHtml(transcript_html(snap, self.show_raw))
+            sb.setValue(sb.maximum() if at_bottom else keep)
         self.dirty = False
+
+    def _switch_view(self):
+        self.view_mode = "transcript" if self.view_mode == "report" else "report"
+        self._rebuild()
+
+    def _show_gen_menu(self):
+        self.gen_menu.exec(self.btn_gen.mapToGlobal(QPoint(0, self.btn_gen.height())))
+
+    def _trigger_gen(self, format_id: str, custom_prompt: str = ""):
+        self.engine.generate_report(format_id, custom_prompt)
+
+    def _trigger_custom_gen(self):
+        dlg = QInputDialog(self)
+        dlg.setWindowTitle(f"{APP_NAME} - Custom Prompt")
+        dlg.setLabelText("How should the LLM format or analyze this transcript?")
+        dlg.setTextValue("Summarize the key points and list any action items.")
+        dlg.setWindowFlag(Qt.WindowStaysOnTopHint, True)
+        dlg.setStyleSheet("")
+        if dlg.exec() and dlg.textValue().strip():
+            self._trigger_gen("custom", dlg.textValue().strip())
 
     def toggle_panel(self):
         show = not self.panel.isVisible()
@@ -544,8 +619,14 @@ class EloquentWidget(QWidget):
         self._rebuild()
 
     def _copy(self):
-        QGuiApplication.clipboard().setText(self.engine.state.full_text(raw=self.show_raw))
-        self._caption("Transcript copied to the clipboard", "hint")
+        snap = self.engine.state.snapshot()
+        rep = snap.get("report")
+        if self.view_mode == "report" and rep and rep.get("text"):
+            QGuiApplication.clipboard().setText(rep["text"])
+            self._caption(f"{rep['label']} copied to the clipboard", "hint")
+        else:
+            QGuiApplication.clipboard().setText(self.engine.state.full_text(raw=self.show_raw))
+            self._caption("Transcript copied to the clipboard", "hint")
         self.caption_reset.start()
 
     def _open(self, path: Path):

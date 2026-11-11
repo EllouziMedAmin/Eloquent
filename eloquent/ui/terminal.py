@@ -14,7 +14,11 @@ import time
 
 from rich.console import Console, Group
 from rich.live import Live
+from rich.markdown import Markdown
+from rich.panel import Panel
 from rich.text import Text
+
+from ..llm.prompts import REPORT_FORMATS
 
 try:
     import msvcrt  # Windows: non-blocking key reads
@@ -40,15 +44,18 @@ def _paragraph_text(p: dict) -> Text:
 
 
 class TerminalUI:
-    def __init__(self, engine, wav_path=None, auto_start=True):
+    def __init__(self, engine, wav_path=None, auto_start=True, auto_format=None, custom_prompt=""):
         self.engine = engine
         self.wav_path = wav_path
         self.auto_start = auto_start
+        self.auto_format = auto_format
+        self.custom_prompt = custom_prompt
         self.console = Console(highlight=False)
         self.changed = threading.Event()
         self.logs: "queue.Queue[tuple]" = queue.Queue()
         self.printed = 0           # number of paragraphs already printed permanently
         self.quit = False
+        self.picking_format = False
         self.ended = threading.Event()
         self.last_seg_info = ""
         engine.subscribe(self._on_event)
@@ -61,11 +68,14 @@ class TerminalUI:
             self.last_seg_info = f"{data['audio_sec']:.1f}s audio decoded in {data['decode_sec']:.2f}s"
         elif kind == "reset":
             self.printed = 0
+            self.picking_format = False
         elif kind == "session_started":
             self.logs.put(("info", f"Recording... saving to {data['dir']}"))
         elif kind == "session_ended":
             self.logs.put(("info", f"Stopped. Files in: {data['dir']}"))
             self.ended.set()
+        elif kind == "report" and data and data.get("status") == "done":
+            self.logs.put(("report", data))
         self.changed.set()
 
     # -- rendering ----------------------------------------------------------
@@ -76,7 +86,12 @@ class TerminalUI:
                 level, msg = self.logs.get_nowait()
             except queue.Empty:
                 return
-            live.console.print(Text(msg, style=styles.get(level, "")))
+            if level == "report":
+                live.console.print()
+                live.console.print(Panel(Markdown(msg["text"]), title=msg["label"], border_style="cyan"))
+                live.console.print()
+            else:
+                live.console.print(Text(msg, style=styles.get(level, "")))
 
     def _print_finished(self, live, snap):
         paras = snap["paragraphs"]
@@ -97,8 +112,12 @@ class TerminalUI:
         t.append(f"   {llm_txt}", style="dim")
         if self.last_seg_info:
             t.append(f"   last: {self.last_seg_info}", style="dim")
-        hint = "  Space start/stop · Q quit" if msvcrt and not self.wav_path else "  Ctrl+C stop"
-        t.append(hint, style="dim")
+        if self.picking_format:
+            opts = "  ".join(f"[{i+1}] {f['label']}" for i, f in enumerate(REPORT_FORMATS))
+            t.append(f"\nGenerate: {opts}  [Esc] cancel", style="cyan")
+        else:
+            hint = "  Space start/stop · G generate · Q quit" if msvcrt and not self.wav_path else "  Ctrl+C stop"
+            t.append(hint, style="dim")
         return t
 
     def _live_view(self, snap) -> Group:
@@ -124,8 +143,18 @@ class TerminalUI:
             return
         while msvcrt.kbhit():
             ch = msvcrt.getwch()
+            if self.picking_format:
+                if ch in "123456" and int(ch) <= len(REPORT_FORMATS):
+                    fmt = REPORT_FORMATS[int(ch) - 1]
+                    self.picking_format = False
+                    self.engine.generate_report(fmt["id"])
+                elif ch == "\x1b" or ch.lower() == "g":
+                    self.picking_format = False
+                continue
             if ch == " ":
                 self.engine.toggle()
+            elif ch.lower() == "g":
+                self.picking_format = True
             elif ch.lower() == "q":
                 self.quit = True
 
@@ -190,9 +219,12 @@ class TerminalUI:
         snap = e.state.snapshot()
         self._flush_logs(live)
         self._print_finished(live, snap)
+        if self.auto_format:
+            e.generate_report(self.auto_format, self.custom_prompt, blocking=True)
+            self._flush_logs(live)
         live.update(self._status_line(), refresh=True)
 
 
-def run_terminal(engine, wav_path=None, auto_start=True):
-    TerminalUI(engine, wav_path, auto_start).run()
+def run_terminal(engine, wav_path=None, auto_start=True, auto_format=None, custom_prompt=""):
+    TerminalUI(engine, wav_path, auto_start, auto_format, custom_prompt).run()
     sys.stdout.flush()

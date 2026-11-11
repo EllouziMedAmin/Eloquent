@@ -1,5 +1,6 @@
 """Browser UI: local page fed by Server-Sent Events (pushed, no polling delay)."""
 
+import json
 import threading
 import time
 import webbrowser
@@ -19,11 +20,12 @@ header b{font-size:15px}
 .dot{width:9px;height:9px;border-radius:50%;background:#888;display:inline-block;margin-right:6px}
 .dot.listening{background:#2e9e5b}.dot.stopping{background:#d4a017}.dot.off{background:#c0392b}
 header label{color:var(--mut);cursor:pointer}
-header button{font:inherit;color:var(--fg);background:var(--card);border:1px solid var(--line);border-radius:8px;padding:4px 12px;cursor:pointer}
+header button,header select{font:inherit;color:var(--fg);background:var(--card);border:1px solid var(--line);border-radius:8px;padding:4px 12px;cursor:pointer}
 header button:disabled{opacity:.5;cursor:default}
-#llm{color:var(--mut);font-size:13px}
 #err{color:var(--warn);font-size:13px}
 main{max-width:860px;margin:0 auto;padding:20px 20px 120px}
+.report{background:var(--card);border:2px solid var(--acc);border-radius:12px;padding:16px 20px;margin:0 0 18px;white-space:pre-wrap}
+.report b.title{display:block;font-size:14px;color:var(--acc);margin-bottom:8px}
 .para{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px 16px;margin:0 0 12px}
 .para p{margin:0}
 .para .time{display:block;font-size:12px;color:var(--mut);margin-bottom:2px}
@@ -43,8 +45,17 @@ main{max-width:860px;margin:0 auto;padding:20px 20px 120px}
   <span><span class="dot" id="dot"></span><span id="status">connecting</span></span>
   <button id="toggle" disabled>Start</button>
   <label><input type="checkbox" id="raw"> show raw</label>
+  <select id="fmt">
+    <option value="summary">Concise Summary</option>
+    <option value="bullets">Key Bullet Points</option>
+    <option value="meeting">Meeting Minutes</option>
+    <option value="lecture">Lecture / Study Notes</option>
+    <option value="report">Structured Report</option>
+    <option value="article">Clean Article / Memo</option>
+    <option value="custom">Custom Prompt…</option>
+  </select>
+  <button id="gen">Generate</button>
   <button id="copy">Copy text</button>
-  <span id="llm"></span>
   <span id="err"></span>
 </header>
 <main id="log"></main>
@@ -59,6 +70,12 @@ function allText(s){
 function render(s){
   const nearBottom=window.innerHeight+window.scrollY>=document.body.offsetHeight-120;
   const box=$('log'); box.textContent='';
+  if(s.report){
+    const r=el('div','report');
+    r.append(el('b','title',s.report.label+(s.report.status==='generating'?' (generating…)':'')));
+    r.append(document.createTextNode(s.report.status==='error'?s.report.error:s.report.text));
+    box.append(r);
+  }
   for(const p of s.paragraphs){
     const d=el('div','para '+p.status);
     d.append(el('span','time',p.time));
@@ -77,7 +94,6 @@ function render(s){
   $('dot').className='dot '+s.status; $('status').textContent=s.status;
   const t=$('toggle'); t.disabled=!(s.status==='idle'||s.status==='listening');
   t.textContent=s.status==='listening'?'Stop':'Start';
-  const l=s.llm; $('llm').textContent=l.state==='ready'?l.label:l.state==='off'?'LLM off':l.state==='checking'?'checking '+l.label:'LLM error (raw kept)';
   if(nearBottom) window.scrollTo(0,document.body.scrollHeight);
 }
 function connect(){
@@ -86,8 +102,14 @@ function connect(){
   es.onerror=()=>{$('dot').className='dot off'; $('status').textContent='disconnected';};
 }
 $('raw').addEventListener('change',e=>{showRaw=e.target.checked; if(state)render(state);});
-$('copy').addEventListener('click',()=>{if(state)navigator.clipboard.writeText(allText(state));});
+$('copy').addEventListener('click',()=>{if(state)navigator.clipboard.writeText(state.report&&state.report.text?state.report.text:allText(state));});
 $('toggle').addEventListener('click',()=>fetch('/toggle',{method:'POST'}));
+$('gen').addEventListener('click',()=>{
+  const fid=$('fmt').value;
+  let custom='';
+  if(fid==='custom'){custom=prompt('How should the LLM format or analyze this transcript?','Summarize key points')||''; if(!custom)return;}
+  fetch('/generate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({format_id:fid,custom_prompt:custom})});
+});
 connect();
 </script></body></html>
 """
@@ -133,6 +155,13 @@ class WebUI:
             def do_POST(self):
                 if self.path == "/toggle":
                     ui.engine.toggle()
+                    self.send_response(204)
+                    self.end_headers()
+                    return
+                if self.path == "/generate":
+                    length = int(self.headers.get("Content-Length", "0"))
+                    body = json.loads(self.rfile.read(length).decode("utf-8")) if length else {}
+                    ui.engine.generate_report(body.get("format_id", "summary"), body.get("custom_prompt", ""))
                     self.send_response(204)
                     self.end_headers()
                     return

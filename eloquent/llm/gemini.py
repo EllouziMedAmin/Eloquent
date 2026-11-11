@@ -33,11 +33,14 @@ class GeminiProvider(LLMProvider):
             model=self.model, contents=build_proofread_prompt(raw, context), config=self.proof_cfg)
         return strip_wrappers(resp.text or "")
 
-    def generate(self, instruction: str, text: str, max_tokens: int = 4096) -> str:
+    def generate(self, instruction: str, text: str, max_tokens: int = 8192) -> str:
         t = self._types
         resp = self.client.models.generate_content(
             model=self.model, contents="TRANSCRIPT:\n" + text,
             config=t.GenerateContentConfig(
-                system_instruction=instruction, max_output_tokens=max_tokens,
-                thinking_config=t.ThinkingConfig(thinking_level="low")))
-        return (resp.text or "").strip()
+                system_instruction=instruction,
+                max_output_tokens=max_tokens,
+                thinking_config=t.ThinkingConfig(thinking_level="low"),
+                http_options=t.HttpOptions(timeout=60_000),
+            ))
+        return strip_wrappers(resp.text or "")

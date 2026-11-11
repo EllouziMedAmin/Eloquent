@@ -3,9 +3,9 @@
 from .base import LLMProvider
 
 
-def make_provider(settings):
+def make_provider(settings, force: bool = False):
     """Return (provider or None, reason). Never raises."""
-    if not settings.cleanup:
+    if not settings.cleanup and not force:
         return None, "cleanup off"
     key = settings.resolved_api_key()
     if not key:
