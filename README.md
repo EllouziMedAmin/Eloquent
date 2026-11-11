@@ -32,7 +32,7 @@ All three use the same engine, so speed and accuracy are identical.
 Requirements: Windows 10/11, Python 3.10+.
 
 ```bat
-git clone https://github.com/<you>/eloquent.git
+git clone https://github.com/EllouziMedAmin/Eloquent.git
 cd eloquent
 setup.bat
 ```
