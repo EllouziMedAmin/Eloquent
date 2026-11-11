@@ -42,6 +42,9 @@ def build_parser(s: Settings) -> argparse.ArgumentParser:
     p.add_argument("--out", help="sessions folder")
     p.add_argument("--port", type=int, help=f"web UI port (default {s.web_port})")
     p.add_argument("--no-browser", action="store_true", help="web: do not open the browser automatically")
+    p.add_argument("--minimized", action="store_true", help="widget: start minimized in background")
+    p.add_argument("--create-shortcut", action="store_true", help="create Desktop/Start Menu/Startup shortcuts and start the hotkey launcher")
+    p.add_argument("--listen", action="store_true", help="run only the tiny background launcher that starts Eloquent on the launch hotkey")
     p.add_argument("--settings-path", action="store_true", help="print where settings are stored")
     p.add_argument("--version", action="version", version=f"{APP_NAME} {__version__}")
     return p
@@ -54,6 +57,18 @@ def main(argv=None):
     if args.settings_path:
         print(SETTINGS_FILE)
         return 0
+    if args.create_shortcut:
+        from .hotkeys import spawn_listener
+        from .shortcuts import create_windows_shortcuts
+        for p in create_windows_shortcuts():
+            print(f"Created shortcut: {p}")
+        spawn_listener()
+        print(f"Launcher running in background: press {s.launch_hotkey} to start Eloquent "
+              f"(it also starts with Windows).")
+        return 0
+    if args.listen:
+        from .hotkeys import run_listener
+        return run_listener(s.launch_hotkey)
     if args.list_devices:
         import sounddevice as sd
         print(sd.query_devices())
@@ -80,7 +95,8 @@ def main(argv=None):
         s.web_port = args.port
 
     ui = args.ui or ("terminal" if args.input else s.ui)
-    os.system("")  # enable ANSI colours in the Windows console
+    if sys.stdout is not None and hasattr(sys.stdout, "isatty") and sys.stdout.isatty():
+        os.system("")  # enable ANSI colours in the Windows console
 
     from .engine import Engine
     engine = Engine(s)
@@ -93,7 +109,7 @@ def main(argv=None):
                   f"Falling back to the terminal UI.")
             ui = "terminal"
         else:
-            return run_widget(engine, s)
+            return run_widget(engine, s, start_minimized=args.minimized)
 
     if ui == "web":
         from .ui.web import run_web

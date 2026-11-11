@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "eloquent-stt"
+version = "0.1.0"
+description = "Open-source live transcription for Windows on CPU (NVIDIA Parakeet TDT 0.6B v3 INT8 + Silero VAD + optional Gemini Flash-Lite proofreading & notes generation)"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+dependencies = [
+    "sherpa-onnx>=1.12",
+    "sounddevice>=0.4.6",
+    "numpy>=1.24",
+    "huggingface_hub>=0.20",
+    "google-genai>=1.0",
+    "python-dotenv>=1.0",
+    "rich>=13.0",
+    "PySide6-Essentials>=6.6",
+]
+
+[project.scripts]
+eloquent = "eloquent.__main__:main"
+
+[project.gui-scripts]
+eloquent-widget = "eloquent.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["eloquent*"]
