@@ -1,0 +1,8 @@
+sherpa-onnx>=1.12
+sounddevice>=0.4.6
+numpy>=1.24
+huggingface_hub>=0.20
+google-genai>=1.0
+python-dotenv>=1.0
+rich>=13.0
+PySide6-Essentials>=6.6

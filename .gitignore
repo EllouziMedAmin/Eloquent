@@ -3,3 +3,12 @@
 .env.*
 models
 sessions
+
+# python
+.venv/
+venv/
+__pycache__/
+*.pyc
+build/
+dist/
+*.spec
