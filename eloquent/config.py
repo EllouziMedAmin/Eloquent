@@ -49,7 +49,8 @@ class Settings:
     models_dir: str = ""              # empty -> <repo>/models
     # --- interface ---
     ui: str = "widget"                # widget | terminal | web
-    hotkey: str = "ctrl+alt+space"    # empty = disabled (widget only)
+    hotkey: str = "ctrl+shift+space"  # start/stop recording while the widget runs (empty = off)
+    launch_hotkey: str = "ctrl+shift+e"  # starts Eloquent from anywhere (background launcher)
     always_on_top: bool = True
     widget_pos: Optional[list] = None
     web_port: int = 8765

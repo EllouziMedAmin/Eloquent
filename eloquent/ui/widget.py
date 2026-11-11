@@ -80,29 +80,7 @@ QScrollBar::add-line, QScrollBar::sub-line { height: 0; }
 # --------------------------------------------------------------------------- #
 # helpers
 # --------------------------------------------------------------------------- #
-_MODS = {"ctrl": 0x2, "control": 0x2, "alt": 0x1, "shift": 0x4, "win": 0x8}
-
-
-def parse_hotkey(text: str):
-    """'ctrl+alt+space' -> (modifiers, virtual key) or None."""
-    parts = [p.strip().lower() for p in text.split("+") if p.strip()]
-    mods, vk = 0, None
-    for p in parts:
-        if p in _MODS:
-            mods |= _MODS[p]
-        elif p == "space":
-            vk = 0x20
-        elif len(p) == 1 and p.isalnum():
-            vk = ord(p.upper())
-        elif p[0] == "f" and p[1:].isdigit() and 1 <= int(p[1:]) <= 24:
-            vk = 0x70 + int(p[1:]) - 1
-        elif p == "pause":
-            vk = 0x13
-        else:
-            return None
-    if vk is None or mods == 0:
-        return None
-    return mods | 0x4000, vk  # MOD_NOREPEAT
+from ..hotkeys import parse_hotkey, single_instance  # noqa: E402
 
 
 def make_icon(color="#7c5cff") -> QIcon:
@@ -178,99 +156,7 @@ class LevelDot(QWidget):
         p.drawEllipse(c, 5, 5)
 
 
-# --------------------------------------------------------------------------- #
-# settings dialog
-# --------------------------------------------------------------------------- #
-class SettingsDialog(QDialog):
-    def __init__(self, settings, parent=None, first_run=False):
-        super().__init__(parent)
-        self.s = settings
-        self.setWindowTitle(f"{APP_NAME} settings")
-        self.setMinimumWidth(500)
-        form = QFormLayout(self)
-
-        if first_run:
-            intro = QLabel("Welcome to Eloquent! Speech recognition runs locally on your CPU.<br>"
-                           "Optional: add a free Gemini API key to polish the transcript "
-                           "(fix misheard words and punctuation).")
-            intro.setWordWrap(True)
-            form.addRow(intro)
-
-        self.key = QLineEdit(settings.gemini_api_key)
-        self.key.setEchoMode(QLineEdit.Password)
-        self.key.setPlaceholderText("empty = GEMINI_API_KEY from .env / environment")
-        link = QLabel('<a href="https://aistudio.google.com/apikey">Get a free key from Google AI Studio</a>')
-        link.setOpenExternalLinks(True)
-        form.addRow("Gemini API key", self.key)
-        form.addRow("", link)
-
-        self.model = QLineEdit(settings.llm_model)
-        form.addRow("Model", self.model)
-
-        self.cleanup = QCheckBox("Polish the transcript with the LLM")
-        self.cleanup.setChecked(settings.cleanup)
-        form.addRow("", self.cleanup)
-        self.fillers = QCheckBox("Keep filler words (uh, um)")
-        self.fillers.setChecked(settings.keep_fillers)
-        form.addRow("", self.fillers)
-
-        self.audio = QCheckBox("Save the audio recording (audio.wav, ~115 MB per hour)")
-        self.audio.setChecked(settings.save_audio)
-        form.addRow("", self.audio)
-
-        self.mic = QComboBox()
-        self.mic.addItem("System default", None)
-        try:
-            import sounddevice as sd
-            default_api = sd.query_devices(kind="input")["hostapi"]
-            for i, d in enumerate(sd.query_devices()):
-                if d["max_input_channels"] > 0 and d["hostapi"] == default_api:
-                    self.mic.addItem(d["name"], i)
-        except Exception:
-            pass
-        idx = self.mic.findData(settings.device)
-        self.mic.setCurrentIndex(max(0, idx))
-        form.addRow("Microphone", self.mic)
-
-        self.hotkey = QLineEdit(settings.hotkey)
-        self.hotkey.setPlaceholderText("e.g. ctrl+alt+space   (empty = off)")
-        form.addRow("Start/stop hotkey", self.hotkey)
-
-        row = QHBoxLayout()
-        self.folder = QLineEdit(str(settings.resolved_sessions_dir()))
-        browse = QPushButton("Browse…")
-        browse.clicked.connect(self._browse)
-        row.addWidget(self.folder)
-        row.addWidget(browse)
-        form.addRow("Sessions folder", row)
-
-        btns = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
-        btns.accepted.connect(self._save)
-        btns.rejected.connect(self.reject)
-        form.addRow(btns)
-
-    def _browse(self):
-        d = QFileDialog.getExistingDirectory(self, "Sessions folder", self.folder.text())
-        if d:
-            self.folder.setText(d)
-
-    def _save(self):
-        hk = self.hotkey.text().strip().lower()
-        if hk and parse_hotkey(hk) is None:
-            QMessageBox.warning(self, APP_NAME, "Hotkey not recognised.\nExample: ctrl+alt+space, ctrl+shift+f9")
-            return
-        s = self.s
-        s.gemini_api_key = self.key.text().strip()
-        s.llm_model = self.model.text().strip() or s.llm_model
-        s.cleanup = self.cleanup.isChecked()
-        s.keep_fillers = self.fillers.isChecked()
-        s.save_audio = self.audio.isChecked()
-        s.device = self.mic.currentData()
-        s.hotkey = hk
-        folder = self.folder.text().strip()
-        s.sessions_dir = "" if folder == str(s.resolved_sessions_dir()) and not s.sessions_dir else folder
-        s.save()
-        self.accept()
+from .settings_dialog import SettingsDialog  # noqa: E402
 
 
 # --------------------------------------------------------------------------- #
@@ -398,6 +284,7 @@ class EloquentWidget(QWidget):
         self.act_top.toggled.connect(self._set_on_top)
         self.menu.addSeparator()
         self.menu.addAction("Open sessions folder", lambda: self._open(self.s.resolved_sessions_dir()))
+        self.menu.addAction("Create shortcuts + launch hotkey", self._make_shortcut)
         self.menu.addAction("Minimize", self.showMinimized)
         self.menu.addSeparator()
         self.menu.addAction(f"Quit {APP_NAME}", self.quit)
@@ -636,6 +523,16 @@ class EloquentWidget(QWidget):
     def _open_folder(self):
         self._open(self.engine.last_session_dir or self.s.resolved_sessions_dir())
 
+    def _make_shortcut(self):
+        from ..hotkeys import spawn_listener
+        from ..shortcuts import create_windows_shortcuts
+        if create_windows_shortcuts():
+            spawn_listener()
+            self._caption(f"Shortcuts created. Launch anytime with {self.s.launch_hotkey}", "hint")
+        else:
+            self._caption("Could not create shortcuts", "error")
+        self.caption_reset.start()
+
     # -- menu / settings ------------------------------------------------------
     def _show_menu(self):
         self.act_audio.blockSignals(True)
@@ -664,7 +561,6 @@ class EloquentWidget(QWidget):
     def open_settings(self, first_run=False):
         dlg = SettingsDialog(self.s, self, first_run=first_run)
         dlg.setWindowFlag(Qt.WindowStaysOnTopHint, True)
-        dlg.setStyleSheet("")
         if dlg.exec():
             self.register_hotkey()
             self.engine.refresh_provider()
@@ -796,8 +692,16 @@ def _redirect_streams():
         sys.stderr = sys.stderr or f
 
 
-def run_widget(engine, settings):
+def run_widget(engine, settings, start_minimized: bool = False):
     _redirect_streams()
+    if sys.platform == "win32" and not single_instance("Eloquent.Widget"):
+        # Already running: bring the existing window to the front instead of opening a second one
+        u32 = ctypes.windll.user32
+        hwnd = u32.FindWindowW(None, APP_NAME)
+        if hwnd:
+            u32.ShowWindow(hwnd, 9)  # SW_RESTORE
+            u32.SetForegroundWindow(hwnd)
+        return 0
     if sys.platform == "win32":
         try:  # own taskbar/tray identity instead of python.exe
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(f"{APP_NAME}.{__version__}")
@@ -810,9 +714,12 @@ def run_widget(engine, settings):
     signal.signal(signal.SIGINT, lambda *_: w.quit())
     sig_timer = QTimer(w, interval=250, timeout=lambda: None)
     sig_timer.start()
-    w.show()
-    w.raise_()
-    w.activateWindow()
+    if start_minimized:
+        w.showMinimized()
+    else:
+        w.show()
+        w.raise_()
+        w.activateWindow()
     w.register_hotkey()
     w.start_loading()
     return app.exec()

@@ -1,14 +1,20 @@
-# Ignore the main environment file
+# Ignore environment files containing secrets, but keep the example template
 .env
 .env.*
-models
-sessions
+!.env.example
 
-# python
+# Local models, recorded sessions, and generated launcher
+models/
+sessions/
+Eloquent.vbs
+
+# Python / build artifacts
 .venv/
 venv/
 __pycache__/
 *.pyc
+*.pyo
+*.egg-info/
 build/
 dist/
 *.spec
