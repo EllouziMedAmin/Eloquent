@@ -241,8 +241,8 @@ class Engine:
                 pending = np.concatenate([pending, chunk])
                 while len(pending) >= WINDOW:
                     frame, pending = pending[:WINDOW], pending[WINDOW:]
-                    # skip live partials when we are falling behind: finals always win
-                    self._process(frame, allow_partial=q.qsize() < 8)
+                    # skip live partials if mic queue backs up >~130 ms: finals always win
+                    self._process(frame, allow_partial=q.qsize() < 4)
 
     def _loop_file(self, path: Path):
         """Feed a recording through the exact same pipeline, as fast as the CPU allows."""
@@ -270,7 +270,12 @@ class Engine:
             return
 
         self._since_partial += len(frame)
-        if speaking and allow_partial and self._since_partial >= self._partial_every:
+        # Step back partial frequency on long utterances to avoid O(N^2) re-decoding overhead
+        buf_sec = self._buf_len / SAMPLE_RATE
+        interval = self._partial_every if buf_sec <= 5.0 else (
+            self._partial_every * 2 if buf_sec <= 10.0 else int(self._partial_every * 2.5)
+        )
+        if speaking and allow_partial and self._since_partial >= interval:
             self._since_partial = 0
             text = transcribe(self.recognizer, np.concatenate(self._buf))
             if text and text != self._last_partial:

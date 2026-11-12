@@ -81,9 +81,9 @@ class Settings:
     def resolved_threads(self) -> int:
         if self.threads and self.threads > 0:
             return self.threads
-        th = default_threads()
-        # Reserve 1 core for background diarization so Parakeet never suffers thread contention
-        return max(2, th - 1) if self.diarize and th >= 4 else th
+        # Diarizer runs at BELOW_NORMAL priority on 1 thread only between turns,
+        # so Parakeet can use the full CPU allocation without hurting real-time latency.
+        return default_threads()
 
     def resolved_sessions_dir(self) -> Path:
         return Path(self.sessions_dir) if self.sessions_dir else ROOT / "sessions"
