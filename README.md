@@ -23,7 +23,7 @@ Optionally, a free **Gemini 3.1 Flash-Lite** API key polishes the transcript in 
 ## Highlights
 
 - **Fast on CPU, zero recognition lag:** Powered by NVIDIA **Parakeet TDT 0.6B v3 (INT8)** and **Silero VAD** via `sherpa-onnx`. Supports 25 European languages automatically.
-- **Multi-speaker diarization:** Identifies **Speaker 1, Speaker 2, …** on a low-priority background thread (`3D-Speaker CAM++`) with zero impact on live speech latency, including mid-turn speaker handoffs using Parakeet word timestamps.
+- **Multi-speaker diarization:** Identifies **Speaker 1, Speaker 2, …** on a low-priority background thread (`NVIDIA NeMo TitaNet-Small`) with zero impact on live speech latency, including mid-turn speaker handoffs using Parakeet word timestamps.
 - **Background LLM proofreading:** Every few sentences, Gemini 3.1 Flash-Lite fixes misheard words, punctuation, and spoken fillers in a background thread without slowing down live captions. If offline or if the model rewrites too much, raw text is kept automatically.
 - **3 Interfaces, 1 Engine:**
   - **Floating Widget (`Eloquent.bat`, default):** Always-on-top compact pill with live audio meter, live captions, expandable transcript drawer (`⤢`), and global hotkeys.

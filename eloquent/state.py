@@ -87,22 +87,51 @@ class State:
                 self.loose[idx:idx + 1] = repl
             elif parts:
                 # Cleaner already pulled seg_id into a paragraph before diarization finished
-                first_tid = parts[0][0]
-                first_spk = mapping.get(first_tid, parts[0][4])
-                for p in self.paragraphs:
-                    if seg_id in p.get("seg_ids", ()):
-                        p["speaker"] = first_spk
-                        break
+                for pi, p in enumerate(self.paragraphs):
+                    sids = p.get("seg_ids", ())
+                    if seg_id not in sids:
+                        continue
+                    if len(sids) == 1 and len(parts) > 1:
+                        # Group consecutive parts by speaker so mid-chunk switches aren't orphaned
+                        grouped = []
+                        for tid, st, t0, txt, spk in parts:
+                            sp = mapping.get(tid, spk)
+                            if grouped and grouped[-1]["speaker"] == sp:
+                                grouped[-1]["raw"] += f" {txt}"
+                                grouped[-1]["seg_ids"].append(tid)
+                            else:
+                                grouped.append({
+                                    "id": p["id"] if not grouped else self.next_id,
+                                    "time": st, "raw": txt, "clean": None, "tokens": None,
+                                    "status": "raw", "note": "", "speaker": sp, "seg_ids": [tid],
+                                })
+                                if len(grouped) > 1:
+                                    self.next_id += 1
+                        if len(grouped) == 1:
+                            p["speaker"] = grouped[0]["speaker"]
+                            p["seg_ids"] = grouped[0]["seg_ids"]
+                        else:
+                            self.paragraphs[pi:pi + 1] = grouped
+                    else:
+                        first_tid = parts[0][0]
+                        p["speaker"] = mapping.get(first_tid, parts[0][4])
+                        if len(parts) > 1:
+                            extra = [tid for tid, _, _, _, _ in parts[1:] if tid not in sids]
+                            p["seg_ids"] = list(sids) + extra
+                    break
 
             if mapping:
                 for x in self.loose:
                     if x["id"] in mapping:
                         x["speaker"] = mapping[x["id"]]
                 for p in self.paragraphs:
+                    counts: dict[str, int] = {}
                     for tid in p.get("seg_ids", ()):
                         if tid in mapping:
-                            p["speaker"] = mapping[tid]
-                            break
+                            sp = mapping[tid]
+                            counts[sp] = counts.get(sp, 0) + 1
+                    if counts:
+                        p["speaker"] = max(counts.items(), key=lambda kv: kv[1])[0]
             self.rev += 1
         self.emit("speakers", seg_id)
 

@@ -30,10 +30,10 @@ class Cleaner(threading.Thread):
             if not segs:
                 return None
             now = time.time()
-            # Wait briefly (~2.5s max) for background diarizer before locking a chunk into a paragraph
+            # Wait briefly (~4.5s max) for background diarizer before locking a chunk into a paragraph
             ready_n = 0
             for s in segs:
-                if not self.flushing and not s.get("spk_ready", True) and (now - s["ts"]) < 2.5:
+                if not self.flushing and not s.get("spk_ready", True) and (now - s["ts"]) < 4.5:
                     break
                 ready_n += 1
             if ready_n == 0:
