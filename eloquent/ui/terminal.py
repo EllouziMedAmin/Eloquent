@@ -26,11 +26,23 @@ except ImportError:  # pragma: no cover
     msvcrt = None
 
 MAX_PENDING_LINES = 6
+SPEAKER_STYLES = ("bold cyan", "bold green", "bold yellow", "bold magenta", "bold blue", "bold red")
 
 
-def _paragraph_text(p: dict) -> Text:
+def _speaker_style(spk: str) -> str:
+    idx = 0
+    try:
+        idx = int(spk.rsplit(" ", 1)[-1]) - 1
+    except ValueError:
+        pass
+    return SPEAKER_STYLES[idx % len(SPEAKER_STYLES)]
+
+
+def _paragraph_text(p: dict, multi_speaker: bool = False) -> Text:
     t = Text()
     t.append(p["time"] + "  ", style="dim")
+    if multi_speaker and p.get("speaker"):
+        t.append(p["speaker"] + "  ", style=_speaker_style(p["speaker"]))
     if p["tokens"]:
         for i, (w, changed) in enumerate(p["tokens"]):
             if i:
@@ -95,8 +107,9 @@ class TerminalUI:
 
     def _print_finished(self, live, snap):
         paras = snap["paragraphs"]
+        multi = bool(snap.get("multi_speaker"))
         while self.printed < len(paras) and paras[self.printed]["status"] != "cleaning":
-            live.console.print(_paragraph_text(paras[self.printed]))
+            live.console.print(_paragraph_text(paras[self.printed], multi_speaker=multi))
             live.console.print()
             self.printed += 1
 
@@ -122,13 +135,18 @@ class TerminalUI:
 
     def _live_view(self, snap) -> Group:
         lines = []
+        multi = bool(snap.get("multi_speaker"))
         for p in snap["paragraphs"][self.printed:]:
             t = Text(p["time"] + "  ", style="dim")
+            if multi and p.get("speaker"):
+                t.append(p["speaker"] + "  ", style=_speaker_style(p["speaker"]))
             t.append(p["raw"], style="italic bright_black")
             t.append("  polishing...", style="cyan")
             lines.append(t)
         for x in snap["loose"]:
             t = Text(x["t"] + "  ", style="dim")
+            if multi and x.get("speaker"):
+                t.append(x["speaker"] + "  ", style=_speaker_style(x["speaker"]))
             t.append(x["text"])
             lines.append(t)
         if snap["partial"]:
@@ -199,8 +217,9 @@ class TerminalUI:
             e.stop()
             e.wait_idle(40)
             snap = e.state.snapshot()
+            multi = bool(snap.get("multi_speaker"))
             for p in snap["paragraphs"][self.printed:]:
-                self.console.print(_paragraph_text(p))
+                self.console.print(_paragraph_text(p, multi_speaker=multi))
             while not self.logs.empty():
                 self.console.print(Text(self.logs.get()[1], style="dim"))
 

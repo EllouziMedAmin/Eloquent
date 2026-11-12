@@ -29,13 +29,32 @@ class Cleaner(threading.Thread):
             segs = st.loose
             if not segs:
                 return None
-            take = len(segs)
-            if self.flushing:
+            now = time.time()
+            # Wait briefly (~4.5s max) for background diarizer before locking a chunk into a paragraph
+            ready_n = 0
+            for s in segs:
+                if not self.flushing and not s.get("spk_ready", True) and (now - s["ts"]) < 4.5:
+                    break
+                ready_n += 1
+            if ready_n == 0:
+                return None
+
+            first_spk = segs[0].get("speaker", "")
+            same_n = 0
+            for s in segs[:ready_n]:
+                if same_n > 0 and s.get("speaker", "") != first_spk:
+                    break
+                same_n += 1
+            speaker_switch = same_n < ready_n
+
+            take = same_n
+            if self.flushing or speaker_switch:
                 take = min(take, self.max_seg)
             else:
-                words = sum(len(s["text"].split()) for s in segs)
-                idle = time.time() - segs[-1]["ts"]
-                ready = ((len(segs) >= self.n_sent and words >= self.min_words)
+                grp = segs[:same_n]
+                words = sum(len(s["text"].split()) for s in grp)
+                idle = now - grp[-1]["ts"]
+                ready = ((len(grp) >= self.n_sent and words >= self.min_words)
                          or words >= self.max_words or idle >= self.idle_flush)
                 if not ready:
                     return None
@@ -43,15 +62,18 @@ class Cleaner(threading.Thread):
                 # keep it for the next chunk so it can be joined with its continuation.
                 if take > self.max_seg:
                     take = self.max_seg
-                elif idle < self.idle_flush and not ends_sentence(segs[-1]["text"]):
+                elif idle < self.idle_flush and not ends_sentence(grp[-1]["text"]):
                     take -= 1
                 if take == 0:
                     return None
             chunk = segs[:take]
             del segs[:take]
             raw = " ".join(s["text"] for s in chunk)
-            para = {"id": st.next_id, "time": chunk[0]["t"], "raw": raw, "clean": None,
-                    "tokens": None, "status": "cleaning" if self.provider else "raw", "note": ""}
+            para = {
+                "id": st.next_id, "time": chunk[0]["t"], "raw": raw, "clean": None,
+                "tokens": None, "status": "cleaning" if self.provider else "raw",
+                "note": "", "speaker": first_spk, "seg_ids": [s["id"] for s in chunk],
+            }
             st.next_id += 1
             st.paragraphs.append(para)
         st.touch("paragraph", para["id"])
@@ -60,7 +82,13 @@ class Cleaner(threading.Thread):
     def _context(self, current) -> str:
         with self.state.lock:
             prev = [p for p in self.state.paragraphs if p is not current and p["status"] != "cleaning"][-3:]
-            text = " ".join((p["clean"] or p["raw"]) for p in prev)
+            multi = self.state._multi_speaker_locked()
+            parts = []
+            for p in prev:
+                t = p["clean"] or p["raw"]
+                spk = p.get("speaker", "")
+                parts.append(f"{spk}: {t}" if (multi and spk) else t)
+            text = " ".join(parts)
         return text[-1000:]
 
     # -- LLM call ----------------------------------------------------------

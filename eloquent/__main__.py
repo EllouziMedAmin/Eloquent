@@ -33,6 +33,11 @@ def build_parser(s: Settings) -> argparse.ArgumentParser:
                        help="save audio.wav in the session folder")
     audio.add_argument("--no-audio", dest="save_audio", action="store_false", help="do not save audio.wav")
     p.add_argument("--no-clean", action="store_true", help="skip LLM cleanup, raw text only")
+    diar = p.add_mutually_exclusive_group()
+    diar.add_argument("--diarize", dest="diarize", action="store_true", default=None,
+                      help="identify speakers (Speaker 1, Speaker 2, ...)")
+    diar.add_argument("--no-diarize", dest="diarize", action="store_false",
+                      help="disable multi-speaker identification")
     p.add_argument("--model", help=f"LLM model (default {s.llm_model})")
     p.add_argument("--keep-fillers", action="store_true", default=None, help="keep uh/um in the cleaned text")
     p.add_argument("--threads", type=int, help="CPU threads for Parakeet (default: half the cores, max 8)")
@@ -77,6 +82,8 @@ def main(argv=None):
     # per-run overrides (never written back to settings.json)
     if args.save_audio is not None:
         s.save_audio = args.save_audio
+    if args.diarize is not None:
+        s.diarize = args.diarize
     if args.no_clean:
         s.cleanup = False
     if args.model:

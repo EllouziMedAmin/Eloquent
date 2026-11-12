@@ -62,11 +62,44 @@ def build_vad(vad_path: Path, threshold: float, silence: float, max_utterance: f
     return sherpa_onnx.VoiceActivityDetector(cfg, buffer_size_in_seconds=60)
 
 
+def _extract_words(result) -> list[dict]:
+    """Group BPE tokens from OfflineRecognitionResult into word spans: [{'w', 't0', 't1'}]."""
+    tokens = getattr(result, "tokens", None) or []
+    times = getattr(result, "timestamps", None) or []
+    durs = getattr(result, "durations", None) or []
+    if not tokens or len(tokens) != len(times):
+        return []
+    words = []
+    for i, tok in enumerate(tokens):
+        t0 = float(times[i])
+        dur = float(durs[i]) if i < len(durs) and durs[i] > 0 else 0.08
+        t1 = t0 + dur
+        starts_word = (not words) or tok.startswith((" ", "\u2581"))
+        piece = tok.lstrip(" \u2581")
+        if not piece:
+            continue
+        if starts_word:
+            words.append({"w": piece, "t0": t0, "t1": t1})
+        else:
+            words[-1]["w"] += piece
+            words[-1]["t1"] = max(words[-1]["t1"], t1)
+    return words
+
+
 def transcribe(recognizer, samples: np.ndarray) -> str:
     stream = recognizer.create_stream()
     stream.accept_waveform(SAMPLE_RATE, samples)
     recognizer.decode_stream(stream)
     return stream.result.text.strip()
+
+
+def transcribe_detailed(recognizer, samples: np.ndarray) -> tuple[str, list[dict]]:
+    """Decode audio once and return (text, [{'w', 't0', 't1'}, ...]) with zero extra ASR cost."""
+    stream = recognizer.create_stream()
+    stream.accept_waveform(SAMPLE_RATE, samples)
+    recognizer.decode_stream(stream)
+    r = stream.result
+    return r.text.strip(), _extract_words(r)
 
 
 def read_wav_16k(path: Path) -> np.ndarray:

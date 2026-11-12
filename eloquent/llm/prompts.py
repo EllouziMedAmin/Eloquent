@@ -38,6 +38,7 @@ def build_proofread_prompt(raw: str, ctx: str) -> str:
 _BASE_FORMAT_RULES = """
 Rules:
 - Use ONLY facts, numbers, and statements present in the transcript. Never invent information.
+- If speaker labels (such as Speaker 1, Speaker 2) are present, preserve accurate speaker attribution for points, decisions, and action items.
 - Silently correct any remaining speech-recognition typos when writing the document.
 - Write in the SAME language as the transcript unless the user explicitly asks for another language.
 - Format cleanly in Markdown (headings, bullet points, bold key terms). Do not wrap the whole reply in ```markdown fences.

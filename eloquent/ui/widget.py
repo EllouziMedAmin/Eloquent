@@ -99,11 +99,30 @@ def make_icon(color="#7c5cff") -> QIcon:
     return QIcon(pm)
 
 
+SPEAKER_COLORS = ("#7db4ff", "#6ee7b7", "#fbbf24", "#f472b6", "#c084fc", "#fb923c", "#38bdf8", "#a3e635")
+
+
+def _speaker_badge(spk: str, esc) -> str:
+    if not spk:
+        return ""
+    idx = sum(ord(c) for c in spk)
+    try:
+        idx = int(spk.rsplit(" ", 1)[-1]) - 1
+    except ValueError:
+        pass
+    color = SPEAKER_COLORS[idx % len(SPEAKER_COLORS)]
+    return (f'<span style="color:{color};background:rgba(255,255,255,14);'
+            f'border-radius:4px;padding:0 5px;font-size:10px;font-weight:600">'
+            f'{esc(spk)}</span>&nbsp; ')
+
+
 def transcript_html(snap: dict, show_raw: bool) -> str:
     esc = html.escape
+    multi = bool(snap.get("multi_speaker"))
     out = []
     for p in snap["paragraphs"]:
-        head = f'<span style="color:#7d7d7d;font-size:11px">{esc(p["time"])}</span>'
+        badge = _speaker_badge(p.get("speaker", ""), esc) if multi else ""
+        head = f'{badge}<span style="color:#7d7d7d;font-size:11px">{esc(p["time"])}</span>'
         if p["status"] == "cleaning":
             head += '<span style="color:#7db4ff;font-size:11px"> · polishing…</span>'
             body = f'<span style="color:#9a9a9a"><i>{esc(p["raw"])}</i></span>'
@@ -117,7 +136,8 @@ def transcript_html(snap: dict, show_raw: bool) -> str:
                 if p["note"] else "")
         out.append(f'<p style="margin:0 0 12px 0">{head}<br>{body}{note}</p>')
     for x in snap["loose"]:
-        out.append(f'<p style="margin:0 0 6px 0"><span style="color:#7d7d7d;font-size:11px">'
+        badge = _speaker_badge(x.get("speaker", ""), esc) if multi else ""
+        out.append(f'<p style="margin:0 0 6px 0">{badge}<span style="color:#7d7d7d;font-size:11px">'
                    f'{esc(x["t"])}</span>&nbsp;&nbsp;{esc(x["text"])}</p>')
     if not out:
         out.append('<p style="color:#7d7d7d">The transcript will appear here.</p>')
@@ -330,7 +350,7 @@ class EloquentWidget(QWidget):
             self.last_final = data["text"]
             self._caption(data["text"], "")
             self._mark_dirty()
-        elif kind in ("paragraph", "reset"):
+        elif kind in ("paragraph", "reset", "speakers"):
             if kind == "reset":
                 self.last_final = ""
                 self.view_mode = "transcript"
@@ -564,6 +584,7 @@ class EloquentWidget(QWidget):
         if dlg.exec():
             self.register_hotkey()
             self.engine.refresh_provider()
+            self.engine.sync_diarizer()
             self._update_llm_label()
             self._update_controls()
             if self.engine.status == "idle":
