@@ -52,7 +52,8 @@ class State:
         self.emit("partial", text)
 
     def add_segment(self, text: str, stamp: str, info: dict,
-                    start_sec: float = 0.0, spk_ready: bool = True) -> int:
+                    start_sec: float = 0.0, spk_ready: bool = True,
+                    speaker: str = "") -> int:
         import time
         with self.lock:
             tid = self.next_turn_id
@@ -60,7 +61,7 @@ class State:
             self.loose.append({
                 "id": tid, "t": stamp, "start_sec": start_sec,
                 "ts": time.time(), "text": text,
-                "speaker": "", "spk_ready": spk_ready,
+                "speaker": speaker, "spk_ready": spk_ready,
             })
             self.partial = ""
             self.rev += 1

@@ -39,7 +39,9 @@ class Settings:
     # --- speech ---
     threads: int = 0                  # 0 = auto
     diarize: bool = True              # background multi-speaker identification (Speaker 1, 2, ...)
+    audio_source: str = "mic"         # "mic" | "system" | "both"
     device: Optional[int] = None      # None = system default microphone
+    loopback_device: Optional[str] = None  # None = default Windows playback speakers
     silence: float = 0.5
     max_utterance: float = 15.0
     vad_threshold: float = 0.5

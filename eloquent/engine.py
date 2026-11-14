@@ -24,6 +24,7 @@ from pathlib import Path
 
 import numpy as np
 
+from .audio import LoopbackCapture, MicCapture
 from .cleaner import Cleaner
 from .diarizer import Diarizer, build_speaker_extractor, ensure_speaker_model
 from .llm import make_provider
@@ -32,6 +33,29 @@ from .session import Session, write_session_files
 from .speech import (SAMPLE_RATE, WINDOW, build_recognizer, build_vad, ensure_asr_model,
                      ensure_vad_model, read_wav_16k, transcribe, transcribe_detailed)
 from .state import State, fmt_time
+
+_SILENCE_FRAME = np.zeros(WINDOW, dtype=np.float32)
+
+
+class _StreamPipe:
+    """Per-audio-source VAD + partial buffer + speaker routing state."""
+
+    def __init__(self, tag: str, vad, preroll: int, partial_every: int,
+                 use_diarizer: bool = True, fixed_speaker: str = "", partial_prefix: str = ""):
+        self.tag = tag
+        self.vad = vad
+        self.preroll = preroll
+        self.partial_every = partial_every
+        self.use_diarizer = use_diarizer
+        self.fixed_speaker = fixed_speaker
+        self.partial_prefix = partial_prefix
+        self.buf = collections.deque()
+        self.buf_len = 0
+        self.since_partial = 0
+        self.last_partial = ""
+        self.samples = 0
+        self.level = 0.0
+        self.last_frame_t = time.monotonic()
 
 
 class Engine:
@@ -166,7 +190,6 @@ class Engine:
         self.state.reset()
         self.session = Session(s.resolved_sessions_dir(), save_audio=s.save_audio)
         self.last_session_dir = self.session.dir
-        self.vad = build_vad(self.vad_path, s.vad_threshold, s.silence, s.max_utterance)
         if s.diarize and self.extractor is None:
             self._load_speaker_extractor()
         self.diarizer = Diarizer(self.extractor, self.state, self.session, log=self.log) if (
@@ -176,14 +199,35 @@ class Engine:
             self.diarizer.start()
         self.cleaner = Cleaner(self.state, self.session, self.provider, s, log=self.log)
         self.cleaner.start()
-        # per-session pipeline state
-        self._buf = collections.deque()
-        self._buf_len = 0
-        self._since_partial = 0
-        self._last_partial = ""
-        self._samples = 0
-        self._preroll = int(0.3 * SAMPLE_RATE)
-        self._partial_every = int(s.partial_interval * SAMPLE_RATE)
+
+        # per-session pipeline state (one VAD pipe per live source, or single file pipe)
+        preroll = int(0.3 * SAMPLE_RATE)
+        partial_every = int(s.partial_interval * SAMPLE_RATE)
+        src = s.audio_source if s.audio_source in ("mic", "system", "both") else "mic"
+        self._is_file_run = wav_path is not None
+        self._session_t0 = time.monotonic()
+        self._pipes: dict[str, _StreamPipe] = {}
+        if wav_path is not None:
+            self._pipes["file"] = _StreamPipe(
+                "file", build_vad(self.vad_path, s.vad_threshold, s.silence, s.max_utterance),
+                preroll, partial_every, use_diarizer=(self.diarizer is not None),
+            )
+        elif src == "both":
+            self._pipes["mic"] = _StreamPipe(
+                "mic", build_vad(self.vad_path, s.vad_threshold, s.silence, s.max_utterance),
+                preroll, partial_every, use_diarizer=False, fixed_speaker="You", partial_prefix="You: ",
+            )
+            self._pipes["system"] = _StreamPipe(
+                "system", build_vad(self.vad_path, s.vad_threshold, s.silence, s.max_utterance),
+                preroll, partial_every, use_diarizer=(self.diarizer is not None),
+                fixed_speaker="" if self.diarizer is not None else "Remote",
+            )
+        else:
+            self._pipes[src] = _StreamPipe(
+                src, build_vad(self.vad_path, s.vad_threshold, s.silence, s.max_utterance),
+                preroll, partial_every, use_diarizer=(self.diarizer is not None),
+            )
+
         self._stop.clear()
         self._set_status("listening")
         self._emit("session_started", {"dir": str(self.session.dir)})
@@ -215,7 +259,7 @@ class Engine:
     def _run(self, wav_path):
         try:
             if wav_path is None:
-                self._loop_mic()
+                self._loop_live()
             else:
                 self._loop_file(Path(wav_path))
         except Exception as e:
@@ -223,70 +267,111 @@ class Engine:
         finally:
             self._finish()
 
-    def _loop_mic(self):
-        import sounddevice as sd
-        q: "queue.Queue[np.ndarray]" = queue.Queue()
+    def _loop_live(self):
+        s = self.settings
+        q: "queue.Queue[tuple[str, np.ndarray]]" = queue.Queue()
+        captures = []
+        dual = "mic" in self._pipes and "system" in self._pipes
+        wav_sys = collections.deque() if (dual and s.save_audio) else None
+        frame_dt = WINDOW / SAMPLE_RATE
 
-        def callback(indata, frames, time_info, status):
-            q.put(indata[:, 0].copy())
+        try:
+            if "mic" in self._pipes:
+                mic = MicCapture(s.device, q, tag="mic", on_status=lambda m: self.log(m, "warn"))
+                mic.start()
+                captures.append(mic)
+            if "system" in self._pipes:
+                sys_cap = LoopbackCapture(s.loopback_device, q, tag="system", on_log=self.log)
+                sys_cap.start()
+                captures.append(sys_cap)
 
-        pending = np.zeros(0, dtype=np.float32)
-        with sd.InputStream(channels=1, dtype="float32", samplerate=SAMPLE_RATE,
-                            blocksize=WINDOW, device=self.settings.device, callback=callback):
+            self._session_t0 = time.monotonic()
+            for p in self._pipes.values():
+                p.last_frame_t = self._session_t0
+
             while not self._stop.is_set():
                 try:
-                    chunk = q.get(timeout=0.2)
+                    tag, frame = q.get(timeout=0.04)
                 except queue.Empty:
-                    continue
-                pending = np.concatenate([pending, chunk])
-                while len(pending) >= WINDOW:
-                    frame, pending = pending[:WINDOW], pending[WINDOW:]
-                    # skip live partials if mic queue backs up >~130 ms: finals always win
-                    self._process(frame, allow_partial=q.qsize() < 4)
+                    tag, frame = None, None
+
+                now = time.monotonic()
+                if tag is not None:
+                    pipe = self._pipes[tag]
+                    pipe.last_frame_t = now
+                    pipe.level = float(np.sqrt(np.mean(frame * frame)))
+                    if s.save_audio:
+                        if dual:
+                            if tag == "mic":
+                                sf = wav_sys.popleft() if wav_sys else 0.0
+                                self.session.write_audio(np.clip(frame + sf, -1.0, 1.0))
+                            elif len(wav_sys) < 12:
+                                wav_sys.append(frame)
+                        else:
+                            self.session.write_audio(frame)
+                    self._process_pipe(pipe, frame, allow_partial=q.qsize() < 6, elapsed=now - self._session_t0)
+
+                # Windows WASAPI loopback pauses callbacks during total system silence; inject trailing
+                # quiet frames if speech was active so Silero VAD finalizes immediately on YouTube pause.
+                sys_pipe = self._pipes.get("system")
+                if sys_pipe is not None and (now - sys_pipe.last_frame_t) >= 0.08:
+                    sys_pipe.level = 0.0
+                    if sys_pipe.vad.is_speech_detected() or not sys_pipe.vad.empty():
+                        sys_pipe.last_frame_t += frame_dt
+                        self._process_pipe(sys_pipe, _SILENCE_FRAME, allow_partial=False,
+                                           elapsed=now - self._session_t0)
+
+                self.level = max((p.level for p in self._pipes.values()), default=0.0)
+        finally:
+            for cap in captures:
+                cap.close()
 
     def _loop_file(self, path: Path):
         """Feed a recording through the exact same pipeline, as fast as the CPU allows."""
         self.log(f"Transcribing file: {path}")
+        pipe = self._pipes["file"]
         audio = read_wav_16k(path)
         for i in range(0, len(audio) - WINDOW + 1, WINDOW):
             if self._stop.is_set():
                 break
-            self._process(audio[i:i + WINDOW], allow_partial=False)
+            frame = audio[i:i + WINDOW]
+            self.session.write_audio(frame)
+            pipe.level = float(np.sqrt(np.mean(frame * frame)))
+            self.level = pipe.level
+            self._process_pipe(pipe, frame, allow_partial=False, elapsed=None)
 
-    def _process(self, frame: np.ndarray, allow_partial: bool):
-        self.session.write_audio(frame)
-        self._samples += len(frame)
-        self.level = float(np.sqrt(np.mean(frame * frame)))
-        vad = self.vad
+    def _process_pipe(self, pipe: _StreamPipe, frame: np.ndarray, allow_partial: bool, elapsed):
+        pipe.samples += len(frame)
+        vad = pipe.vad
         vad.accept_waveform(frame)
-        self._buf.append(frame)
-        self._buf_len += len(frame)
+        pipe.buf.append(frame)
+        pipe.buf_len += len(frame)
         speaking = vad.is_speech_detected()
 
         if not speaking and vad.empty():
             # keep a short pre-roll so the first syllable is not cut
-            while self._buf_len - len(self._buf[0]) >= self._preroll and len(self._buf) > 1:
-                self._buf_len -= len(self._buf.popleft())
+            while pipe.buf_len - len(pipe.buf[0]) >= pipe.preroll and len(pipe.buf) > 1:
+                pipe.buf_len -= len(pipe.buf.popleft())
             return
 
-        self._since_partial += len(frame)
+        pipe.since_partial += len(frame)
         # Step back partial frequency on long utterances to avoid O(N^2) re-decoding overhead
-        buf_sec = self._buf_len / SAMPLE_RATE
-        interval = self._partial_every if buf_sec <= 5.0 else (
-            self._partial_every * 2 if buf_sec <= 10.0 else int(self._partial_every * 2.5)
+        buf_sec = pipe.buf_len / SAMPLE_RATE
+        interval = pipe.partial_every if buf_sec <= 5.0 else (
+            pipe.partial_every * 2 if buf_sec <= 10.0 else int(pipe.partial_every * 2.5)
         )
-        if speaking and allow_partial and self._since_partial >= interval:
-            self._since_partial = 0
-            text = transcribe(self.recognizer, np.concatenate(self._buf))
-            if text and text != self._last_partial:
-                self._last_partial = text
-                self.state.set_partial(text)
+        if speaking and allow_partial and pipe.since_partial >= interval:
+            pipe.since_partial = 0
+            text = transcribe(self.recognizer, np.concatenate(pipe.buf))
+            if text and text != pipe.last_partial:
+                pipe.last_partial = text
+                self.state.set_partial(f"{pipe.partial_prefix}{text}" if pipe.partial_prefix else text)
 
-        self._drain()
+        self._drain_pipe(pipe, elapsed)
 
-    def _drain(self):
-        """Transcribe every sentence the VAD has finished."""
-        vad = self.vad
+    def _drain_pipe(self, pipe: _StreamPipe, elapsed):
+        """Transcribe every finished utterance on a pipe and route to State (+ Diarizer if applicable)."""
+        vad = pipe.vad
         while not vad.empty():
             seg = np.asarray(vad.front.samples, dtype=np.float32)
             vad.pop()
@@ -295,36 +380,40 @@ class Engine:
             dur = len(seg) / SAMPLE_RATE
             decode = time.time() - t1
             if text:
-                t0 = max(0.0, self._samples / SAMPLE_RATE - dur)
+                end_sec = (pipe.samples / SAMPLE_RATE) if elapsed is None else elapsed
+                t0 = max(0.0, end_sec - dur)
                 stamp = fmt_time(t0)
                 self.session.add_raw(stamp, text)
+                use_diar = pipe.use_diarizer and self.diarizer is not None
                 seg_id = self.state.add_segment(
                     text, stamp, {"audio_sec": dur, "decode_sec": decode},
-                    start_sec=t0, spk_ready=(self.diarizer is None),
+                    start_sec=t0, spk_ready=(not use_diar), speaker=pipe.fixed_speaker,
                 )
-                if self.diarizer is not None:
+                if use_diar:
                     self.diarizer.submit(seg_id, t0, stamp, seg, text, words)
             else:
                 self.state.set_partial("")
-            self._buf.clear()
-            self._buf_len = 0
-            self._since_partial = 0
-            self._last_partial = ""
+            pipe.buf.clear()
+            pipe.buf_len = 0
+            pipe.since_partial = 0
+            pipe.last_partial = ""
 
     def _finish(self):
-        """Finish the sentence in progress, then diarization & cleanup, then close the files."""
+        """Flush all active streams, finish diarization & cleanup, then close session files."""
         self._set_status("stopping")
         self.level = 0.0
         try:
-            self.vad.flush()
-            self._drain()
+            elapsed = None if self._is_file_run else (time.monotonic() - self._session_t0)
+            for pipe in self._pipes.values():
+                pipe.vad.flush()
+                self._drain_pipe(pipe, elapsed)
         except Exception as e:
             self.log(f"Flush error: {e}", "error")
         self.state.set_partial("")
         if self.diarizer is not None:
             self.diarizer.flush_and_wait()
         self.cleaner.flush_and_wait()
-        if self.diarizer is not None:
+        if self.diarizer is not None or self.state.snapshot().get("multi_speaker"):
             self.session.sync_from_state(self.state)
         self.diarizer = None
         self.session.close()
