@@ -30,10 +30,10 @@ class Cleaner(threading.Thread):
             if not segs:
                 return None
             now = time.time()
-            # Wait briefly (~4.5s max) for background diarizer before locking a chunk into a paragraph
+            # Wait briefly (~6.0s max) for background diarizer before locking a chunk into a paragraph
             ready_n = 0
             for s in segs:
-                if not self.flushing and not s.get("spk_ready", True) and (now - s["ts"]) < 4.5:
+                if not self.flushing and not s.get("spk_ready", True) and (now - s["ts"]) < 6.0:
                     break
                 ready_n += 1
             if ready_n == 0:
@@ -73,6 +73,8 @@ class Cleaner(threading.Thread):
                 "id": st.next_id, "time": chunk[0]["t"], "raw": raw, "clean": None,
                 "tokens": None, "status": "cleaning" if self.provider else "raw",
                 "note": "", "speaker": first_spk, "seg_ids": [s["id"] for s in chunk],
+                "segs": [{"id": s["id"], "t": s["t"], "text": s["text"], "speaker": s.get("speaker", "")}
+                         for s in chunk],
             }
             st.next_id += 1
             st.paragraphs.append(para)
@@ -143,7 +145,10 @@ class Cleaner(threading.Thread):
                 result, note = self._clean(raw, self._context(para))
             tokens = mark_changes(raw, result) if result else None   # outside the lock
             with self.state.lock:
-                if result:
+                if para["raw"] != raw:
+                    if para.get("status") == "cleaning":
+                        para["status"] = "raw"
+                elif result:
                     para.update(clean=result, tokens=tokens, status="done")
                 else:
                     para.update(status="raw", note=note)

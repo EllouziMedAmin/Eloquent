@@ -75,6 +75,7 @@ class State:
         import time
         now = time.time()
         with self.lock:
+            segs_dirty = False
             idx = next((i for i, x in enumerate(self.loose) if x["id"] == seg_id), None)
             if idx is not None and parts:
                 orig_ts = self.loose[idx]["ts"]
@@ -93,27 +94,23 @@ class State:
                     sids = p.get("seg_ids", ())
                     if seg_id not in sids:
                         continue
-                    if len(sids) == 1 and len(parts) > 1:
-                        # Group consecutive parts by speaker so mid-chunk switches aren't orphaned
-                        grouped = []
-                        for tid, st, t0, txt, spk in parts:
-                            sp = mapping.get(tid, spk)
-                            if grouped and grouped[-1]["speaker"] == sp:
-                                grouped[-1]["raw"] += f" {txt}"
-                                grouped[-1]["seg_ids"].append(tid)
-                            else:
-                                grouped.append({
-                                    "id": p["id"] if not grouped else self.next_id,
-                                    "time": st, "raw": txt, "clean": None, "tokens": None,
-                                    "status": "raw", "note": "", "speaker": sp, "seg_ids": [tid],
-                                })
-                                if len(grouped) > 1:
-                                    self.next_id += 1
-                        if len(grouped) == 1:
-                            p["speaker"] = grouped[0]["speaker"]
-                            p["seg_ids"] = grouped[0]["seg_ids"]
-                        else:
-                            self.paragraphs[pi:pi + 1] = grouped
+                    segs_meta = p.get("segs")
+                    if segs_meta is not None:
+                        idx_s = next((si for si, item in enumerate(segs_meta) if item["id"] == seg_id), None)
+                        if idx_s is not None:
+                            segs_meta[idx_s:idx_s + 1] = [
+                                {"id": tid, "t": st, "text": txt, "speaker": mapping.get(tid, spk)}
+                                for tid, st, t0, txt, spk in parts
+                            ]
+                            p["seg_ids"] = [item["id"] for item in segs_meta]
+                            segs_dirty = True
+                    elif len(sids) == 1 and len(parts) > 1:
+                        p["segs"] = [
+                            {"id": tid, "t": st, "text": txt, "speaker": mapping.get(tid, spk)}
+                            for tid, st, t0, txt, spk in parts
+                        ]
+                        p["seg_ids"] = [item["id"] for item in p["segs"]]
+                        segs_dirty = True
                     else:
                         first_tid = parts[0][0]
                         p["speaker"] = mapping.get(first_tid, parts[0][4])
@@ -122,18 +119,60 @@ class State:
                             p["seg_ids"] = list(sids) + extra
                     break
 
-            if mapping:
+            if mapping or segs_dirty:
                 for x in self.loose:
                     if x["id"] in mapping:
                         x["speaker"] = mapping[x["id"]]
+                new_paragraphs = []
                 for p in self.paragraphs:
-                    counts: dict[str, int] = {}
-                    for tid in p.get("seg_ids", ()):
-                        if tid in mapping:
-                            sp = mapping[tid]
-                            counts[sp] = counts.get(sp, 0) + 1
-                    if counts:
-                        p["speaker"] = max(counts.items(), key=lambda kv: kv[1])[0]
+                    segs_meta = p.get("segs")
+                    if segs_meta:
+                        for item in segs_meta:
+                            if item["id"] in mapping:
+                                item["speaker"] = mapping[item["id"]]
+                        # Split into consecutive speaker runs if multiple speakers exist inside this paragraph
+                        spk_set = {item["speaker"] for item in segs_meta if item.get("speaker")}
+                        if len(spk_set) > 1:
+                            runs = []
+                            for item in segs_meta:
+                                sp = item.get("speaker", "")
+                                if runs and runs[-1]["speaker"] == sp:
+                                    runs[-1]["items"].append(item)
+                                else:
+                                    runs.append({"speaker": sp, "items": [item]})
+                            for ri, run in enumerate(runs):
+                                items = run["items"]
+                                raw_run = " ".join(it["text"] for it in items)
+                                if ri == 0:
+                                    base = p
+                                    if base.get("raw") != raw_run:
+                                        base["clean"] = None
+                                        base["tokens"] = None
+                                        base["status"] = "raw"
+                                else:
+                                    base = {
+                                        "id": self.next_id, "clean": None, "tokens": None, "status": "raw", "note": "",
+                                    }
+                                    self.next_id += 1
+                                base["time"] = items[0]["t"]
+                                base["raw"] = raw_run
+                                base["speaker"] = run["speaker"]
+                                base["seg_ids"] = [it["id"] for it in items]
+                                base["segs"] = items
+                                new_paragraphs.append(base)
+                            continue
+                        if spk_set:
+                            p["speaker"] = next(iter(spk_set))
+                    else:
+                        counts: dict[str, int] = {}
+                        for tid in p.get("seg_ids", ()):
+                            if tid in mapping:
+                                sp = mapping[tid]
+                                counts[sp] = counts.get(sp, 0) + 1
+                        if counts:
+                            p["speaker"] = max(counts.items(), key=lambda kv: kv[1])[0]
+                    new_paragraphs.append(p)
+                self.paragraphs = new_paragraphs
             self.rev += 1
         self.emit("speakers", seg_id)
 

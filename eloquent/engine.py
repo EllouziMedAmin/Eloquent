@@ -53,6 +53,9 @@ class _StreamPipe:
         self.buf_len = 0
         self.since_partial = 0
         self.last_partial = ""
+        self.partial_cut = 0
+        self.partial_prefix_text = ""
+        self.last_partial_dt = 0.0
         self.samples = 0
         self.level = 0.0
         self.last_frame_t = time.monotonic()
@@ -204,27 +207,28 @@ class Engine:
         preroll = int(0.3 * SAMPLE_RATE)
         partial_every = int(s.partial_interval * SAMPLE_RATE)
         src = s.audio_source if s.audio_source in ("mic", "system", "both") else "mic"
+        max_utt = min(float(s.max_utterance), 8.0)
         self._is_file_run = wav_path is not None
         self._session_t0 = time.monotonic()
         self._pipes: dict[str, _StreamPipe] = {}
         if wav_path is not None:
             self._pipes["file"] = _StreamPipe(
-                "file", build_vad(self.vad_path, s.vad_threshold, s.silence, s.max_utterance),
+                "file", build_vad(self.vad_path, s.vad_threshold, s.silence, max_utt),
                 preroll, partial_every, use_diarizer=(self.diarizer is not None),
             )
         elif src == "both":
             self._pipes["mic"] = _StreamPipe(
-                "mic", build_vad(self.vad_path, s.vad_threshold, s.silence, s.max_utterance),
+                "mic", build_vad(self.vad_path, s.vad_threshold, s.silence, max_utt),
                 preroll, partial_every, use_diarizer=False, fixed_speaker="You", partial_prefix="You: ",
             )
             self._pipes["system"] = _StreamPipe(
-                "system", build_vad(self.vad_path, s.vad_threshold, s.silence, s.max_utterance),
+                "system", build_vad(self.vad_path, s.vad_threshold, s.silence, max_utt),
                 preroll, partial_every, use_diarizer=(self.diarizer is not None),
                 fixed_speaker="" if self.diarizer is not None else "Remote",
             )
         else:
             self._pipes[src] = _StreamPipe(
-                src, build_vad(self.vad_path, s.vad_threshold, s.silence, s.max_utterance),
+                src, build_vad(self.vad_path, s.vad_threshold, s.silence, max_utt),
                 preroll, partial_every, use_diarizer=(self.diarizer is not None),
             )
 
@@ -355,14 +359,44 @@ class Engine:
             return
 
         pipe.since_partial += len(frame)
-        # Step back partial frequency on long utterances to avoid O(N^2) re-decoding overhead
         buf_sec = pipe.buf_len / SAMPLE_RATE
-        interval = pipe.partial_every if buf_sec <= 5.0 else (
-            pipe.partial_every * 2 if buf_sec <= 10.0 else int(pipe.partial_every * 2.5)
-        )
-        if speaking and allow_partial and pipe.since_partial >= interval:
+
+        # Prefix-locked partial decoding: keep decoded tail <= ~5.2 s + bounded adaptive cooldown
+        base_iv = pipe.partial_every if buf_sec <= 4.5 else int(pipe.partial_every * 1.6)
+        min_iv = max(base_iv, min(int(1.4 * SAMPLE_RATE), int(pipe.last_partial_dt * 1.5 * SAMPLE_RATE)))
+        if speaking and allow_partial and pipe.since_partial >= min_iv:
             pipe.since_partial = 0
-            text = transcribe(self.recognizer, np.concatenate(pipe.buf))
+            full = np.concatenate(pipe.buf)
+            tail = full[pipe.partial_cut:]
+            t_dec = time.monotonic()
+            if len(tail) > int(4.4 * SAMPLE_RATE):
+                _, pwords = transcribe_detailed(self.recognizer, tail)
+                tail_dur = len(tail) / SAMPLE_RATE
+                cut_idx = None
+                for wi in range(len(pwords) - 1, -1, -1):
+                    if pwords[wi]["t1"] <= tail_dur - 1.8:
+                        if wi + 1 < len(pwords) and (pwords[wi + 1]["t0"] - pwords[wi]["t1"]) >= 0.06:
+                            cut_idx = wi
+                            break
+                        if cut_idx is None:
+                            cut_idx = wi
+                if cut_idx is not None:
+                    committed = " ".join(w["w"] for w in pwords[:cut_idx + 1]).strip()
+                    rest = " ".join(w["w"] for w in pwords[cut_idx + 1:]).strip()
+                    if committed:
+                        pipe.partial_prefix_text = f"{pipe.partial_prefix_text} {committed}".strip()
+                    t_adv = float(pwords[cut_idx]["t1"])
+                    if cut_idx + 1 < len(pwords):
+                        gap = float(pwords[cut_idx + 1]["t0"]) - t_adv
+                        t_adv = t_adv + min(0.03, 0.5 * max(0.0, gap))
+                    pipe.partial_cut += min(len(tail), max(0, int(t_adv * SAMPLE_RATE)))
+                    text = f"{pipe.partial_prefix_text} {rest}".strip()
+                else:
+                    text = f"{pipe.partial_prefix_text} {' '.join(w['w'] for w in pwords)}".strip()
+            else:
+                tail_text = transcribe(self.recognizer, tail)
+                text = f"{pipe.partial_prefix_text} {tail_text}".strip()
+            pipe.last_partial_dt = time.monotonic() - t_dec
             if text and text != pipe.last_partial:
                 pipe.last_partial = text
                 self.state.set_partial(f"{pipe.partial_prefix}{text}" if pipe.partial_prefix else text)
@@ -397,6 +431,9 @@ class Engine:
             pipe.buf_len = 0
             pipe.since_partial = 0
             pipe.last_partial = ""
+            pipe.partial_cut = 0
+            pipe.partial_prefix_text = ""
+            pipe.last_partial_dt = 0.0
 
     def _finish(self):
         """Flush all active streams, finish diarization & cleanup, then close session files."""
