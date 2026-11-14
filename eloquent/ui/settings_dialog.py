@@ -1,7 +1,7 @@
 """Eloquent settings dialog (own dark theme, grouped sections)."""
 
 from PySide6.QtCore import QPoint, Qt
-from PySide6.QtGui import QColor, QKeySequence, QPainter, QPalette, QPen, QPixmap
+from PySide6.QtGui import QColor, QGuiApplication, QKeySequence, QPainter, QPalette, QPen, QPixmap
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QFileDialog, QFrame, QHBoxLayout, QKeySequenceEdit,
                                QLabel, QLineEdit, QMessageBox, QPushButton, QScrollArea, QVBoxLayout, QWidget)
 
@@ -42,7 +42,7 @@ QLabel#hint a, QLabel a { color: #8fb4ff; text-decoration: none; }
 QFrame#card { background: #222226; border: 1px solid #2f2f35; border-radius: 12px; }
 QLineEdit, QComboBox, QKeySequenceEdit {
     background: #2a2a2f; color: #ececec; border: 1px solid #3a3a41; border-radius: 8px;
-    padding: 6px 10px; font: 10pt "Segoe UI"; selection-background-color: #4b5bd6;
+    padding: 5px 10px; font: 10pt "Segoe UI"; selection-background-color: #4b5bd6;
 }
 QLineEdit:focus, QComboBox:focus, QKeySequenceEdit:focus { border: 1px solid #7c7cff; }
 QLineEdit:disabled, QComboBox:disabled { color: #6a6a72; background: #232327; }
@@ -59,9 +59,10 @@ QPushButton:hover { background: #3a3a43; }
 QPushButton#primary { background: #5b5bf0; border: 1px solid #5b5bf0; color: white; font-weight: 600; }
 QPushButton#primary:hover { background: #6d6df5; }
 QPushButton#small { padding: 6px 12px; }
-QScrollBar:vertical { background: transparent; width: 8px; margin: 2px; }
-QScrollBar::handle:vertical { background: #44444c; border-radius: 4px; min-height: 30px; }
+QScrollBar:vertical { background: transparent; width: 9px; margin: 2px; }
+QScrollBar::handle:vertical { background: #44444c; border-radius: 4px; min-height: 28px; }
 QScrollBar::add-line, QScrollBar::sub-line { height: 0; }
+QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: none; }
 """
 
 
@@ -81,14 +82,15 @@ class SettingsDialog(QDialog):
     def __init__(self, settings, parent=None, first_run=False):
         super().__init__(parent)
         self.s = settings
+        self._positioned = False
         self.setWindowTitle(f"{APP_NAME} settings")
-        self.setMinimumWidth(560)
-        self.setMaximumHeight(820)
+        self.setMinimumSize(460, 380)
+        self.setSizeGripEnabled(True)
         self.setStyleSheet(DIALOG_STYLE.replace("image: none;", f"image: url({_check_icon_path()});"))
 
         root = QVBoxLayout(self)
-        root.setContentsMargins(24, 22, 24, 20)
-        root.setSpacing(14)
+        root.setContentsMargins(20, 16, 20, 16)
+        root.setSpacing(10)
 
         root.addWidget(_label("Settings", "title"))
         if first_run:
@@ -99,8 +101,8 @@ class SettingsDialog(QDialog):
 
         body = QWidget(objectName="body")
         bl = QVBoxLayout(body)
-        bl.setContentsMargins(0, 0, 4, 0)
-        bl.setSpacing(16)
+        bl.setContentsMargins(0, 0, 6, 0)
+        bl.setSpacing(12)
         bl.addLayout(self._section_polish())
         bl.addLayout(self._section_recording())
         bl.addLayout(self._section_shortcuts())
@@ -126,21 +128,48 @@ class SettingsDialog(QDialog):
         root.addLayout(footer)
 
         self._sync_llm_enabled()
-        self.resize(600, min(body.sizeHint().height() + (210 if first_run else 160), 800))
+        screen = (parent.screen() if parent else None) or QGuiApplication.primaryScreen()
+        avail = screen.availableGeometry() if screen else None
+        max_w = max(460, avail.width() - 40) if avail else 640
+        max_h = max(380, int(avail.height() * 0.72)) if avail else 560
+        default_h = 560 if first_run else 520
+        self.resize(min(520, max_w), max(380, min(body.sizeHint().height() + (190 if first_run else 140), default_h, max_h)))
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if self._positioned:
+            return
+        self._positioned = True
+        screen = self.screen() or QGuiApplication.primaryScreen()
+        if not screen:
+            return
+        avail = screen.availableGeometry().adjusted(8, 8, -8, -8)
+        fg = self.frameGeometry()
+        extra_h = max(0, fg.height() - self.height())
+        if fg.height() > avail.height():
+            self.resize(self.width(), max(self.minimumHeight(), avail.height() - extra_h))
+            fg = self.frameGeometry()
+        if fg.width() > avail.width():
+            self.resize(max(self.minimumWidth(), avail.width()), self.height())
+            fg = self.frameGeometry()
+        dx = max(0, avail.left() - fg.left()) + min(0, avail.right() - fg.right())
+        dy = max(0, avail.top() - fg.top()) + min(0, avail.bottom() - fg.bottom())
+        if dx or dy:
+            self.move(self.pos() + QPoint(dx, dy))
 
     # ------------------------------------------------------------------ #
     @staticmethod
     def _card():
         card = QFrame(objectName="card")
         lay = QVBoxLayout(card)
-        lay.setContentsMargins(16, 14, 16, 14)
-        lay.setSpacing(10)
+        lay.setContentsMargins(14, 11, 14, 11)
+        lay.setSpacing(8)
         return card, lay
 
     @staticmethod
     def _field(title: str, widget: QWidget, hint: str = "") -> QVBoxLayout:
         col = QVBoxLayout()
-        col.setSpacing(5)
+        col.setSpacing(4)
         col.addWidget(_label(title))
         col.addWidget(widget)
         if hint:
@@ -149,7 +178,7 @@ class SettingsDialog(QDialog):
 
     def _section(self, title: str, card: QFrame) -> QVBoxLayout:
         sec = QVBoxLayout()
-        sec.setSpacing(8)
+        sec.setSpacing(6)
         sec.addWidget(_label(title.upper(), "section"))
         sec.addWidget(card)
         return sec
