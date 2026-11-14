@@ -43,7 +43,7 @@ class Settings:
     device: Optional[int] = None      # None = system default microphone
     loopback_device: Optional[str] = None  # None = default Windows playback speakers
     silence: float = 0.5
-    max_utterance: float = 15.0
+    max_utterance: float = 8.0
     vad_threshold: float = 0.5
     partial_interval: float = 0.5
     # --- output ---
