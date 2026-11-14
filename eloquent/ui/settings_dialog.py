@@ -6,6 +6,7 @@ from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QFileDialog, QFram
                                QLabel, QLineEdit, QMessageBox, QPushButton, QScrollArea, QVBoxLayout, QWidget)
 
 from .. import APP_NAME
+from ..audio import AUDIO_SOURCES, list_input_devices, list_loopback_devices
 from ..config import config_dir
 from ..hotkeys import parse_hotkey
 
@@ -202,18 +203,31 @@ class SettingsDialog(QDialog):
         s = self.s
         card, lay = self._card()
 
+        self.source = QComboBox()
+        for key, label in AUDIO_SOURCES:
+            self.source.addItem(label, key)
+        self.source.setCurrentIndex(max(0, self.source.findData(s.audio_source)))
+        self.source.currentIndexChanged.connect(self._sync_audio_source)
+        self.source_hint = _label("", "hint", wrap=True)
+        lay.addLayout(self._field("Audio source", self.source))
+        lay.addWidget(self.source_hint)
+
         self.mic = QComboBox()
         self.mic.addItem("System default", None)
-        try:
-            import sounddevice as sd
-            default_api = sd.query_devices(kind="input")["hostapi"]
-            for i, d in enumerate(sd.query_devices()):
-                if d["max_input_channels"] > 0 and d["hostapi"] == default_api:
-                    self.mic.addItem(d["name"], i)
-        except Exception:
-            pass
+        for i, name in list_input_devices():
+            self.mic.addItem(name, i)
         self.mic.setCurrentIndex(max(0, self.mic.findData(s.device)))
         lay.addLayout(self._field("Microphone", self.mic))
+
+        self.loopback = QComboBox()
+        self.loopback.addItem("Default playback speakers", None)
+        for _, name, is_def in list_loopback_devices():
+            self.loopback.addItem(f"{name} (default)" if is_def else name, name)
+        if s.loopback_device and self.loopback.findData(s.loopback_device) < 0:
+            self.loopback.addItem(s.loopback_device, s.loopback_device)
+        self.loopback.setCurrentIndex(max(0, self.loopback.findData(s.loopback_device)))
+        lay.addLayout(self._field("System output (loopback)", self.loopback))
+        self._sync_audio_source()
 
         self.audio = QCheckBox("Save the audio recording (audio.wav, about 115 MB per hour)")
         self.audio.setChecked(s.save_audio)
@@ -267,6 +281,17 @@ class SettingsDialog(QDialog):
         return self._section("Shortcuts", card)
 
     # ------------------------------------------------------------------ #
+    def _sync_audio_source(self):
+        src = self.source.currentData()
+        self.mic.setEnabled(src in ("mic", "both"))
+        self.loopback.setEnabled(src in ("system", "both"))
+        hints = {
+            "mic": "Captures your microphone only (best for dictation and in-person rooms).",
+            "system": "Captures Windows audio directly with zero speaker echo (best for YouTube, podcasts, videos).",
+            "both": "Labels your mic as You and remote audio separately. Wear headphones so speaker sound doesn't echo into your mic.",
+        }
+        self.source_hint.setText(hints.get(src, ""))
+
     def _sync_llm_enabled(self):
         on = self.cleanup.isChecked()
         for w in (self.key_box, self.model_box, self.fillers):
@@ -301,7 +326,9 @@ class SettingsDialog(QDialog):
         s.keep_fillers = self.fillers.isChecked()
         s.save_audio = self.audio.isChecked()
         s.diarize = self.diarize.isChecked()
+        s.audio_source = self.source.currentData() or "mic"
         s.device = self.mic.currentData()
+        s.loopback_device = self.loopback.currentData()
         s.hotkey = hk
         folder = self.folder.text().strip()
         s.sessions_dir = "" if folder == str(s.resolved_sessions_dir()) and not s.sessions_dir else folder

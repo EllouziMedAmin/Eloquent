@@ -30,6 +30,10 @@ SPEAKER_STYLES = ("bold cyan", "bold green", "bold yellow", "bold magenta", "bol
 
 
 def _speaker_style(spk: str) -> str:
+    if spk == "You":
+        return "bold bright_yellow"
+    if spk == "Remote":
+        return "bold cyan"
     idx = 0
     try:
         idx = int(spk.rsplit(" ", 1)[-1]) - 1
@@ -126,12 +130,16 @@ class TerminalUI:
         t.append(f"   {llm_txt}", style="dim")
         if self.last_seg_info:
             t.append(f"   last: {self.last_seg_info}", style="dim")
+        if not self.wav_path:
+            src_lbl = {"mic": "Mic", "system": "System", "both": "Mic+Sys"}.get(e.settings.audio_source, "Mic")
+            t.append(f"   [{src_lbl}]", style="cyan")
         if self.picking_format:
             opts = "  ".join(f"[{i+1}] {f['label']}" for i, f in enumerate(REPORT_FORMATS))
             t.append(f"\nGenerate: {opts}  [Esc] cancel", style="cyan")
         else:
             ren = " · R rename" if self.engine.state.snapshot().get("multi_speaker") else ""
-            hint = f"  Space start/stop{ren} · G generate · Q quit" if msvcrt and not self.wav_path else "  Ctrl+C stop"
+            src_key = " · A source" if e.status == "idle" else ""
+            hint = f"  Space start/stop{src_key}{ren} · G generate · Q quit" if msvcrt and not self.wav_path else "  Ctrl+C stop"
             t.append(hint, style="dim")
         return t
 
@@ -173,6 +181,13 @@ class TerminalUI:
                 continue
             if ch == " ":
                 self.engine.toggle()
+            elif ch.lower() == "a" and self.engine.status == "idle":
+                order = ("mic", "system", "both")
+                cur = self.engine.settings.audio_source
+                nxt = order[(order.index(cur) + 1) % len(order)] if cur in order else "mic"
+                self.engine.settings.audio_source = nxt
+                self.engine.settings.save()
+                self.changed.set()
             elif ch.lower() == "r" and self.engine.state.snapshot().get("multi_speaker"):
                 self.renaming = True
             elif ch.lower() == "g":

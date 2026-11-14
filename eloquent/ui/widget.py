@@ -29,13 +29,14 @@ if sys.platform == "win32":
     os.environ.setdefault("QT_LOGGING_RULES", "qt.gui.icc.warning=false")
 
 from PySide6.QtCore import QObject, QPoint, Qt, QTimer, QUrl, Signal
-from PySide6.QtGui import QAction, QColor, QDesktopServices, QFont, QGuiApplication, QIcon, QPainter, QPixmap
+from PySide6.QtGui import QAction, QActionGroup, QColor, QDesktopServices, QFont, QGuiApplication, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
                                QFormLayout, QFrame, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QMenu,
                                QMessageBox, QPushButton, QSizeGrip, QSystemTrayIcon, QTextBrowser, QToolButton,
                                QVBoxLayout, QWidget)
 
 from .. import APP_NAME, __version__
+from ..audio import AUDIO_SOURCES, AUDIO_SOURCE_LABELS
 from ..config import SETTINGS_FILE, config_dir
 from ..llm.prompts import REPORT_FORMATS
 
@@ -340,6 +341,15 @@ class EloquentWidget(QWidget):
 
         self.menu = QMenu(self)
         self.act_settings = self.menu.addAction("Settings…", self.open_settings)
+        src_menu = self.menu.addMenu("Audio source")
+        self.src_group = QActionGroup(self)
+        self.src_actions: dict[str, QAction] = {}
+        for key, label in AUDIO_SOURCES:
+            act = src_menu.addAction(label)
+            act.setCheckable(True)
+            act.triggered.connect(lambda _chk=False, k=key: self._set_audio_source(k))
+            self.src_group.addAction(act)
+            self.src_actions[key] = act
         self.act_audio = self.menu.addAction("Save audio recording")
         self.act_audio.setCheckable(True)
         self.act_audio.toggled.connect(self._set_audio)
@@ -450,7 +460,8 @@ class EloquentWidget(QWidget):
         if e.status != "idle":
             return
         hk = f" or {self.s.hotkey}" if self.hotkey_ok and self.s.hotkey else ""
-        msg = f"Ready. Press ▶{hk} to start"
+        src_tag = {"system": " (System audio)", "both": " (Mic + System)"}.get(self.s.audio_source, "")
+        msg = f"Ready{src_tag}. Press ▶{hk} to start"
         if e.llm["state"] == "off" and self.s.cleanup:
             msg += "  ·  no Gemini key, raw text only"
         self._caption(msg, "hint")
@@ -625,6 +636,11 @@ class EloquentWidget(QWidget):
 
     # -- menu / settings ------------------------------------------------------
     def _show_menu(self):
+        cur_src = self.s.audio_source if self.s.audio_source in self.src_actions else "mic"
+        for k, act in self.src_actions.items():
+            act.blockSignals(True)
+            act.setChecked(k == cur_src)
+            act.blockSignals(False)
         self.act_audio.blockSignals(True)
         self.act_audio.setChecked(self.s.save_audio)
         self.act_audio.blockSignals(False)
@@ -632,6 +648,16 @@ class EloquentWidget(QWidget):
         self.act_top.setChecked(self.s.always_on_top)
         self.act_top.blockSignals(False)
         self.menu.exec(self.btn_menu.mapToGlobal(QPoint(0, self.btn_menu.height())))
+
+    def _set_audio_source(self, src: str):
+        self.s.audio_source = src
+        self.s.save()
+        label = AUDIO_SOURCE_LABELS.get(src, src)
+        if self.engine.status != "idle":
+            self._caption(f"Audio source set to {label} (applies to next recording)", "hint")
+            self.caption_reset.start()
+        else:
+            self._idle_caption()
 
     def _set_audio(self, on):
         self.s.save_audio = on

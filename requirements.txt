@@ -1,5 +1,6 @@
 sherpa-onnx>=1.12
 sounddevice>=0.4.6
+PyAudioWPatch>=0.2.12; sys_platform == "win32"
 numpy>=1.24
 huggingface_hub>=0.20
 google-genai>=1.0

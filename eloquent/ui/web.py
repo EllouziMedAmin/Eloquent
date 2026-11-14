@@ -47,6 +47,11 @@ main{max-width:860px;margin:0 auto;padding:20px 20px 120px}
   <b>Eloquent</b>
   <span><span class="dot" id="dot"></span><span id="status">connecting</span></span>
   <button id="toggle" disabled>Start</button>
+  <select id="src" title="Audio source">
+    <option value="mic">Mic only</option>
+    <option value="system">System audio</option>
+    <option value="both">Mic + System</option>
+  </select>
   <label><input type="checkbox" id="raw"> show raw</label>
   <select id="fmt">
     <option value="summary">Concise Summary</option>
@@ -70,7 +75,8 @@ function el(tag,cls,text){const e=document.createElement(tag); if(cls)e.classNam
 function spkBadge(spk,spkId){
   if(!spk)return null;
   const key=spkId||spk, n=parseInt((key.split(' ').pop())||'1',10)||1;
-  const b=el('span','spk spk'+((n-1)%6),spk);
+  const idx=key==='You'?5:((n-1)%6);
+  const b=el('span','spk spk'+idx,spk);
   b.title='Click to rename '+spk;
   b.addEventListener('click',()=>renameOne(key,spk));
   return b;
@@ -120,6 +126,8 @@ function render(s){
   }
   if(s.partial) box.append(el('div','partial','... '+s.partial));
   $('rename').hidden=!s.multi_speaker;
+  if(s.audio_source){$('src').value=s.audio_source;}
+  $('src').disabled=(s.status!=='idle');
   $('err').textContent=s.error?('LLM: '+s.error):'';
   $('dot').className='dot '+s.status; $('status').textContent=s.status;
   const t=$('toggle'); t.disabled=!(s.status==='idle'||s.status==='listening');
@@ -134,6 +142,7 @@ function connect(){
 $('raw').addEventListener('change',e=>{showRaw=e.target.checked; if(state)render(state);});
 $('copy').addEventListener('click',()=>{if(state)navigator.clipboard.writeText(state.report&&state.report.text?state.report.text:allText(state));});
 $('toggle').addEventListener('click',()=>fetch('/toggle',{method:'POST'}));
+$('src').addEventListener('change',e=>fetch('/source',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({source:e.target.value})}));
 $('rename').addEventListener('click',()=>{
   if(!state||!state.speakers||!state.speakers.length)return;
   const names={};
@@ -172,7 +181,9 @@ class WebUI:
 
     def payload(self) -> bytes:
         e = self.engine
-        return e.state.snapshot_json({"status": e.status, "llm": e.llm}).encode("utf-8")
+        return e.state.snapshot_json({
+            "status": e.status, "llm": e.llm, "audio_source": e.settings.audio_source,
+        }).encode("utf-8")
 
     def _serve(self, port: int) -> str:
         ui = self
@@ -209,6 +220,17 @@ class WebUI:
                     length = int(self.headers.get("Content-Length", "0"))
                     body = json.loads(self.rfile.read(length).decode("utf-8")) if length else {}
                     ui.engine.rename_speakers(body.get("names") or {})
+                    self.send_response(204)
+                    self.end_headers()
+                    return
+                if self.path == "/source":
+                    length = int(self.headers.get("Content-Length", "0"))
+                    body = json.loads(self.rfile.read(length).decode("utf-8")) if length else {}
+                    src = body.get("source")
+                    if src in ("mic", "system", "both") and ui.engine.status == "idle":
+                        ui.engine.settings.audio_source = src
+                        ui.engine.settings.save()
+                        ui._on_event("source", src)
                     self.send_response(204)
                     self.end_headers()
                     return

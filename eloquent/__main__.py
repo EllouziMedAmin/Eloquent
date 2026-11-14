@@ -41,7 +41,10 @@ def build_parser(s: Settings) -> argparse.ArgumentParser:
     p.add_argument("--model", help=f"LLM model (default {s.llm_model})")
     p.add_argument("--keep-fillers", action="store_true", default=None, help="keep uh/um in the cleaned text")
     p.add_argument("--threads", type=int, help="CPU threads for Parakeet (default: half the cores, max 8)")
+    p.add_argument("--source", choices=["mic", "system", "both"], default=None,
+                   help=f"audio source (default from settings: {s.audio_source})")
     p.add_argument("--device", type=int, help="microphone index (see --list-devices)")
+    p.add_argument("--loopback", help="system playback speaker name for loopback (see --list-devices)")
     p.add_argument("--list-devices", action="store_true")
     p.add_argument("--silence", type=float, help=f"pause (s) that ends a sentence (default {s.silence})")
     p.add_argument("--out", help="sessions folder")
@@ -76,7 +79,17 @@ def main(argv=None):
         return run_listener(s.launch_hotkey)
     if args.list_devices:
         import sounddevice as sd
+        from .audio import list_loopback_devices
+        print("=== Microphones ===")
         print(sd.query_devices())
+        lbs = list_loopback_devices()
+        print("\n=== System Audio Loopback (Windows speakers) ===")
+        if lbs:
+            for idx, name, is_def in lbs:
+                tag = " (default)" if is_def else ""
+                print(f"  [{idx}] {name}{tag}")
+        else:
+            print("  (none detected)")
         return 0
 
     # per-run overrides (never written back to settings.json)
@@ -92,8 +105,12 @@ def main(argv=None):
         s.keep_fillers = True
     if args.threads:
         s.threads = args.threads
+    if args.source:
+        s.audio_source = args.source
     if args.device is not None:
         s.device = args.device
+    if args.loopback:
+        s.loopback_device = args.loopback
     if args.silence:
         s.silence = args.silence
     if args.out:
