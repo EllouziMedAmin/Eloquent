@@ -32,7 +32,7 @@ main{max-width:860px;margin:0 auto;padding:20px 20px 120px}
 .para.cleaning p{color:var(--mut);font-style:italic}
 .para.cleaning .time::after{content:" - polishing...";color:var(--acc)}
 .para .note{display:block;font-size:12px;color:var(--warn);margin-top:4px}
-.spk{display:inline-block;font-size:11px;font-weight:600;padding:0 6px;border-radius:4px;margin-right:8px;background:rgba(128,128,128,.15)}
+.spk{display:inline-block;font-size:11px;font-weight:600;padding:0 6px;border-radius:4px;margin-right:8px;background:rgba(128,128,128,.15);cursor:pointer}
 .spk0{color:#2b6cb0}.spk1{color:#1f7a4c}.spk2{color:#a15c00}.spk3{color:#9d2d6b}.spk4{color:#6b46c1}.spk5{color:#c05621}
 @media (prefers-color-scheme: dark){.spk0{color:#7db4ff}.spk1{color:#6ee7b7}.spk2{color:#fbbf24}.spk3{color:#f472b6}.spk4{color:#c084fc}.spk5{color:#fb923c}}
 .fix{border-bottom:2px solid var(--fix)}
@@ -58,6 +58,7 @@ main{max-width:860px;margin:0 auto;padding:20px 20px 120px}
     <option value="custom">Custom Prompt…</option>
   </select>
   <button id="gen">Generate</button>
+  <button id="rename" hidden>Rename speakers</button>
   <button id="copy">Copy text</button>
   <span id="err"></span>
 </header>
@@ -66,7 +67,19 @@ main{max-width:860px;margin:0 auto;padding:20px 20px 120px}
 let state=null, showRaw=false; const seenDone=new Set();
 const $=id=>document.getElementById(id);
 function el(tag,cls,text){const e=document.createElement(tag); if(cls)e.className=cls; if(text!==undefined)e.textContent=text; return e;}
-function spkBadge(spk){if(!spk)return null;const n=parseInt((spk.split(' ').pop())||'1',10)||1;return el('span','spk spk'+((n-1)%6),spk);}
+function spkBadge(spk,spkId){
+  if(!spk)return null;
+  const key=spkId||spk, n=parseInt((key.split(' ').pop())||'1',10)||1;
+  const b=el('span','spk spk'+((n-1)%6),spk);
+  b.title='Click to rename '+spk;
+  b.addEventListener('click',()=>renameOne(key,spk));
+  return b;
+}
+function postRename(names){fetch('/rename',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({names})});}
+function renameOne(spkId,cur){
+  const v=prompt('Name for '+spkId+' (leave empty to reset):',cur===spkId?'':cur);
+  if(v!==null) postRename({[spkId]:v.trim()});
+}
 function allText(s){
   const out=s.paragraphs.map(p=>{
     const txt=(p.tokens&&!showRaw)?p.tokens.map(t=>t[0]).join(' '):p.raw;
@@ -87,7 +100,7 @@ function render(s){
   for(const p of s.paragraphs){
     const d=el('div','para '+p.status);
     const meta=el('span','time');
-    if(s.multi_speaker&&p.speaker){const b=spkBadge(p.speaker); if(b)meta.append(b);}
+    if(s.multi_speaker&&p.speaker){const b=spkBadge(p.speaker,p.speaker_id); if(b)meta.append(b);}
     meta.append(document.createTextNode(p.time));
     d.append(meta);
     const body=el('p');
@@ -101,11 +114,12 @@ function render(s){
   }
   for(const l of s.loose){
     const d=el('div','loose');
-    if(s.multi_speaker&&l.speaker){const b=spkBadge(l.speaker); if(b)d.append(b);}
+    if(s.multi_speaker&&l.speaker){const b=spkBadge(l.speaker,l.speaker_id); if(b)d.append(b);}
     d.append(el('span','time',l.t), document.createTextNode(l.text));
     box.append(d);
   }
   if(s.partial) box.append(el('div','partial','... '+s.partial));
+  $('rename').hidden=!s.multi_speaker;
   $('err').textContent=s.error?('LLM: '+s.error):'';
   $('dot').className='dot '+s.status; $('status').textContent=s.status;
   const t=$('toggle'); t.disabled=!(s.status==='idle'||s.status==='listening');
@@ -120,6 +134,16 @@ function connect(){
 $('raw').addEventListener('change',e=>{showRaw=e.target.checked; if(state)render(state);});
 $('copy').addEventListener('click',()=>{if(state)navigator.clipboard.writeText(state.report&&state.report.text?state.report.text:allText(state));});
 $('toggle').addEventListener('click',()=>fetch('/toggle',{method:'POST'}));
+$('rename').addEventListener('click',()=>{
+  if(!state||!state.speakers||!state.speakers.length)return;
+  const names={};
+  for(const sp of state.speakers){
+    const v=prompt('Name for '+sp.id+' (leave empty to keep/reset):',sp.name===sp.id?'':sp.name);
+    if(v===null)return;
+    names[sp.id]=v.trim();
+  }
+  postRename(names);
+});
 $('gen').addEventListener('click',()=>{
   const fid=$('fmt').value;
   let custom='';
@@ -178,6 +202,13 @@ class WebUI:
                     length = int(self.headers.get("Content-Length", "0"))
                     body = json.loads(self.rfile.read(length).decode("utf-8")) if length else {}
                     ui.engine.generate_report(body.get("format_id", "summary"), body.get("custom_prompt", ""))
+                    self.send_response(204)
+                    self.end_headers()
+                    return
+                if self.path == "/rename":
+                    length = int(self.headers.get("Content-Length", "0"))
+                    body = json.loads(self.rfile.read(length).decode("utf-8")) if length else {}
+                    ui.engine.rename_speakers(body.get("names") or {})
                     self.send_response(204)
                     self.end_headers()
                     return

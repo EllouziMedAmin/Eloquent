@@ -86,7 +86,7 @@ class Cleaner(threading.Thread):
             parts = []
             for p in prev:
                 t = p["clean"] or p["raw"]
-                spk = p.get("speaker", "")
+                spk = self.state._disp_spk(p.get("speaker", ""))
                 parts.append(f"{spk}: {t}" if (multi and spk) else t)
             text = " ".join(parts)
         return text[-1000:]

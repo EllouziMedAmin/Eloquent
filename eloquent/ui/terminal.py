@@ -42,7 +42,7 @@ def _paragraph_text(p: dict, multi_speaker: bool = False) -> Text:
     t = Text()
     t.append(p["time"] + "  ", style="dim")
     if multi_speaker and p.get("speaker"):
-        t.append(p["speaker"] + "  ", style=_speaker_style(p["speaker"]))
+        t.append(p["speaker"] + "  ", style=_speaker_style(p.get("speaker_id") or p["speaker"]))
     if p["tokens"]:
         for i, (w, changed) in enumerate(p["tokens"]):
             if i:
@@ -68,6 +68,7 @@ class TerminalUI:
         self.printed = 0           # number of paragraphs already printed permanently
         self.quit = False
         self.picking_format = False
+        self.renaming = False
         self.ended = threading.Event()
         self.last_seg_info = ""
         engine.subscribe(self._on_event)
@@ -129,7 +130,8 @@ class TerminalUI:
             opts = "  ".join(f"[{i+1}] {f['label']}" for i, f in enumerate(REPORT_FORMATS))
             t.append(f"\nGenerate: {opts}  [Esc] cancel", style="cyan")
         else:
-            hint = "  Space start/stop · G generate · Q quit" if msvcrt and not self.wav_path else "  Ctrl+C stop"
+            ren = " · R rename" if self.engine.state.snapshot().get("multi_speaker") else ""
+            hint = f"  Space start/stop{ren} · G generate · Q quit" if msvcrt and not self.wav_path else "  Ctrl+C stop"
             t.append(hint, style="dim")
         return t
 
@@ -139,14 +141,14 @@ class TerminalUI:
         for p in snap["paragraphs"][self.printed:]:
             t = Text(p["time"] + "  ", style="dim")
             if multi and p.get("speaker"):
-                t.append(p["speaker"] + "  ", style=_speaker_style(p["speaker"]))
+                t.append(p["speaker"] + "  ", style=_speaker_style(p.get("speaker_id") or p["speaker"]))
             t.append(p["raw"], style="italic bright_black")
             t.append("  polishing...", style="cyan")
             lines.append(t)
         for x in snap["loose"]:
             t = Text(x["t"] + "  ", style="dim")
             if multi and x.get("speaker"):
-                t.append(x["speaker"] + "  ", style=_speaker_style(x["speaker"]))
+                t.append(x["speaker"] + "  ", style=_speaker_style(x.get("speaker_id") or x["speaker"]))
             t.append(x["text"])
             lines.append(t)
         if snap["partial"]:
@@ -171,10 +173,29 @@ class TerminalUI:
                 continue
             if ch == " ":
                 self.engine.toggle()
+            elif ch.lower() == "r" and self.engine.state.snapshot().get("multi_speaker"):
+                self.renaming = True
             elif ch.lower() == "g":
                 self.picking_format = True
             elif ch.lower() == "q":
                 self.quit = True
+
+    def _prompt_rename(self, live):
+        speakers = self.engine.state.speakers()
+        if not speakers:
+            return
+        live.stop()
+        try:
+            updates = {}
+            self.console.print("[cyan]Rename speakers (press Enter to keep current):[/cyan]")
+            for cid, cur in speakers:
+                val = self.console.input(f"  {cid} [{cur}]: ").strip()
+                if val:
+                    updates[cid] = val
+            if updates:
+                self.engine.rename_speakers(updates)
+        finally:
+            live.start()
 
     # -- main loop ----------------------------------------------------------
     def run(self):
@@ -205,6 +226,9 @@ class TerminalUI:
                     self.changed.wait(0.1)
                     self.changed.clear()
                     self._keys()
+                    if self.renaming:
+                        self.renaming = False
+                        self._prompt_rename(live)
                     snap = e.state.snapshot()
                     self._flush_logs(live)
                     self._print_finished(live, snap)

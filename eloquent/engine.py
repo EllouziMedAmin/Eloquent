@@ -28,7 +28,7 @@ from .cleaner import Cleaner
 from .diarizer import Diarizer, build_speaker_extractor, ensure_speaker_model
 from .llm import make_provider
 from .llm.prompts import build_format_instruction
-from .session import Session
+from .session import Session, write_session_files
 from .speech import (SAMPLE_RATE, WINDOW, build_recognizer, build_vad, ensure_asr_model,
                      ensure_vad_model, read_wav_16k, transcribe, transcribe_detailed)
 from .state import State, fmt_time
@@ -333,8 +333,16 @@ class Engine:
         self._emit("session_ended", {"dir": d})
 
     # ------------------------------------------------------------------ #
-    # post-session document generation
+    # speaker naming & post-session document generation
     # ------------------------------------------------------------------ #
+    def rename_speakers(self, names: dict[str, str]):
+        """Rename speakers in State and sync raw.txt / clean.txt on disk."""
+        self.state.rename_speakers(names)
+        if self.session is not None and not self.session.raw_f.closed:
+            self.session.sync_from_state(self.state)
+        elif self.last_session_dir:
+            write_session_files(Path(self.last_session_dir), self.state)
+
     def generate_report(self, format_id: str, custom_prompt: str = "", blocking: bool = False):
         """Format or summarize the current transcript with the LLM and save to the session folder."""
         text = self.state.full_text(raw=False).strip()
