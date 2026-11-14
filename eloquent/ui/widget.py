@@ -37,7 +37,7 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QDia
 
 from .. import APP_NAME, __version__
 from ..audio import AUDIO_SOURCES, AUDIO_SOURCE_LABELS
-from ..config import SETTINGS_FILE, config_dir
+from ..config import ROOT, SETTINGS_FILE, config_dir
 from ..llm.prompts import REPORT_FORMATS
 
 WM_HOTKEY = 0x0312
@@ -86,6 +86,13 @@ from ..hotkeys import parse_hotkey, single_instance  # noqa: E402
 
 
 def make_icon(color="#7c5cff") -> QIcon:
+    """Return Eloquent's custom app/taskbar/tray icon, with a drawn fallback if missing."""
+    for name in ("icon.ico", "icon.png"):
+        p = ROOT / "assets" / name
+        if p.exists():
+            ic = QIcon(str(p))
+            if not ic.isNull() and ic.availableSizes():
+                return ic
     pm = QPixmap(64, 64)
     pm.fill(Qt.transparent)
     p = QPainter(pm)
@@ -826,6 +833,7 @@ def run_widget(engine, settings, start_minimized: bool = False):
             pass
     app = QApplication.instance() or QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
+    app.setWindowIcon(make_icon())
     app.setQuitOnLastWindowClosed(False)
     w = EloquentWidget(engine, settings)
     signal.signal(signal.SIGINT, lambda *_: w.quit())
