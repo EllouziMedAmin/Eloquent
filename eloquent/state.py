@@ -31,6 +31,7 @@ class State:
             self.report = None     # {"format_id","label","status","text","file","error"}
             self.next_id = 1
             self.next_turn_id = 1
+            self.speaker_names = {}  # canonical ID ("Speaker 1") -> user display name
             self.rev += 1
         if notify:
             self.emit("reset")
@@ -171,20 +172,75 @@ class State:
                     return True
         return False
 
+    def _disp_spk(self, spk_id: str) -> str:
+        return self.speaker_names.get(spk_id, spk_id) if spk_id else ""
+
+    def display_speaker(self, spk_id: str) -> str:
+        with self.lock:
+            return self._disp_spk(spk_id)
+
+    def _speakers_locked(self) -> list[tuple[str, str]]:
+        seen: dict[str, str] = {}
+        for item in self.paragraphs:
+            cid = item.get("speaker", "")
+            if cid and cid not in seen:
+                seen[cid] = self._disp_spk(cid)
+        for item in self.loose:
+            cid = item.get("speaker", "")
+            if cid and cid not in seen:
+                seen[cid] = self._disp_spk(cid)
+        return list(seen.items())
+
+    def speakers(self) -> list[tuple[str, str]]:
+        """Return `[(canonical_id, display_name), ...]` in order of first appearance."""
+        with self.lock:
+            return self._speakers_locked()
+
+    def rename_speakers(self, mapping: dict[str, str]):
+        """Update display names `{canonical_id_or_current_name: new_name}` without losing clusters."""
+        if not mapping:
+            return
+        with self.lock:
+            cur = self._speakers_locked()
+            known = {cid for cid, _ in cur}
+            reverse = {disp: cid for cid, disp in cur}
+            changed = False
+            for key, raw_name in mapping.items():
+                cid = key if key in known else reverse.get(key, key)
+                if not cid:
+                    continue
+                new_name = (raw_name or "").strip()
+                if not new_name or new_name == cid:
+                    if cid in self.speaker_names:
+                        del self.speaker_names[cid]
+                        changed = True
+                elif self.speaker_names.get(cid) != new_name:
+                    self.speaker_names[cid] = new_name
+                    changed = True
+            if not changed:
+                return
+            self.rev += 1
+        self.emit("speakers", None)
+
     def _build(self) -> dict:
         return {
             "rev": self.rev,
             "partial": self.partial,
             "error": self.error,
             "multi_speaker": self._multi_speaker_locked(),
+            "speakers": [{"id": cid, "name": name} for cid, name in self._speakers_locked()],
             "report": dict(self.report) if self.report else None,
             "loose": [
-                {"t": x["t"], "text": x["text"], "speaker": x.get("speaker", "")}
+                {"t": x["t"], "text": x["text"],
+                 "speaker": self._disp_spk(x.get("speaker", "")),
+                 "speaker_id": x.get("speaker", "")}
                 for x in self.loose
             ],
             "paragraphs": [
                 {"id": p["id"], "time": p["time"], "raw": p["raw"], "tokens": p["tokens"],
-                 "status": p["status"], "note": p["note"], "speaker": p.get("speaker", "")}
+                 "status": p["status"], "note": p["note"],
+                 "speaker": self._disp_spk(p.get("speaker", "")),
+                 "speaker_id": p.get("speaker", "")}
                 for p in self.paragraphs
             ],
         }
@@ -206,13 +262,13 @@ class State:
             out = []
             for p in self.paragraphs:
                 txt = p["raw"] if raw or not p["clean"] else p["clean"]
-                spk = p.get("speaker", "")
+                spk = self._disp_spk(p.get("speaker", ""))
                 out.append(f"{spk}: {txt}" if (multi and spk) else txt)
             if self.loose:
                 # Group consecutive loose sentences of same speaker
                 cur_spk, cur_txt = None, []
                 for x in self.loose:
-                    spk = x.get("speaker", "") if multi else ""
+                    spk = self._disp_spk(x.get("speaker", "")) if multi else ""
                     if cur_txt and spk != cur_spk:
                         line = " ".join(cur_txt)
                         out.append(f"{cur_spk}: {line}" if cur_spk else line)
@@ -230,12 +286,12 @@ class State:
         """Return `(multi_speaker, [(stamp, speaker, raw)], [(stamp, speaker, clean_or_raw)])`."""
         with self.lock:
             multi = self._multi_speaker_locked()
-            raw_items = [(p["time"], p.get("speaker", ""), p["raw"]) for p in self.paragraphs]
-            raw_items += [(x["t"], x.get("speaker", ""), x["text"]) for x in self.loose]
+            raw_items = [(p["time"], self._disp_spk(p.get("speaker", "")), p["raw"]) for p in self.paragraphs]
+            raw_items += [(x["t"], self._disp_spk(x.get("speaker", "")), x["text"]) for x in self.loose]
             clean_items = [
-                (p["time"], p.get("speaker", ""), p["clean"] or p["raw"]) for p in self.paragraphs
+                (p["time"], self._disp_spk(p.get("speaker", "")), p["clean"] or p["raw"]) for p in self.paragraphs
             ]
             if self.loose:
-                clean_items.append((self.loose[0]["t"], self.loose[0].get("speaker", ""),
+                clean_items.append((self.loose[0]["t"], self._disp_spk(self.loose[0].get("speaker", "")),
                                     " ".join(x["text"] for x in self.loose)))
             return multi, raw_items, clean_items

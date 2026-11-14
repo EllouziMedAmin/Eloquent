@@ -10,6 +10,30 @@ import numpy as np
 from .speech import SAMPLE_RATE
 
 
+def _format_session_texts(state) -> tuple[str, str]:
+    multi, raw_items, clean_items = state.export_records()
+    raw_lines = []
+    for stamp, spk, txt in raw_items:
+        prefix = f"[{stamp}] {spk}:" if (multi and spk) else f"[{stamp}]"
+        raw_lines.append(f"{prefix} {txt}\n")
+    clean_lines = []
+    for stamp, spk, txt in clean_items:
+        if multi and spk:
+            clean_lines.append(f"[{stamp}] {spk}: {txt.strip()}\n\n")
+        else:
+            clean_lines.append(txt.strip() + "\n\n")
+    return "".join(raw_lines), "".join(clean_lines)
+
+
+def write_session_files(session_dir: Path, state) -> None:
+    """Rewrite closed session raw.txt and clean.txt on disk (e.g. after speaker rename)."""
+    if not session_dir.exists():
+        return
+    raw_body, clean_body = _format_session_texts(state)
+    (session_dir / "raw.txt").write_text(raw_body, encoding="utf-8")
+    (session_dir / "clean.txt").write_text(clean_body, encoding="utf-8")
+
+
 class Session:
     def __init__(self, base: Path, save_audio: bool):
         self.dir = base / datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -38,23 +62,17 @@ class Session:
 
     def sync_from_state(self, state):
         """Rewrite raw.txt and clean.txt with finalized multi-speaker splits and labels."""
-        multi, raw_items, clean_items = state.export_records()
+        raw_body, clean_body = _format_session_texts(state)
         with self._lock:
             if not self.raw_f.closed:
                 self.raw_f.seek(0)
                 self.raw_f.truncate()
-                for stamp, spk, txt in raw_items:
-                    prefix = f"[{stamp}] {spk}:" if (multi and spk) else f"[{stamp}]"
-                    self.raw_f.write(f"{prefix} {txt}\n")
+                self.raw_f.write(raw_body)
                 self.raw_f.flush()
             if not self.clean_f.closed:
                 self.clean_f.seek(0)
                 self.clean_f.truncate()
-                for stamp, spk, txt in clean_items:
-                    if multi and spk:
-                        self.clean_f.write(f"[{stamp}] {spk}: {txt.strip()}\n\n")
-                    else:
-                        self.clean_f.write(txt.strip() + "\n\n")
+                self.clean_f.write(clean_body)
                 self.clean_f.flush()
 
     def write_audio(self, frame: np.ndarray):

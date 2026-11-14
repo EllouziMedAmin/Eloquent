@@ -11,6 +11,7 @@ import os
 import signal
 import sys
 import threading
+import urllib.parse
 from ctypes import wintypes
 from pathlib import Path
 
@@ -102,18 +103,25 @@ def make_icon(color="#7c5cff") -> QIcon:
 SPEAKER_COLORS = ("#7db4ff", "#6ee7b7", "#fbbf24", "#f472b6", "#c084fc", "#fb923c", "#38bdf8", "#a3e635")
 
 
-def _speaker_badge(spk: str, esc) -> str:
-    if not spk:
-        return ""
-    idx = sum(ord(c) for c in spk)
+def _speaker_color(spk_id: str) -> str:
+    idx = sum(ord(c) for c in spk_id)
     try:
-        idx = int(spk.rsplit(" ", 1)[-1]) - 1
+        idx = int(spk_id.rsplit(" ", 1)[-1]) - 1
     except ValueError:
         pass
-    color = SPEAKER_COLORS[idx % len(SPEAKER_COLORS)]
-    return (f'<span style="color:{color};background:rgba(255,255,255,14);'
-            f'border-radius:4px;padding:0 5px;font-size:10px;font-weight:600">'
-            f'{esc(spk)}</span>&nbsp; ')
+    return SPEAKER_COLORS[idx % len(SPEAKER_COLORS)]
+
+
+def _speaker_badge(spk: str, esc, spk_id: str = "") -> str:
+    if not spk:
+        return ""
+    key = spk_id or spk
+    color = _speaker_color(key)
+    href = urllib.parse.quote(key, safe="")
+    return (f'<a href="spk:{href}" title="Click to rename {esc(spk)}" '
+            f'style="color:{color};background:rgba(255,255,255,14);'
+            f'border-radius:4px;padding:0 5px;font-size:10px;font-weight:600;'
+            f'text-decoration:none">{esc(spk)}</a>&nbsp; ')
 
 
 def transcript_html(snap: dict, show_raw: bool) -> str:
@@ -121,7 +129,7 @@ def transcript_html(snap: dict, show_raw: bool) -> str:
     multi = bool(snap.get("multi_speaker"))
     out = []
     for p in snap["paragraphs"]:
-        badge = _speaker_badge(p.get("speaker", ""), esc) if multi else ""
+        badge = _speaker_badge(p.get("speaker", ""), esc, p.get("speaker_id", "")) if multi else ""
         head = f'{badge}<span style="color:#7d7d7d;font-size:11px">{esc(p["time"])}</span>'
         if p["status"] == "cleaning":
             head += '<span style="color:#7db4ff;font-size:11px"> · polishing…</span>'
@@ -136,12 +144,45 @@ def transcript_html(snap: dict, show_raw: bool) -> str:
                 if p["note"] else "")
         out.append(f'<p style="margin:0 0 12px 0">{head}<br>{body}{note}</p>')
     for x in snap["loose"]:
-        badge = _speaker_badge(x.get("speaker", ""), esc) if multi else ""
+        badge = _speaker_badge(x.get("speaker", ""), esc, x.get("speaker_id", "")) if multi else ""
         out.append(f'<p style="margin:0 0 6px 0">{badge}<span style="color:#7d7d7d;font-size:11px">'
                    f'{esc(x["t"])}</span>&nbsp;&nbsp;{esc(x["text"])}</p>')
     if not out:
         out.append('<p style="color:#7d7d7d">The transcript will appear here.</p>')
     return "".join(out)
+
+
+class RenameSpeakersDialog(QDialog):
+    def __init__(self, speakers: list[tuple[str, str]], parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"{APP_NAME} - Rename Speakers")
+        self.setMinimumWidth(340)
+        self.setStyleSheet("")
+        self.setWindowFlag(Qt.WindowStaysOnTopHint, True)
+
+        layout = QVBoxLayout(self)
+        hint = QLabel("Assign names to speakers before generating notes or minutes.")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        form = QFormLayout()
+        self.inputs: dict[str, QLineEdit] = {}
+        for cid, name in speakers:
+            lbl = QLabel(f"<b>{html.escape(cid)}</b>")
+            lbl.setStyleSheet(f"color: {_speaker_color(cid)};")
+            edit = QLineEdit("" if name == cid else name)
+            edit.setPlaceholderText(cid)
+            form.addRow(lbl, edit)
+            self.inputs[cid] = edit
+        layout.addLayout(form)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def values(self) -> dict[str, str]:
+        return {cid: edit.text().strip() for cid, edit in self.inputs.items()}
 
 
 class Bridge(QObject):
@@ -257,6 +298,7 @@ class EloquentWidget(QWidget):
         pv.addWidget(line)
         self.view = QTextBrowser()
         self.view.setOpenLinks(False)
+        self.view.anchorClicked.connect(self._on_anchor)
         self.view.setMinimumHeight(PANEL_HEIGHT - 60)
         pv.addWidget(self.view, 1)
         bottom = QHBoxLayout()
@@ -284,6 +326,8 @@ class EloquentWidget(QWidget):
         v.addWidget(self.panel, 1)
 
         self.gen_menu = QMenu(self)
+        self.act_rename = self.gen_menu.addAction("Rename speakers…", self.rename_speakers)
+        self.act_rename_sep = self.gen_menu.addSeparator()
         for fmt in REPORT_FORMATS:
             self.gen_menu.addAction(fmt["label"], lambda fid=fmt["id"]: self._trigger_gen(fid))
         self.gen_menu.addSeparator()
@@ -488,7 +532,33 @@ class EloquentWidget(QWidget):
         self._rebuild()
 
     def _show_gen_menu(self):
+        multi = bool(self.engine.state.snapshot().get("multi_speaker"))
+        self.act_rename.setVisible(multi)
+        self.act_rename_sep.setVisible(multi)
         self.gen_menu.exec(self.btn_gen.mapToGlobal(QPoint(0, self.btn_gen.height())))
+
+    def _on_anchor(self, url: QUrl):
+        raw = url.toString()
+        if not raw.startswith("spk:"):
+            return
+        spk_id = urllib.parse.unquote(raw[4:])
+        cur = self.engine.state.display_speaker(spk_id) or spk_id
+        dlg = QInputDialog(self)
+        dlg.setWindowTitle(f"{APP_NAME} - Rename {spk_id}")
+        dlg.setLabelText(f"Name for {spk_id}:")
+        dlg.setTextValue("" if cur == spk_id else cur)
+        dlg.setWindowFlag(Qt.WindowStaysOnTopHint, True)
+        dlg.setStyleSheet("")
+        if dlg.exec():
+            self.engine.rename_speakers({spk_id: dlg.textValue().strip()})
+
+    def rename_speakers(self):
+        speakers = self.engine.state.speakers()
+        if not speakers:
+            return
+        dlg = RenameSpeakersDialog(speakers, self)
+        if dlg.exec():
+            self.engine.rename_speakers(dlg.values())
 
     def _trigger_gen(self, format_id: str, custom_prompt: str = ""):
         self.engine.generate_report(format_id, custom_prompt)
