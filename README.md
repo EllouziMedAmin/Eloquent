@@ -83,7 +83,8 @@ eloquent
 
 ### Widget Mode (`Eloquent.bat` or `Ctrl+Shift+E`)
 - **`Ctrl+Shift+E`** — Launch Eloquent from anywhere in Windows (handled by the tiny background launcher `setup.bat` installs); if it's already open, it comes to the front.
-- **`▶` / `■`** (or **`Ctrl+Shift+Space`**, customizable to e.g. **`Ctrl+Up`** in Settings) — Start / Stop recording.
+- **`▶` / `■`** (or **`Ctrl+Shift+Space`**, customizable in Settings) — Start / Stop recording notes or meetings.
+- **`Ctrl+Alt+Space`** (customizable in Settings) — **Dictate into any app** (ChatGPT, Reddit, browser, editor): press once with your cursor in any text box, speak, then press again to clean up and paste right at your cursor (click **`■`** instead to cancel without pasting).
 - **`⤢`** (or double-click the pill) — Expand / collapse the full transcript & report drawer.
 - **`Generate ▾`** — Generate Summary, Bullet Points, Meeting Minutes, Lecture Notes, Report, Memo, or Custom Prompt.
 - **`⋯`** — Settings, *Save audio recording* toggle (`audio.wav`), *Always on top*, *Create shortcuts + launch hotkey*, *Minimize*.

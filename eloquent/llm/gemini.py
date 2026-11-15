@@ -1,7 +1,7 @@
 """Google Gemini provider (default: gemini-3.1-flash-lite, free key from Google AI Studio)."""
 
 from .base import LLMProvider
-from .prompts import build_proofread_prompt, proofread_system_prompt
+from .prompts import build_proofread_prompt, dictation_system_prompt, proofread_system_prompt
 from ..textutil import strip_wrappers
 
 
@@ -20,6 +20,11 @@ class GeminiProvider(LLMProvider):
             max_output_tokens=2048,
             # Gemini 3 works best at its default temperature, so we leave it alone.
         )
+        self.dict_cfg = types.GenerateContentConfig(
+            system_instruction=dictation_system_prompt(keep_fillers),
+            thinking_config=types.ThinkingConfig(thinking_level="minimal"),
+            max_output_tokens=4096,
+        )
 
     def check(self) -> None:
         t = self._types
@@ -28,9 +33,10 @@ class GeminiProvider(LLMProvider):
             config=t.GenerateContentConfig(
                 max_output_tokens=16, thinking_config=t.ThinkingConfig(thinking_level="minimal")))
 
-    def proofread(self, raw: str, context: str) -> str:
+    def proofread(self, raw: str, context: str, mode: str = "proofread") -> str:
+        cfg = self.dict_cfg if mode == "dictation" else self.proof_cfg
         resp = self.client.models.generate_content(
-            model=self.model, contents=build_proofread_prompt(raw, context), config=self.proof_cfg)
+            model=self.model, contents=build_proofread_prompt(raw, context, mode=mode), config=cfg)
         return strip_wrappers(resp.text or "")
 
     def generate(self, instruction: str, text: str, max_tokens: int = 8192) -> str:

@@ -25,7 +25,7 @@ from pathlib import Path
 import numpy as np
 
 from .audio import LoopbackCapture, MicCapture
-from .cleaner import Cleaner
+from .cleaner import Cleaner, DICTATION_PAUSE_SEC
 from .diarizer import Diarizer, build_speaker_extractor, ensure_speaker_model
 from .llm import make_provider
 from .llm.prompts import build_format_instruction
@@ -57,6 +57,7 @@ class _StreamPipe:
         self.partial_prefix_text = ""
         self.last_partial_dt = 0.0
         self.samples = 0
+        self.last_end_sec = -1.0
         self.level = 0.0
         self.last_frame_t = time.monotonic()
 
@@ -67,6 +68,8 @@ class Engine:
         self.state = State()
         self.state.emit = self._emit
         self.status = "idle"
+        self.session_mode = "meeting"
+        self._paste_on_stop = False
         self.llm = {"state": "off", "label": "", "message": ""}
         self.level = 0.0                 # mic RMS of the latest frame (for UI meters)
         self.session = None
@@ -76,6 +79,7 @@ class Engine:
         self.extractor = None
         self.diarizer = None
         self.provider = None
+        self.dict_provider = None
         self._diar_lock = threading.Lock()
         self._provider_key = None
         self._listeners = []
@@ -149,13 +153,20 @@ class Engine:
             threading.Thread(target=self._load_speaker_extractor, daemon=True, name="eloquent-diar-load").start()
 
     def refresh_provider(self, force: bool = False):
-        """(Re)create the LLM provider when its settings changed. The key check runs in the background."""
+        """(Re)create the LLM provider(s) when settings change. The key check runs in the background."""
         s = self.settings
-        key = (s.cleanup, s.resolved_api_key(), s.llm_model, s.keep_fillers)
+        key = (s.cleanup, s.dictation_cleanup, s.resolved_api_key(), s.llm_model, s.keep_fillers)
         if key == self._provider_key and not force:
             return
         self._provider_key = key
         self.provider, reason = make_provider(s)
+        if self.provider is not None:
+            self.dict_provider = self.provider if s.dictation_cleanup else None
+        elif s.dictation_cleanup:
+            self.dict_provider, _ = make_provider(s, force=True)
+        else:
+            self.dict_provider = None
+
         if self.provider is None:
             self._set_llm("off", reason)
             if s.cleanup:
@@ -185,28 +196,37 @@ class Engine:
     def busy(self) -> bool:
         return self.status in ("listening", "stopping")
 
-    def start(self, wav_path: Path = None) -> bool:
+    def start(self, wav_path: Path = None, mode: str = "meeting") -> bool:
         if not self._loaded or self.status != "idle":
             return False
         s = self.settings
+        mode = "dictation" if (mode == "dictation" and wav_path is None) else "meeting"
+        dictating = (mode == "dictation")
+        self.session_mode = mode
+        self._paste_on_stop = dictating
         self.refresh_provider()
         self.state.reset()
-        self.session = Session(s.resolved_sessions_dir(), save_audio=s.save_audio)
-        self.last_session_dir = self.session.dir
-        if s.diarize and self.extractor is None:
+        if dictating:
+            self.session = None
+        else:
+            self.session = Session(s.resolved_sessions_dir(), save_audio=s.save_audio)
+            self.last_session_dir = self.session.dir
+        use_diar = (not dictating) and s.diarize
+        if use_diar and self.extractor is None:
             self._load_speaker_extractor()
         self.diarizer = Diarizer(self.extractor, self.state, self.session, log=self.log) if (
-            s.diarize and self.extractor is not None
+            use_diar and self.extractor is not None
         ) else None
         if self.diarizer is not None:
             self.diarizer.start()
-        self.cleaner = Cleaner(self.state, self.session, self.provider, s, log=self.log)
+        cleaner_provider = self.dict_provider if dictating else self.provider
+        self.cleaner = Cleaner(self.state, self.session, cleaner_provider, s, mode=mode, log=self.log)
         self.cleaner.start()
 
         # per-session pipeline state (one VAD pipe per live source, or single file pipe)
         preroll = int(0.3 * SAMPLE_RATE)
         partial_every = int(s.partial_interval * SAMPLE_RATE)
-        src = s.audio_source if s.audio_source in ("mic", "system", "both") else "mic"
+        src = "mic" if dictating else (s.audio_source if s.audio_source in ("mic", "system", "both") else "mic")
         max_utt = min(float(s.max_utterance), 8.0)
         self._is_file_run = wav_path is not None
         self._session_t0 = time.monotonic()
@@ -234,22 +254,33 @@ class Engine:
 
         self._stop.clear()
         self._set_status("listening")
-        self._emit("session_started", {"dir": str(self.session.dir)})
+        self._emit("session_started", {
+            "dir": str(self.session.dir) if self.session is not None else "",
+            "mode": mode,
+        })
         self._worker = threading.Thread(target=self._run, args=(wav_path,), daemon=True,
                                         name="eloquent-audio")
         self._worker.start()
         return True
 
-    def stop(self):
+    def stop(self, paste: bool = True):
         """Ask the audio thread to stop. Returns immediately; status goes stopping -> idle."""
         if self.status == "listening":
+            if not paste:
+                self._paste_on_stop = False
             self._stop.set()
 
-    def toggle(self):
+    def toggle(self, mode: str = "meeting") -> bool:
         if self.status == "idle":
-            self.start()
-        elif self.status == "listening":
-            self.stop()
+            return self.start(mode=mode)
+        if self.status == "listening":
+            if self.session_mode == "dictation":
+                self.stop(paste=(mode == "dictation"))
+                return True
+            if mode == "meeting":
+                self.stop()
+                return True
+        return False
 
     def wait_idle(self, timeout: float = None) -> bool:
         if self._worker is not None:
@@ -304,7 +335,7 @@ class Engine:
                     pipe = self._pipes[tag]
                     pipe.last_frame_t = now
                     pipe.level = float(np.sqrt(np.mean(frame * frame)))
-                    if s.save_audio:
+                    if s.save_audio and self.session is not None:
                         if dual:
                             if tag == "mic":
                                 sf = wav_sys.popleft() if wav_sys else 0.0
@@ -416,12 +447,16 @@ class Engine:
             if text:
                 end_sec = (pipe.samples / SAMPLE_RATE) if elapsed is None else elapsed
                 t0 = max(0.0, end_sec - dur)
+                gap_before = max(0.0, t0 - pipe.last_end_sec) if pipe.last_end_sec >= 0.0 else 0.0
+                pipe.last_end_sec = end_sec
                 stamp = fmt_time(t0)
-                self.session.add_raw(stamp, text)
+                if self.session is not None:
+                    self.session.add_raw(stamp, text)
                 use_diar = pipe.use_diarizer and self.diarizer is not None
                 seg_id = self.state.add_segment(
                     text, stamp, {"audio_sec": dur, "decode_sec": decode},
                     start_sec=t0, spk_ready=(not use_diar), speaker=pipe.fixed_speaker,
+                    gap_before=gap_before,
                 )
                 if use_diar:
                     self.diarizer.submit(seg_id, t0, stamp, seg, text, words)
@@ -434,6 +469,25 @@ class Engine:
             pipe.partial_cut = 0
             pipe.partial_prefix_text = ""
             pipe.last_partial_dt = 0.0
+
+    def _dictation_text(self) -> str:
+        with self.state.lock:
+            parts = []
+            for p in self.state.paragraphs:
+                txt = (p["clean"] or p["raw"]).strip()
+                if not txt:
+                    continue
+                if parts:
+                    parts.append("\n\n" if p.get("break_before") else " ")
+                parts.append(txt)
+            for x in self.state.loose:
+                txt = x["text"].strip()
+                if not txt:
+                    continue
+                if parts:
+                    parts.append("\n\n" if x.get("gap_before", 0.0) >= DICTATION_PAUSE_SEC else " ")
+                parts.append(txt)
+            return "".join(parts).strip()
 
     def _finish(self):
         """Flush all active streams, finish diarization & cleanup, then close session files."""
@@ -450,13 +504,19 @@ class Engine:
         if self.diarizer is not None:
             self.diarizer.flush_and_wait()
         self.cleaner.flush_and_wait()
-        if self.diarizer is not None or self.state.snapshot().get("multi_speaker"):
-            self.session.sync_from_state(self.state)
+        if self.session is not None:
+            if self.diarizer is not None or self.state.snapshot().get("multi_speaker"):
+                self.session.sync_from_state(self.state)
+            self.session.close()
         self.diarizer = None
-        self.session.close()
-        d = str(self.session.dir)
+        d = str(self.session.dir) if self.session is not None else ""
+        mode = self.session_mode
+        cancelled = (mode == "dictation" and not self._paste_on_stop)
+        paste_text = self._dictation_text() if (mode == "dictation" and self._paste_on_stop) else ""
         self._set_status("idle")
-        self._emit("session_ended", {"dir": d})
+        self._emit("session_ended", {
+            "dir": d, "mode": mode, "paste_text": paste_text, "cancelled": cancelled,
+        })
 
     # ------------------------------------------------------------------ #
     # speaker naming & post-session document generation

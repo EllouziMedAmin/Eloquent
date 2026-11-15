@@ -39,13 +39,21 @@ from .. import APP_NAME, __version__
 from ..audio import AUDIO_SOURCES, AUDIO_SOURCE_LABELS
 from ..config import ROOT, SETTINGS_FILE, config_dir
 from ..llm.prompts import REPORT_FORMATS
+from ..paste import get_external_foreground, play_cue, send_paste
 
 WM_HOTKEY = 0x0312
 HOTKEY_ID = 1
+HOTKEY_DICTATE_ID = 2
 COMPACT_WIDTH = 560
 PANEL_HEIGHT = 380
 
-STATUS_COLORS = {"idle": "#8a8a8a", "loading": "#4aa3df", "listening": "#34c759", "stopping": "#e0a526"}
+STATUS_COLORS = {
+    "idle": "#8a8a8a",
+    "loading": "#4aa3df",
+    "listening": "#34c759",
+    "dictating": "#8f8cff",
+    "stopping": "#e0a526",
+}
 
 STYLE = """
 #card { background: rgba(24, 24, 27, 240); border: 1px solid rgba(255,255,255,28); border-radius: 16px; }
@@ -241,6 +249,8 @@ class EloquentWidget(QWidget):
         self.drag_offset = None
         self.quitting = False
         self.hotkey_ok = False
+        self.dictate_hotkey_ok = False
+        self.dictate_target_hwnd = 0
         self.caption_text, self.caption_kind = "Starting…", "hint"
         self.last_final = ""
 
@@ -282,7 +292,7 @@ class EloquentWidget(QWidget):
         self.caption = QLabel(objectName="caption")
         self.caption.setMinimumWidth(200)
         self.btn_toggle = QToolButton(objectName="toggle", text="▶")
-        self.btn_toggle.clicked.connect(self.engine.toggle)
+        self.btn_toggle.clicked.connect(self._toggle_meeting)
         self.btn_expand = QToolButton(text="⤢", toolTip="Show transcript")
         self.btn_expand.clicked.connect(self.toggle_panel)
         self.btn_menu = QToolButton(text="⋯", toolTip="Menu")
@@ -386,7 +396,7 @@ class EloquentWidget(QWidget):
         self.tray.setToolTip(APP_NAME)
         m = QMenu()
         m.addAction("Show / hide", self._toggle_visible)
-        self.tray_toggle = m.addAction("Start", self.engine.toggle)
+        self.tray_toggle = m.addAction("Start", self._toggle_meeting)
         m.addAction("Settings…", self.open_settings)
         m.addSeparator()
         m.addAction("Quit", self.quit)
@@ -406,7 +416,7 @@ class EloquentWidget(QWidget):
             if data:
                 self._caption(data, "partial")
             elif self.engine.status == "listening":
-                self._caption(self.last_final or "Listening…", "" if self.last_final else "hint")
+                self._caption(self.last_final or self._listening_hint(), "" if self.last_final else "hint")
         elif kind == "segment":
             self.last_final = data["text"]
             self._caption(data["text"], "")
@@ -431,11 +441,19 @@ class EloquentWidget(QWidget):
                     self.caption_reset.start()
             self._mark_dirty()
         elif kind == "session_started":
-            self._caption("Listening…", "hint")
+            dictating = (data or {}).get("mode") == "dictation"
+            if dictating and self.s.dictation_sound:
+                play_cue("start")
+            self._caption(self._listening_hint(dictating), "hint")
         elif kind == "session_ended":
             if not self.quitting:
-                self._caption("Saved. Open the transcript with ⤢ or the folder from ⋯", "hint")
-                self.caption_reset.start()
+                if (data or {}).get("mode") == "dictation":
+                    self._handle_dictation_ended(data)
+                else:
+                    self._caption("Saved. Open the transcript with ⤢ or the folder from ⋯", "hint")
+                    self.caption_reset.start()
+        elif kind == "paste_done":
+            self._on_paste_done(*data)
         elif kind in ("llm", "error"):
             self._update_llm_label()
             if self.engine.status == "idle" and not self.quitting:
@@ -447,6 +465,78 @@ class EloquentWidget(QWidget):
             elif level == "error":
                 self._caption(msg, "error")
                 self.caption_reset.start()
+
+    def _listening_hint(self, dictating: bool = None) -> str:
+        if dictating is None:
+            dictating = (self.engine.session_mode == "dictation")
+        if dictating:
+            dk = self.s.dictate_hotkey or "hotkey"
+            return f"Dictating… press {dk} to paste"
+        return "Listening…"
+
+    def _toggle_meeting(self):
+        self.engine.toggle("meeting")
+
+    def _toggle_dictation(self):
+        if self.engine.status == "listening" and self.engine.session_mode == "meeting":
+            self._caption("Stop the current recording first", "hint")
+            self.caption_reset.start()
+            return
+        if self.engine.status == "idle":
+            self.dictate_target_hwnd = get_external_foreground()
+        self.engine.toggle("dictation")
+
+    def _handle_dictation_ended(self, data: dict):
+        paste_text = (data or {}).get("paste_text", "")
+        cancelled = bool((data or {}).get("cancelled"))
+        target_hwnd = self.dictate_target_hwnd
+        self.dictate_target_hwnd = 0
+        if cancelled:
+            if self.s.dictation_sound:
+                play_cue("cancel")
+            self._caption("Dictation cancelled (kept in ⤢)", "hint")
+            self.caption_reset.start()
+            return
+        if not paste_text:
+            if self.s.dictation_sound:
+                play_cue("error")
+            self._caption("No speech detected", "hint")
+            self.caption_reset.start()
+            return
+        clip = QGuiApplication.clipboard()
+        prev_text = None
+        if self.s.restore_clipboard:
+            mime = clip.mimeData()
+            if mime is not None and mime.hasText():
+                prev_text = clip.text()
+        clip.setText(paste_text)
+
+        def do_paste():
+            ok = send_paste(target_hwnd)
+            self.bridge.event.emit("paste_done", (ok, paste_text, prev_text))
+
+        threading.Thread(target=do_paste, daemon=True, name="eloquent-paste").start()
+
+    def _on_paste_done(self, ok: bool, pasted_text: str, prev_text):
+        if self.quitting:
+            return
+        if ok:
+            if prev_text is not None:
+                QTimer.singleShot(380, lambda pt=pasted_text, prev=prev_text: self._restore_clipboard(pt, prev))
+            if self.s.dictation_sound:
+                play_cue("done")
+            self._caption("Pasted!", "hint")
+        else:
+            if self.s.dictation_sound:
+                play_cue("error")
+            self._caption("Copied to clipboard (press Ctrl+V)", "hint")
+        self.caption_reset.start()
+
+    @staticmethod
+    def _restore_clipboard(pasted_text: str, prev_text: str):
+        clip = QGuiApplication.clipboard()
+        if clip.text() == pasted_text:
+            clip.setText(prev_text)
 
     def _caption(self, text: str, kind: str):
         self.caption_text = text
@@ -462,41 +552,52 @@ class EloquentWidget(QWidget):
         self.caption.setText(fm.elidedText(self.caption_text, Qt.ElideLeft, max(50, self.caption.width() - 4)))
         self.caption.setToolTip(self.caption_text if len(self.caption_text) > 60 else "")
 
+    def _dot_status(self) -> str:
+        if self.engine.status == "listening" and self.engine.session_mode == "dictation":
+            return "dictating"
+        return self.engine.status
+
     def _idle_caption(self):
         e = self.engine
         if e.status != "idle":
             return
         hk = f" or {self.s.hotkey}" if self.hotkey_ok and self.s.hotkey else ""
+        dk = f" · Dictate: {self.s.dictate_hotkey}" if self.dictate_hotkey_ok and self.s.dictate_hotkey else ""
         src_tag = {"system": " (System audio)", "both": " (Mic + System)"}.get(self.s.audio_source, "")
-        msg = f"Ready{src_tag}. Press ▶{hk} to start"
+        msg = f"Ready{src_tag}. Press ▶{hk}{dk}"
         if e.llm["state"] == "off" and self.s.cleanup:
             msg += "  ·  no Gemini key, raw text only"
         self._caption(msg, "hint")
 
     def _update_controls(self):
         st = self.engine.status
+        dot_st = self._dot_status()
         on = st == "listening"
+        dictating = (self.engine.session_mode == "dictation")
         self.btn_toggle.setText("■" if on else "▶")
         self.btn_toggle.setEnabled(st in ("idle", "listening"))
         self.btn_toggle.setProperty("on", "true" if on else "false")
         self.btn_toggle.style().unpolish(self.btn_toggle)
         self.btn_toggle.style().polish(self.btn_toggle)
-        hk = f" ({self.s.hotkey})" if self.hotkey_ok and self.s.hotkey else ""
-        self.btn_toggle.setToolTip(("Stop" if on else "Start") + hk)
+        if on and dictating:
+            self.btn_toggle.setToolTip("Cancel dictation (keep in drawer)")
+        else:
+            hk = f" ({self.s.hotkey})" if self.hotkey_ok and self.s.hotkey else ""
+            self.btn_toggle.setToolTip(("Stop" if on else "Start") + hk)
         if self.tray:
             self.tray_toggle.setText("Stop" if on else "Start")
             self.tray_toggle.setEnabled(st in ("idle", "listening"))
-            self.tray.setToolTip(f"{APP_NAME} - {st}")
+            self.tray.setToolTip(f"{APP_NAME} - {dot_st}")
         if on:
             self.level_timer.start()
         else:
             self.level_timer.stop()
-            self.dot.set_state(st)
+            self.dot.set_state(dot_st)
         if st == "stopping":
-            self._caption("Finishing the last sentence…", "hint")
+            self._caption("Cleaning & pasting…" if dictating else "Finishing the last sentence…", "hint")
 
     def _tick_level(self):
-        self.dot.set_state("listening", self.engine.level)
+        self.dot.set_state(self._dot_status(), self.engine.level)
 
     def _update_llm_label(self):
         llm, err = self.engine.llm, self.engine.state.error
@@ -689,12 +790,12 @@ class EloquentWidget(QWidget):
         dlg = SettingsDialog(self.s, self, first_run=first_run)
         dlg.setWindowFlag(Qt.WindowStaysOnTopHint, True)
         if dlg.exec():
-            self.register_hotkey()
+            hk_ok = self.register_hotkey()
             self.engine.refresh_provider()
             self.engine.sync_diarizer()
             self._update_llm_label()
             self._update_controls()
-            if self.engine.status == "idle":
+            if self.engine.status == "idle" and hk_ok:
                 self._idle_caption()
 
     def _toggle_visible(self):
@@ -706,32 +807,52 @@ class EloquentWidget(QWidget):
             self.activateWindow()
 
     # -- global hotkey (Windows) -----------------------------------------------
-    def register_hotkey(self):
+    def register_hotkey(self) -> bool:
         self.unregister_hotkey()
-        if sys.platform != "win32" or not self.s.hotkey:
-            return
-        parsed = parse_hotkey(self.s.hotkey)
-        if not parsed:
-            return
-        mods, vk = parsed
-        self.hotkey_ok = bool(ctypes.windll.user32.RegisterHotKey(int(self.winId()), HOTKEY_ID, mods, vk))
-        if not self.hotkey_ok:
-            self._caption(f"Hotkey {self.s.hotkey} is used by another app (change it in Settings)", "error")
+        if sys.platform != "win32":
+            return True
+        hwnd = int(self.winId())
+        failed = []
+        for hk_id, text, attr in (
+            (HOTKEY_ID, self.s.hotkey, "hotkey_ok"),
+            (HOTKEY_DICTATE_ID, self.s.dictate_hotkey, "dictate_hotkey_ok"),
+        ):
+            ok = False
+            if text:
+                parsed = parse_hotkey(text)
+                if parsed:
+                    mods, vk = parsed
+                    ok = bool(ctypes.windll.user32.RegisterHotKey(hwnd, hk_id, mods, vk))
+                    if not ok:
+                        failed.append(text)
+            setattr(self, attr, ok)
+        if failed:
+            joined = ", ".join(failed)
+            self._caption(f"Hotkey {joined} is used by another app (change it in Settings)", "error")
             self.caption_reset.start()
+            return False
+        return True
 
     def unregister_hotkey(self):
-        if self.hotkey_ok:
-            ctypes.windll.user32.UnregisterHotKey(int(self.winId()), HOTKEY_ID)
-            self.hotkey_ok = False
+        if sys.platform == "win32":
+            hwnd = int(self.winId())
+            for hk_id, attr in ((HOTKEY_ID, "hotkey_ok"), (HOTKEY_DICTATE_ID, "dictate_hotkey_ok")):
+                if getattr(self, attr, False):
+                    ctypes.windll.user32.UnregisterHotKey(hwnd, hk_id)
+                    setattr(self, attr, False)
 
     def nativeEvent(self, eventType, message):
         try:
             et = eventType.data() if hasattr(eventType, "data") else bytes(eventType)
             if et == b"windows_generic_MSG":
                 msg = wintypes.MSG.from_address(int(message))
-                if msg.message == WM_HOTKEY and msg.wParam == HOTKEY_ID:
-                    self.engine.toggle()
-                    return True, 0
+                if msg.message == WM_HOTKEY:
+                    if msg.wParam == HOTKEY_ID:
+                        self._toggle_meeting()
+                        return True, 0
+                    if msg.wParam == HOTKEY_DICTATE_ID:
+                        self._toggle_dictation()
+                        return True, 0
         except Exception:
             pass
         return super().nativeEvent(eventType, message)
