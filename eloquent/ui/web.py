@@ -6,6 +6,8 @@ import time
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+from eloquent.ui.markdown_math import render_report_web
+
 PAGE = r"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -24,8 +26,18 @@ header button,header select{font:inherit;color:var(--fg);background:var(--card);
 header button:disabled{opacity:.5;cursor:default}
 #err{color:var(--warn);font-size:13px}
 main{max-width:860px;margin:0 auto;padding:20px 20px 120px}
-.report{background:var(--card);border:2px solid var(--acc);border-radius:12px;padding:16px 20px;margin:0 0 18px;white-space:pre-wrap}
+.report{background:var(--card);border:2px solid var(--acc);border-radius:12px;padding:16px 20px;margin:0 0 18px}
 .report b.title{display:block;font-size:14px;color:var(--acc);margin-bottom:8px}
+.report-body.raw{white-space:pre-wrap}
+.report-body h1,.report-body h2,.report-body h3{margin:14px 0 6px;line-height:1.3}
+.report-body h1{font-size:1.3em}.report-body h2{font-size:1.12em;color:var(--acc)}.report-body h3{font-size:1em}
+.report-body p{margin:0 0 10px}.report-body ul,.report-body ol{margin:4px 0 10px;padding-left:22px}
+.report-body pre,.report-body code{font-family:ui-monospace,Consolas,monospace;font-size:.88em;background:rgba(128,128,128,.12);border-radius:5px}
+.report-body code{padding:1px 5px}.report-body pre{padding:10px 12px;overflow-x:auto}
+.report-body table{border-collapse:collapse;margin:10px 0}.report-body th,.report-body td{border:1px solid var(--line);padding:6px 10px}
+.report-body blockquote{margin:8px 0;padding:4px 12px;border-left:3px solid var(--acc);color:var(--mut)}
+.report-body .math-block{margin:10px 0;overflow-x:auto}
+.report-body math{font-size:1.05em}
 .para{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px 16px;margin:0 0 12px}
 .para p{margin:0}
 .para .time{display:block;font-size:12px;color:var(--mut);margin-bottom:2px}
@@ -100,7 +112,14 @@ function render(s){
   if(s.report){
     const r=el('div','report');
     r.append(el('b','title',s.report.label+(s.report.status==='generating'?' (generating…)':'')));
-    r.append(document.createTextNode(s.report.status==='error'?s.report.error:s.report.text));
+    const body=el('div','report-body');
+    if(s.report.status==='done'&&s.report.html){
+      body.innerHTML=s.report.html;
+    }else{
+      body.classList.add('raw');
+      body.append(document.createTextNode(s.report.status==='error'?s.report.error:s.report.text));
+    }
+    r.append(body);
     box.append(r);
   }
   for(const p of s.paragraphs){
@@ -181,9 +200,12 @@ class WebUI:
 
     def payload(self) -> bytes:
         e = self.engine
-        return e.state.snapshot_json({
-            "status": e.status, "llm": e.llm, "audio_source": e.settings.audio_source,
-        }).encode("utf-8")
+        data = e.state.snapshot()
+        data.update({"status": e.status, "llm": e.llm, "audio_source": e.settings.audio_source})
+        rep = data.get("report")
+        if rep and rep.get("status") == "done" and rep.get("text"):
+            data["report"] = dict(rep, html=render_report_web(rep["text"]))
+        return json.dumps(data).encode("utf-8")
 
     def _serve(self, port: int) -> str:
         ui = self

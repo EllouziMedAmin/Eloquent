@@ -529,7 +529,11 @@ class EloquentWidget(QWidget):
                     f'<p style="color:#ff8a80"><b>{html.escape(rep["label"])}</b><br>'
                     f'{html.escape(rep.get("error", ""))}</p>')
             else:
-                self.view.setMarkdown(f"# {rep['label']}\n\n{rep['text']}")
+                from eloquent.ui.markdown_math import render_report_qt
+                max_w = max(240, self.view.viewport().width() - 28)
+                self.view.setHtml(
+                    render_report_qt(self.view.document(), rep["label"], rep["text"], max_width=max_w)
+                )
         else:
             self.view_mode = "transcript"
             self.chk_raw.show()
