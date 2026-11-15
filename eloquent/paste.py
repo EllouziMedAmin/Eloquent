@@ -8,6 +8,8 @@ import sys
 import time
 from ctypes import wintypes
 
+from .config import config_dir
+
 INPUT_KEYBOARD = 1
 KEYEVENTF_EXTENDEDKEY = 0x0001
 KEYEVENTF_KEYUP = 0x0002
@@ -21,6 +23,7 @@ VK_LMENU = 0xA4
 VK_RMENU = 0xA5
 VK_LWIN = 0x5B
 VK_RWIN = 0x5C
+VK_C = 0x43
 VK_V = 0x56
 
 _MODIFIER_VKS = (
@@ -87,6 +90,8 @@ if sys.platform == "win32":
     _u32.MapVirtualKeyW.restype = wintypes.UINT
     _u32.SendInput.argtypes = [wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int]
     _u32.SendInput.restype = wintypes.UINT
+    _u32.GetClipboardSequenceNumber.argtypes = []
+    _u32.GetClipboardSequenceNumber.restype = wintypes.DWORD
 else:
     _u32 = None
 
@@ -127,7 +132,7 @@ def _held_modifiers() -> list[int]:
     return [vk for vk in _MODIFIER_VKS if _u32.GetAsyncKeyState(vk) & 0x8000]
 
 
-def _wait_modifiers_release(timeout: float = 0.5) -> list[int]:
+def _wait_modifiers_release(timeout: float = 0.8) -> list[int]:
     deadline = time.monotonic() + timeout
     held = _held_modifiers()
     while held and time.monotonic() < deadline:
@@ -136,45 +141,72 @@ def _wait_modifiers_release(timeout: float = 0.5) -> list[int]:
     return held
 
 
-def send_paste(target_hwnd: int = 0) -> bool:
-    """Wait for shortcut modifiers to clear, restore focus only if needed, and send Ctrl+V."""
+def _send_ctrl_combo(vk_key: int, target_hwnd: int = 0) -> bool:
     if _u32 is None:
         return False
     held = _wait_modifiers_release()
     cur_fg = _u32.GetForegroundWindow()
-    if cur_fg and is_own_window(int(cur_fg)) and target_hwnd and _u32.IsWindow(wintypes.HWND(target_hwnd)):
+    if (not cur_fg or is_own_window(int(cur_fg))) and target_hwnd and _u32.IsWindow(wintypes.HWND(target_hwnd)):
         if not is_own_window(target_hwnd):
             _u32.SetForegroundWindow(wintypes.HWND(target_hwnd))
             time.sleep(0.05)
 
-    events = [_kbd_input(vk, key_up=True) for vk in held]
-    events.extend([
+    # Flush any still-held modifiers separately first so Ctrl+C/V never merges into Ctrl+Shift+C
+    if held:
+        up_events = [_kbd_input(vk, key_up=True) for vk in held]
+        up_arr = (INPUT * len(up_events))(*up_events)
+        _u32.SendInput(len(up_events), up_arr, ctypes.sizeof(INPUT))
+        time.sleep(0.025)
+
+    events = [
         _kbd_input(VK_CONTROL, key_up=False),
-        _kbd_input(VK_V, key_up=False),
-        _kbd_input(VK_V, key_up=True),
+        _kbd_input(vk_key, key_up=False),
+        _kbd_input(vk_key, key_up=True),
         _kbd_input(VK_CONTROL, key_up=True),
-    ])
+    ]
     arr = (INPUT * len(events))(*events)
     sent = _u32.SendInput(len(events), arr, ctypes.sizeof(INPUT))
     return sent == len(events)
 
 
+def send_paste(target_hwnd: int = 0) -> bool:
+    """Wait for shortcut modifiers to clear, restore focus only if needed, and send Ctrl+V."""
+    return _send_ctrl_combo(VK_V, target_hwnd=target_hwnd)
+
+
+def capture_selection_copy(target_hwnd: int = 0, wait_sec: float = 0.14) -> bool:
+    """Send Ctrl+C after releasing hotkey modifiers; return True if clipboard updated."""
+    if _u32 is None:
+        return False
+    seq_before = _u32.GetClipboardSequenceNumber()
+    if not _send_ctrl_combo(VK_C, target_hwnd=target_hwnd):
+        return False
+    deadline = time.monotonic() + wait_sec
+    while time.monotonic() < deadline:
+        if _u32.GetClipboardSequenceNumber() != seq_before:
+            return True
+        time.sleep(0.015)
+    return _u32.GetClipboardSequenceNumber() != seq_before
+
+
 # --------------------------------------------------------------------------- #
-# subtle async audio cues (pure stdlib PCM WAV kept alive for SND_ASYNC)
+# subtle async audio cues (cached PCM WAV files via SND_FILENAME | SND_ASYNC)
 # --------------------------------------------------------------------------- #
+_CUE_VER = "v2"
 _CUE_SPECS = {
-    "start": ((587.33, 55), (783.99, 75)),
-    "done": ((783.99, 50), (1046.50, 90)),
-    "cancel": ((523.25, 55), (392.00, 75)),
-    "error": ((349.23, 65), (293.66, 85)),
+    "start": ((587.33, 80), (783.99, 105)),
+    "done": ((783.99, 75), (1046.50, 120)),
+    "cancel": ((523.25, 75), (392.00, 100)),
+    "error": ((349.23, 85), (293.66, 110)),
 }
-_CUES: dict[str, bytes] = {}
+_CUE_FILES: dict[str, str] = {}
 
 
-def _synth_wav(notes: tuple[tuple[float, int], ...], amplitude: float = 0.14, rate: int = 22050) -> bytes:
-    samples = bytearray()
-    gap = b"\x00\x00" * int(rate * 0.012)
-    fade_n = max(1, int(rate * 0.012))
+def _synth_wav(notes: tuple[tuple[float, int], ...], amplitude: float = 0.28, rate: int = 22050) -> bytes:
+    # 35ms silence lead-in wakes idle Windows/Realtek DACs so the first note isn't clipped
+    samples = bytearray(b"\x00\x00" * int(rate * 0.035))
+    gap = b"\x00\x00" * int(rate * 0.015)
+    fade_n = max(1, int(rate * 0.014))
     for idx, (freq, dur_ms) in enumerate(notes):
         if idx > 0:
             samples.extend(gap)
@@ -199,19 +231,32 @@ def _synth_wav(notes: tuple[tuple[float, int], ...], amplitude: float = 0.14, ra
     return hdr + data
 
 
+def _ensure_cue_file(kind: str) -> str:
+    path = _CUE_FILES.get(kind)
+    if path and os.path.exists(path):
+        return path
+    spec = _CUE_SPECS.get(kind)
+    if spec is None:
+        return ""
+    cue_dir = config_dir() / "cues"
+    cue_dir.mkdir(parents=True, exist_ok=True)
+    target = cue_dir / f"{kind}_{_CUE_VER}.wav"
+    if not target.exists():
+        target.write_bytes(_synth_wav(spec))
+    path = str(target)
+    _CUE_FILES[kind] = path
+    return path
+
+
 def play_cue(kind: str) -> None:
     """Play a gentle non-blocking sound cue on Windows."""
     if sys.platform != "win32":
         return
-    spec = _CUE_SPECS.get(kind)
-    if spec is None:
+    path = _ensure_cue_file(kind)
+    if not path:
         return
-    wav = _CUES.get(kind)
-    if wav is None:
-        wav = _synth_wav(spec)
-        _CUES[kind] = wav
     try:
         import winsound
-        winsound.PlaySound(wav, winsound.SND_MEMORY | winsound.SND_ASYNC | winsound.SND_NODEFAULT)
+        winsound.PlaySound(path, winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_NODEFAULT)
     except Exception:
         pass

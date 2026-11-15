@@ -28,12 +28,20 @@ def _join_raw_segments(chunk: list[dict], preserve_pauses: bool) -> str:
 
 
 class Cleaner(threading.Thread):
-    def __init__(self, state, session, provider, settings, mode: str = "meeting", log=print):
+    def __init__(self, state, session, provider, settings, mode: str = "meeting",
+                 selected_text: str = "", compose_history: list = None, log=print):
         super().__init__(daemon=True, name="eloquent-cleaner")
         self.state, self.session, self.provider, self.log = state, session, provider, log
+        self.compose = (mode == "compose")
         self.dictation = (mode == "dictation")
+        self.selected_text = selected_text
+        self.compose_history = list(compose_history or ())
         self.min_sim = settings.min_similarity
-        if self.dictation:
+        if self.compose:
+            # Hold the complete spoken prompt until stop so it generates as a single request
+            self.n_sent, self.min_words, self.max_words = 999, 99999, 99999
+            self.idle_flush, self.max_seg = 99999.0, 256
+        elif self.dictation:
             # Keep full context together for prompts/posts; only split mid-stream on very long dictations
             self.n_sent, self.min_words, self.max_words = 12, 180, 220
             self.idle_flush, self.max_seg = 9999.0, 24
@@ -70,9 +78,12 @@ class Cleaner(threading.Thread):
                 same_n += 1
             speaker_switch = same_n < ready_n
 
+            if self.compose and not self.flushing:
+                return None
+
             take = same_n
             if self.flushing or speaker_switch:
-                take = min(take, self.max_seg)
+                take = take if self.compose else min(take, self.max_seg)
             else:
                 grp = segs[:same_n]
                 words = sum(len(s["text"].split()) for s in grp)
@@ -91,7 +102,7 @@ class Cleaner(threading.Thread):
                     return None
             chunk = segs[:take]
             del segs[:take]
-            raw = _join_raw_segments(chunk, preserve_pauses=self.dictation)
+            raw = _join_raw_segments(chunk, preserve_pauses=(self.dictation or self.compose))
             break_before = bool(chunk and chunk[0].get("gap_before", 0.0) >= DICTATION_PAUSE_SEC)
             para = {
                 "id": st.next_id, "time": chunk[0]["t"], "raw": raw, "clean": None,
@@ -126,7 +137,10 @@ class Cleaner(threading.Thread):
         text, err = None, ""
         for _ in range(2):
             try:
-                text = self.provider.proofread(raw, ctx, mode=prompt_mode)
+                if self.compose:
+                    text = self.provider.compose(raw, self.selected_text, self.compose_history)
+                else:
+                    text = self.provider.proofread(raw, ctx, mode=prompt_mode)
                 if text:
                     break
                 err = "empty reply"
@@ -139,11 +153,12 @@ class Cleaner(threading.Thread):
             if self.fail_streak >= 3:              # 3 failed paragraphs in a row -> pause 30 s
                 self.cooldown_until = time.time() + 30
                 self.fail_streak = 0
-            return None, f"{self.provider.name} unavailable, kept raw"
+            return None, (err or f"{self.provider.name} unavailable") if self.compose else f"{self.provider.name} unavailable, kept raw"
         self.fail_streak = 0
-        ok, sim = accept_cleaned(raw, text, self.min_sim, dictation=self.dictation)
-        if not ok:
-            return None, f"kept raw (model changed too much, {sim:.0%} similar)"
+        if not self.compose:
+            ok, sim = accept_cleaned(raw, text, self.min_sim, dictation=self.dictation)
+            if not ok:
+                return None, f"kept raw (model changed too much, {sim:.0%} similar)"
         self._set_error("")
         return text, ""
 

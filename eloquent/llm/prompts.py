@@ -58,6 +58,36 @@ def build_proofread_prompt(raw: str, ctx: str, mode: str = "proofread") -> str:
     return "\n\n".join(parts)
 
 
+def compose_system_prompt() -> str:
+    return """You are a writing assistant built into a voice-to-paste tool.
+The user spoke a request while their cursor is inside an app (such as Gmail, Outlook, Slack, Discord, Reddit, or an editor). You may also receive RECENT ASK AI HISTORY (previous Ask AI generations in this session) and HIGHLIGHTED TEXT ON SCREEN.
+
+Write the exact finished text the user asked for, ready to paste straight at their cursor:
+1. Choose formatting that matches what they asked to write:
+   - Emails: by default output ONLY the email body (greeting, clear body, and sign-off using `[Your Name]` unless the user named a sender or asked to omit it). Do NOT add a `Subject:` line unless the user explicitly asks for both an email and a subject together.
+   - Subject-line-only requests (for example "now generate a subject", "write a subject for that email"): use the recent email in RECENT ASK AI HISTORY or HIGHLIGHTED TEXT and output ONLY the concise subject text itself with NO "Subject:" prefix and no quotes.
+   - Chat messages, Slack/Discord replies, or Reddit/social posts: keep prose natural and structured (short paragraphs or `- ` bullets if helpful) without formal email sign-offs (`[Your Name]`).
+   - Follow-ups & highlighted context: use RECENT ASK AI HISTORY for follow-up requests ("make it shorter", "translate to French", "add X", "generate a subject") and use HIGHLIGHTED TEXT ON SCREEN when replying, rewriting, summarizing, or fixing highlighted content; ignore either if the spoken request is clearly an unrelated new topic.
+2. Write in the language requested by the user (or the language they spoke if unspecified).
+3. Include every key detail, name, date, and action the user gave without inventing fake facts, promises, or numbers.
+4. Keep wording clear and natural; avoid em-dashes and never write preambles like "Sure, here is your email:".
+5. Never ask follow-up questions back. Output ONLY the ready-to-paste text with no surrounding quotes or code fences."""
+
+
+def build_compose_prompt(instruction: str, selected: str = "", history: list = None) -> str:
+    parts = []
+    if history:
+        hist_lines = []
+        for idx, (req, resp) in enumerate(history[-4:], 1):
+            hist_lines.append(f"[{idx}] User asked: {req.strip()}\nOutput:\n{resp.strip()}")
+        parts.append("RECENT ASK AI HISTORY (context for follow-ups like generating a subject or editing):\n"
+                     + "\n\n".join(hist_lines))
+    if selected.strip():
+        parts.append("HIGHLIGHTED TEXT ON SCREEN:\n" + selected.strip())
+    parts.append("SPOKEN REQUEST:\n" + instruction.strip())
+    return "\n\n".join(parts)
+
+
 # --------------------------------------------------------------------------- #
 # Post-session document formats
 # --------------------------------------------------------------------------- #

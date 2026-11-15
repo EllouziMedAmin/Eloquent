@@ -39,11 +39,12 @@ from .. import APP_NAME, __version__
 from ..audio import AUDIO_SOURCES, AUDIO_SOURCE_LABELS
 from ..config import ROOT, SETTINGS_FILE, config_dir
 from ..llm.prompts import REPORT_FORMATS
-from ..paste import get_external_foreground, play_cue, send_paste
+from ..paste import capture_selection_copy, get_external_foreground, play_cue, send_paste
 
 WM_HOTKEY = 0x0312
 HOTKEY_ID = 1
 HOTKEY_DICTATE_ID = 2
+HOTKEY_COMPOSE_ID = 3
 COMPACT_WIDTH = 560
 PANEL_HEIGHT = 380
 
@@ -52,6 +53,7 @@ STATUS_COLORS = {
     "loading": "#4aa3df",
     "listening": "#34c759",
     "dictating": "#8f8cff",
+    "composing": "#38bdf8",
     "stopping": "#e0a526",
 }
 
@@ -250,7 +252,9 @@ class EloquentWidget(QWidget):
         self.quitting = False
         self.hotkey_ok = False
         self.dictate_hotkey_ok = False
+        self.compose_hotkey_ok = False
         self.dictate_target_hwnd = 0
+        self._compose_starting = False
         self.caption_text, self.caption_kind = "Starting…", "hint"
         self.last_final = ""
 
@@ -375,6 +379,7 @@ class EloquentWidget(QWidget):
         self.act_top.toggled.connect(self._set_on_top)
         self.menu.addSeparator()
         self.menu.addAction("Open sessions folder", lambda: self._open(self.s.resolved_sessions_dir()))
+        self.menu.addAction("Clear Ask AI memory", self._clear_compose_history)
         self.menu.addAction("Create shortcuts + launch hotkey", self._make_shortcut)
         self.menu.addAction("Minimize", self.showMinimized)
         self.menu.addSeparator()
@@ -441,17 +446,25 @@ class EloquentWidget(QWidget):
                     self.caption_reset.start()
             self._mark_dirty()
         elif kind == "session_started":
-            dictating = (data or {}).get("mode") == "dictation"
-            if dictating and self.s.dictation_sound:
+            mode = (data or {}).get("mode", "meeting")
+            if mode in ("dictation", "compose") and self.s.dictation_sound:
                 play_cue("start")
-            self._caption(self._listening_hint(dictating), "hint")
+            self._caption(self._listening_hint(mode), "hint")
         elif kind == "session_ended":
             if not self.quitting:
-                if (data or {}).get("mode") == "dictation":
+                mode = (data or {}).get("mode", "meeting")
+                if mode in ("dictation", "compose"):
                     self._handle_dictation_ended(data)
                 else:
                     self._caption("Saved. Open the transcript with ⤢ or the folder from ⋯", "hint")
                     self.caption_reset.start()
+        elif kind == "compose_ready":
+            self._on_compose_ready(*data)
+        elif kind == "compose_unavailable":
+            if self.s.dictation_sound:
+                play_cue("error")
+            self._caption(data or "Add a Gemini API key in Settings to use Ask AI.", "error")
+            self.caption_reset.start()
         elif kind == "paste_done":
             self._on_paste_done(*data)
         elif kind in ("llm", "error"):
@@ -466,10 +479,13 @@ class EloquentWidget(QWidget):
                 self._caption(msg, "error")
                 self.caption_reset.start()
 
-    def _listening_hint(self, dictating: bool = None) -> str:
-        if dictating is None:
-            dictating = (self.engine.session_mode == "dictation")
-        if dictating:
+    def _listening_hint(self, mode: str = None) -> str:
+        if mode is None:
+            mode = self.engine.session_mode
+        if mode == "compose":
+            ck = self.s.compose_hotkey or "hotkey"
+            return f"Ask AI… speak prompt, press {ck} to paste"
+        if mode == "dictation":
             dk = self.s.dictate_hotkey or "hotkey"
             return f"Dictating… press {dk} to paste"
         return "Listening…"
@@ -478,7 +494,7 @@ class EloquentWidget(QWidget):
         self.engine.toggle("meeting")
 
     def _toggle_dictation(self):
-        if self.engine.status == "listening" and self.engine.session_mode == "meeting":
+        if self.engine.status == "listening" and self.engine.session_mode != "dictation":
             self._caption("Stop the current recording first", "hint")
             self.caption_reset.start()
             return
@@ -486,15 +502,75 @@ class EloquentWidget(QWidget):
             self.dictate_target_hwnd = get_external_foreground()
         self.engine.toggle("dictation")
 
+    def _toggle_compose(self):
+        if self.engine.status == "listening":
+            if self.engine.session_mode != "compose":
+                self._caption("Stop the current recording first", "hint")
+                self.caption_reset.start()
+                return
+            self.engine.toggle("compose")
+            return
+        if self.engine.status != "idle" or self._compose_starting:
+            return
+        hwnd = get_external_foreground()
+        self.dictate_target_hwnd = hwnd
+        if self.s.compose_selection and hwnd:
+            clip = QGuiApplication.clipboard()
+            prev_text = None
+            mime = clip.mimeData()
+            if mime is not None and mime.hasText():
+                prev_text = clip.text()
+            self._compose_starting = True
+            self._caption("Reading selection…", "hint")
+
+            def cap():
+                changed = capture_selection_copy(hwnd)
+                self.bridge.event.emit("compose_ready", (hwnd, changed, prev_text))
+
+            threading.Thread(target=cap, daemon=True, name="eloquent-capture").start()
+            return
+        if not self.engine.start(mode="compose", selected_text=""):
+            self.dictate_target_hwnd = 0
+
+    def _on_compose_ready(self, _hwnd: int, changed: bool, prev_text):
+        self._compose_starting = False
+        if self.quitting or self.engine.status != "idle":
+            return
+        selected = ""
+        if changed:
+            clip = QGuiApplication.clipboard()
+            mime = clip.mimeData()
+            if mime is not None and mime.hasText():
+                selected = clip.text()
+            if self.s.restore_clipboard and prev_text is not None and selected:
+                clip.setText(prev_text)
+        if not self.engine.start(mode="compose", selected_text=selected):
+            self.dictate_target_hwnd = 0
+
+    def _clear_compose_history(self):
+        self.engine.clear_compose_history()
+        self._caption("Ask AI memory cleared", "hint")
+        self.caption_reset.start()
+
     def _handle_dictation_ended(self, data: dict):
+        mode = (data or {}).get("mode", "dictation")
+        composing = (mode == "compose")
         paste_text = (data or {}).get("paste_text", "")
         cancelled = bool((data or {}).get("cancelled"))
+        err = (data or {}).get("error", "")
         target_hwnd = self.dictate_target_hwnd
         self.dictate_target_hwnd = 0
         if cancelled:
             if self.s.dictation_sound:
                 play_cue("cancel")
-            self._caption("Dictation cancelled (kept in ⤢)", "hint")
+            msg = "Ask AI cancelled (kept in ⤢)" if composing else "Dictation cancelled (kept in ⤢)"
+            self._caption(msg, "hint")
+            self.caption_reset.start()
+            return
+        if err:
+            if self.s.dictation_sound:
+                play_cue("error")
+            self._caption(f"Ask AI failed (kept prompt in ⤢): {err}" if composing else err, "error")
             self.caption_reset.start()
             return
         if not paste_text:
@@ -553,8 +629,11 @@ class EloquentWidget(QWidget):
         self.caption.setToolTip(self.caption_text if len(self.caption_text) > 60 else "")
 
     def _dot_status(self) -> str:
-        if self.engine.status == "listening" and self.engine.session_mode == "dictation":
-            return "dictating"
+        if self.engine.status == "listening":
+            if self.engine.session_mode == "compose":
+                return "composing"
+            if self.engine.session_mode == "dictation":
+                return "dictating"
         return self.engine.status
 
     def _idle_caption(self):
@@ -563,8 +642,9 @@ class EloquentWidget(QWidget):
             return
         hk = f" or {self.s.hotkey}" if self.hotkey_ok and self.s.hotkey else ""
         dk = f" · Dictate: {self.s.dictate_hotkey}" if self.dictate_hotkey_ok and self.s.dictate_hotkey else ""
+        ck = f" · Ask AI: {self.s.compose_hotkey}" if self.compose_hotkey_ok and self.s.compose_hotkey else ""
         src_tag = {"system": " (System audio)", "both": " (Mic + System)"}.get(self.s.audio_source, "")
-        msg = f"Ready{src_tag}. Press ▶{hk}{dk}"
+        msg = f"Ready{src_tag}. Press ▶{hk}{dk}{ck}"
         if e.llm["state"] == "off" and self.s.cleanup:
             msg += "  ·  no Gemini key, raw text only"
         self._caption(msg, "hint")
@@ -573,13 +653,17 @@ class EloquentWidget(QWidget):
         st = self.engine.status
         dot_st = self._dot_status()
         on = st == "listening"
-        dictating = (self.engine.session_mode == "dictation")
+        mode = self.engine.session_mode
+        dictating = (mode == "dictation")
+        composing = (mode == "compose")
         self.btn_toggle.setText("■" if on else "▶")
         self.btn_toggle.setEnabled(st in ("idle", "listening"))
         self.btn_toggle.setProperty("on", "true" if on else "false")
         self.btn_toggle.style().unpolish(self.btn_toggle)
         self.btn_toggle.style().polish(self.btn_toggle)
-        if on and dictating:
+        if on and composing:
+            self.btn_toggle.setToolTip("Cancel Ask AI (keep prompt in drawer)")
+        elif on and dictating:
             self.btn_toggle.setToolTip("Cancel dictation (keep in drawer)")
         else:
             hk = f" ({self.s.hotkey})" if self.hotkey_ok and self.s.hotkey else ""
@@ -594,7 +678,13 @@ class EloquentWidget(QWidget):
             self.level_timer.stop()
             self.dot.set_state(dot_st)
         if st == "stopping":
-            self._caption("Cleaning & pasting…" if dictating else "Finishing the last sentence…", "hint")
+            if composing:
+                msg = "Generating & pasting…"
+            elif dictating:
+                msg = "Cleaning & pasting…"
+            else:
+                msg = "Finishing the last sentence…"
+            self._caption(msg, "hint")
 
     def _tick_level(self):
         self.dot.set_state(self._dot_status(), self.engine.level)
@@ -816,6 +906,7 @@ class EloquentWidget(QWidget):
         for hk_id, text, attr in (
             (HOTKEY_ID, self.s.hotkey, "hotkey_ok"),
             (HOTKEY_DICTATE_ID, self.s.dictate_hotkey, "dictate_hotkey_ok"),
+            (HOTKEY_COMPOSE_ID, self.s.compose_hotkey, "compose_hotkey_ok"),
         ):
             ok = False
             if text:
@@ -836,7 +927,11 @@ class EloquentWidget(QWidget):
     def unregister_hotkey(self):
         if sys.platform == "win32":
             hwnd = int(self.winId())
-            for hk_id, attr in ((HOTKEY_ID, "hotkey_ok"), (HOTKEY_DICTATE_ID, "dictate_hotkey_ok")):
+            for hk_id, attr in (
+                (HOTKEY_ID, "hotkey_ok"),
+                (HOTKEY_DICTATE_ID, "dictate_hotkey_ok"),
+                (HOTKEY_COMPOSE_ID, "compose_hotkey_ok"),
+            ):
                 if getattr(self, attr, False):
                     ctypes.windll.user32.UnregisterHotKey(hwnd, hk_id)
                     setattr(self, attr, False)
@@ -852,6 +947,9 @@ class EloquentWidget(QWidget):
                         return True, 0
                     if msg.wParam == HOTKEY_DICTATE_ID:
                         self._toggle_dictation()
+                        return True, 0
+                    if msg.wParam == HOTKEY_COMPOSE_ID:
+                        self._toggle_compose()
                         return True, 0
         except Exception:
             pass

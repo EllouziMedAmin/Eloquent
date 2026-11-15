@@ -321,16 +321,31 @@ class SettingsDialog(QDialog):
         )
         lay.addWidget(dict_box)
 
+        self.compose_hotkey, comp_box = self._hotkey_row(
+            "Ask AI & paste at cursor (any app)",
+            self.s.compose_hotkey,
+            "Press once in any text box, speak a prompt (like writing an email), then press again to generate and paste.",
+        )
+        if hasattr(self.compose_hotkey, "keySequenceChanged"):
+            self.compose_hotkey.keySequenceChanged.connect(self._sync_llm_enabled)
+        elif hasattr(self.compose_hotkey, "textChanged"):
+            self.compose_hotkey.textChanged.connect(self._sync_llm_enabled)
+        lay.addWidget(comp_box)
+
         self.dictation_cleanup = QCheckBox("Clean dictated text with AI (dictation prompt)")
         self.dictation_cleanup.setChecked(self.s.dictation_cleanup)
         self.dictation_cleanup.toggled.connect(self._sync_llm_enabled)
         lay.addWidget(self.dictation_cleanup)
 
+        self.compose_selection = QCheckBox("Read highlighted text for Ask AI when available")
+        self.compose_selection.setChecked(self.s.compose_selection)
+        lay.addWidget(self.compose_selection)
+
         self.restore_clipboard = QCheckBox("Restore previous clipboard after pasting")
         self.restore_clipboard.setChecked(self.s.restore_clipboard)
         lay.addWidget(self.restore_clipboard)
 
-        self.dictation_sound = QCheckBox("Play soft sound cues for dictation")
+        self.dictation_sound = QCheckBox("Play soft sound cues for dictation and Ask AI")
         self.dictation_sound.setChecked(self.s.dictation_sound)
         lay.addWidget(self.dictation_sound)
 
@@ -351,7 +366,11 @@ class SettingsDialog(QDialog):
         self.source_hint.setText(hints.get(src, ""))
 
     def _sync_llm_enabled(self):
-        on = self.cleanup.isChecked() or (hasattr(self, "dictation_cleanup") and self.dictation_cleanup.isChecked())
+        on = (
+            self.cleanup.isChecked()
+            or (hasattr(self, "dictation_cleanup") and self.dictation_cleanup.isChecked())
+            or (hasattr(self, "compose_hotkey") and bool(self._hotkey_text(self.compose_hotkey)))
+        )
         for w in (self.key_box, self.model_box, self.fillers):
             w.setEnabled(on)
 
@@ -374,16 +393,23 @@ class SettingsDialog(QDialog):
     def _save(self):
         hk = self._hotkey_text(self.hotkey)
         dhk = self._hotkey_text(self.dictate_hotkey)
-        for label, val in (("recording hotkey", hk), ("dictation hotkey", dhk)):
+        chk = self._hotkey_text(self.compose_hotkey)
+        for label, val in (("recording hotkey", hk), ("dictation hotkey", dhk), ("Ask AI hotkey", chk)):
             if val and parse_hotkey(val) is None:
                 QMessageBox.warning(self, APP_NAME,
                                     f"That {label} can't be used. Include Ctrl, Alt, Shift or Win plus one key,\n"
-                                    "for example Ctrl+Shift+Space or Ctrl+Alt+Space.")
+                                    "for example Ctrl+Shift+Space, Ctrl+Alt+Space, or Ctrl+Alt+A.")
                 return
-        if hk and dhk and hk == dhk:
-            QMessageBox.warning(self, APP_NAME,
-                                "Recording and dictation shortcuts must be different.")
-            return
+        used = {}
+        for name, val in (("Recording", hk), ("Dictation", dhk), ("Ask AI", chk)):
+            if not val:
+                continue
+            k = val.lower()
+            if k in used:
+                QMessageBox.warning(self, APP_NAME,
+                                    f"{used[k]} and {name} shortcuts must be different.")
+                return
+            used[k] = name
         s = self.s
         s.gemini_api_key = self.key.text().strip()
         s.llm_model = self.model.text().strip() or s.llm_model
@@ -396,7 +422,9 @@ class SettingsDialog(QDialog):
         s.loopback_device = self.loopback.currentData()
         s.hotkey = hk
         s.dictate_hotkey = dhk
+        s.compose_hotkey = chk
         s.dictation_cleanup = self.dictation_cleanup.isChecked()
+        s.compose_selection = self.compose_selection.isChecked()
         s.restore_clipboard = self.restore_clipboard.isChecked()
         s.dictation_sound = self.dictation_sound.isChecked()
         folder = self.folder.text().strip()

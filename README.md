@@ -85,6 +85,7 @@ eloquent
 - **`Ctrl+Shift+E`** — Launch Eloquent from anywhere in Windows (handled by the tiny background launcher `setup.bat` installs); if it's already open, it comes to the front.
 - **`▶` / `■`** (or **`Ctrl+Shift+Space`**, customizable in Settings) — Start / Stop recording notes or meetings.
 - **`Ctrl+Alt+Space`** (customizable in Settings) — **Dictate into any app** (ChatGPT, Reddit, browser, editor): press once with your cursor in any text box, speak, then press again to clean up and paste right at your cursor (click **`■`** instead to cancel without pasting).
+- **`Ctrl+Alt+A`** (customizable in Settings) — **Ask AI / Compose at cursor**: press once with your cursor in any text box (optionally highlighting text on screen first), speak an instruction like *"write an email to Sarah pushing tomorrow's meeting to Thursday"*, then press again to generate and paste the reply at your cursor. Ask AI remembers recent turns in the current run so you can move to the Subject box next and say *"now generate a subject"*.
 - **`⤢`** (or double-click the pill) — Expand / collapse the full transcript & report drawer.
 - **`Generate ▾`** — Generate Summary, Bullet Points, Meeting Minutes, Lecture Notes, Report, Memo, or Custom Prompt.
 - **`⋯`** — Settings, *Save audio recording* toggle (`audio.wav`), *Always on top*, *Create shortcuts + launch hotkey*, *Minimize*.

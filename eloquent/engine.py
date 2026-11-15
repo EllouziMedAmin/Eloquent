@@ -80,6 +80,8 @@ class Engine:
         self.diarizer = None
         self.provider = None
         self.dict_provider = None
+        self.compose_provider = None
+        self.compose_history = []
         self._diar_lock = threading.Lock()
         self._provider_key = None
         self._listeners = []
@@ -152,20 +154,23 @@ class Engine:
         if self.settings.diarize and self._loaded and self.extractor is None:
             threading.Thread(target=self._load_speaker_extractor, daemon=True, name="eloquent-diar-load").start()
 
+    def clear_compose_history(self):
+        self.compose_history.clear()
+
     def refresh_provider(self, force: bool = False):
         """(Re)create the LLM provider(s) when settings change. The key check runs in the background."""
         s = self.settings
-        key = (s.cleanup, s.dictation_cleanup, s.resolved_api_key(), s.llm_model, s.keep_fillers)
+        key = (s.cleanup, s.dictation_cleanup, bool(s.compose_hotkey),
+               s.resolved_api_key(), s.llm_model, s.keep_fillers)
         if key == self._provider_key and not force:
             return
         self._provider_key = key
         self.provider, reason = make_provider(s)
-        if self.provider is not None:
-            self.dict_provider = self.provider if s.dictation_cleanup else None
-        elif s.dictation_cleanup:
-            self.dict_provider, _ = make_provider(s, force=True)
-        else:
-            self.dict_provider = None
+        forced = None
+        if self.provider is None and (s.dictation_cleanup or s.compose_hotkey):
+            forced, _ = make_provider(s, force=True)
+        self.dict_provider = (self.provider or forced) if s.dictation_cleanup else None
+        self.compose_provider = (self.provider or forced) if s.compose_hotkey else None
 
         if self.provider is None:
             self._set_llm("off", reason)
@@ -196,22 +201,42 @@ class Engine:
     def busy(self) -> bool:
         return self.status in ("listening", "stopping")
 
-    def start(self, wav_path: Path = None, mode: str = "meeting") -> bool:
+    def start(self, wav_path: Path = None, mode: str = "meeting", selected_text: str = "") -> bool:
         if not self._loaded or self.status != "idle":
             return False
         s = self.settings
-        mode = "dictation" if (mode == "dictation" and wav_path is None) else "meeting"
+        mode = mode if (mode in ("dictation", "compose") and wav_path is None) else "meeting"
         dictating = (mode == "dictation")
-        self.session_mode = mode
-        self._paste_on_stop = dictating
+        composing = (mode == "compose")
+        paste_mode = dictating or composing
         self.refresh_provider()
+        if composing:
+            cleaner_provider = self.compose_provider
+            if cleaner_provider is None:
+                cleaner_provider, reason = make_provider(s, force=True)
+                self.compose_provider = cleaner_provider
+            else:
+                reason = ""
+            if cleaner_provider is None:
+                msg = reason or "Add a Gemini API key in Settings to use Ask AI."
+                self.log(f"[compose] {msg}", "warn")
+                self._emit("compose_unavailable", msg)
+                return False
+        elif dictating:
+            cleaner_provider = self.dict_provider
+        else:
+            cleaner_provider = self.provider
+
+        self.session_mode = mode
+        self._paste_on_stop = paste_mode
+
         self.state.reset()
-        if dictating:
+        if paste_mode:
             self.session = None
         else:
             self.session = Session(s.resolved_sessions_dir(), save_audio=s.save_audio)
             self.last_session_dir = self.session.dir
-        use_diar = (not dictating) and s.diarize
+        use_diar = (not paste_mode) and s.diarize
         if use_diar and self.extractor is None:
             self._load_speaker_extractor()
         self.diarizer = Diarizer(self.extractor, self.state, self.session, log=self.log) if (
@@ -219,14 +244,18 @@ class Engine:
         ) else None
         if self.diarizer is not None:
             self.diarizer.start()
-        cleaner_provider = self.dict_provider if dictating else self.provider
-        self.cleaner = Cleaner(self.state, self.session, cleaner_provider, s, mode=mode, log=self.log)
+        self.cleaner = Cleaner(
+            self.state, self.session, cleaner_provider, s, mode=mode,
+            selected_text=selected_text if composing else "",
+            compose_history=list(self.compose_history) if composing else None,
+            log=self.log,
+        )
         self.cleaner.start()
 
         # per-session pipeline state (one VAD pipe per live source, or single file pipe)
         preroll = int(0.3 * SAMPLE_RATE)
         partial_every = int(s.partial_interval * SAMPLE_RATE)
-        src = "mic" if dictating else (s.audio_source if s.audio_source in ("mic", "system", "both") else "mic")
+        src = "mic" if paste_mode else (s.audio_source if s.audio_source in ("mic", "system", "both") else "mic")
         max_utt = min(float(s.max_utterance), 8.0)
         self._is_file_run = wav_path is not None
         self._session_t0 = time.monotonic()
@@ -270,15 +299,15 @@ class Engine:
                 self._paste_on_stop = False
             self._stop.set()
 
-    def toggle(self, mode: str = "meeting") -> bool:
+    def toggle(self, mode: str = "meeting", selected_text: str = "") -> bool:
         if self.status == "idle":
-            return self.start(mode=mode)
+            return self.start(mode=mode, selected_text=selected_text)
         if self.status == "listening":
-            if self.session_mode == "dictation":
-                self.stop(paste=(mode == "dictation"))
+            if mode == self.session_mode:
+                self.stop(paste=True)
                 return True
-            if mode == "meeting":
-                self.stop()
+            if self.session_mode in ("dictation", "compose") and mode == "meeting":
+                self.stop(paste=False)
                 return True
         return False
 
@@ -489,6 +518,34 @@ class Engine:
                 parts.append(txt)
             return "".join(parts).strip()
 
+    def _compose_result(self) -> tuple[str, str]:
+        with self.state.lock:
+            raw_parts = []
+            clean_parts = []
+            err = ""
+            for p in self.state.paragraphs:
+                raw = (p.get("raw") or "").strip()
+                clean = (p.get("clean") or "").strip()
+                note = (p.get("note") or "").strip()
+                if raw:
+                    raw_parts.append(raw)
+                if clean:
+                    clean_parts.append(clean)
+                elif raw and not err:
+                    err = note
+            state_err = (self.state.error or "").strip()
+
+        if not raw_parts and not clean_parts:
+            return "", ""
+        if len(clean_parts) < len(raw_parts) or not clean_parts:
+            return "", err or state_err or "Ask AI unavailable"
+        generated = "\n\n".join(clean_parts).strip()
+        raw_prompt = "\n\n".join(raw_parts).strip()
+        if raw_prompt and generated:
+            self.compose_history.append((raw_prompt, generated))
+            self.compose_history = self.compose_history[-5:]
+        return generated, ""
+
     def _finish(self):
         """Flush all active streams, finish diarization & cleanup, then close session files."""
         self._set_status("stopping")
@@ -511,11 +568,18 @@ class Engine:
         self.diarizer = None
         d = str(self.session.dir) if self.session is not None else ""
         mode = self.session_mode
-        cancelled = (mode == "dictation" and not self._paste_on_stop)
-        paste_text = self._dictation_text() if (mode == "dictation" and self._paste_on_stop) else ""
+        cancelled = (mode in ("dictation", "compose") and not self._paste_on_stop)
+        paste_text = ""
+        err = ""
+        if not cancelled:
+            if mode == "dictation":
+                paste_text = self._dictation_text()
+            elif mode == "compose":
+                paste_text, err = self._compose_result()
         self._set_status("idle")
         self._emit("session_ended", {
-            "dir": d, "mode": mode, "paste_text": paste_text, "cancelled": cancelled,
+            "dir": d, "mode": mode, "paste_text": paste_text,
+            "cancelled": cancelled, "error": err,
         })
 
     # ------------------------------------------------------------------ #
