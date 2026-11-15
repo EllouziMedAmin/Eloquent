@@ -284,30 +284,74 @@ class SettingsDialog(QDialog):
         lay.addWidget(box)
         return self._section("Recording & storage", card)
 
-    def _section_shortcuts(self) -> QVBoxLayout:
-        card, lay = self._card()
-        self.hotkey = QKeySequenceEdit()
-        self.hotkey.setMaximumSequenceLength(1)
-        if self.s.hotkey:
-            self.hotkey.setKeySequence(QKeySequence(self.s.hotkey))
+    @staticmethod
+    def _hotkey_row(title: str, value: str, hint: str) -> tuple[QKeySequenceEdit, QWidget]:
+        edit = QKeySequenceEdit()
+        edit.setMaximumSequenceLength(1)
+        if value:
+            edit.setKeySequence(QKeySequence(value))
         row = QHBoxLayout()
         clear = QPushButton("Clear")
         clear.setObjectName("small")
-        clear.clicked.connect(self.hotkey.clear)
-        row.addWidget(self.hotkey, 1)
+        clear.clicked.connect(edit.clear)
+        row.addWidget(edit, 1)
         row.addWidget(clear)
         box = QWidget()
         col = QVBoxLayout(box)
         col.setContentsMargins(0, 0, 0, 0)
         col.setSpacing(5)
-        col.addWidget(_label("Start / stop recording"))
+        col.addWidget(_label(title))
         col.addLayout(row)
-        col.addWidget(_label("Click the box and press the keys, for example Ctrl+Shift+Space. "
-                             "Leave empty to turn the hotkey off.", "hint", wrap=True))
-        lay.addWidget(box)
+        col.addWidget(_label(hint, "hint", wrap=True))
+        return edit, box
+
+    def _section_shortcuts(self) -> QVBoxLayout:
+        card, lay = self._card()
+        self.hotkey, rec_box = self._hotkey_row(
+            "Start / stop recording (notes & meetings)",
+            self.s.hotkey,
+            "Click the box and press the keys, for example Ctrl+Shift+Space. Leave empty to turn off.",
+        )
+        lay.addWidget(rec_box)
+
+        self.dictate_hotkey, dict_box = self._hotkey_row(
+            "Dictate & paste at cursor (any app)",
+            self.s.dictate_hotkey,
+            "Press once in ChatGPT, Reddit, or any text box to talk, then press again to clean and paste.",
+        )
+        lay.addWidget(dict_box)
+
+        self.compose_hotkey, comp_box = self._hotkey_row(
+            "Ask AI & paste at cursor (any app)",
+            self.s.compose_hotkey,
+            "Press once in any text box, speak a prompt (like writing an email), then press again to generate and paste.",
+        )
+        if hasattr(self.compose_hotkey, "keySequenceChanged"):
+            self.compose_hotkey.keySequenceChanged.connect(self._sync_llm_enabled)
+        elif hasattr(self.compose_hotkey, "textChanged"):
+            self.compose_hotkey.textChanged.connect(self._sync_llm_enabled)
+        lay.addWidget(comp_box)
+
+        self.dictation_cleanup = QCheckBox("Clean dictated text with AI (dictation prompt)")
+        self.dictation_cleanup.setChecked(self.s.dictation_cleanup)
+        self.dictation_cleanup.toggled.connect(self._sync_llm_enabled)
+        lay.addWidget(self.dictation_cleanup)
+
+        self.compose_selection = QCheckBox("Read highlighted text for Ask AI when available")
+        self.compose_selection.setChecked(self.s.compose_selection)
+        lay.addWidget(self.compose_selection)
+
+        self.restore_clipboard = QCheckBox("Restore previous clipboard after pasting")
+        self.restore_clipboard.setChecked(self.s.restore_clipboard)
+        lay.addWidget(self.restore_clipboard)
+
+        self.dictation_sound = QCheckBox("Play soft sound cues for dictation and Ask AI")
+        self.dictation_sound.setChecked(self.s.dictation_sound)
+        lay.addWidget(self.dictation_sound)
+
         lay.addWidget(_label(f"Launch Eloquent from anywhere: {self.s.launch_hotkey.title()} "
                              "(set up by setup.bat).", "hint", wrap=True))
-        return self._section("Shortcuts", card)
+        return self._section("Shortcuts & dictation", card)
 
     # ------------------------------------------------------------------ #
     def _sync_audio_source(self):
@@ -322,7 +366,11 @@ class SettingsDialog(QDialog):
         self.source_hint.setText(hints.get(src, ""))
 
     def _sync_llm_enabled(self):
-        on = self.cleanup.isChecked()
+        on = (
+            self.cleanup.isChecked()
+            or (hasattr(self, "dictation_cleanup") and self.dictation_cleanup.isChecked())
+            or (hasattr(self, "compose_hotkey") and bool(self._hotkey_text(self.compose_hotkey)))
+        )
         for w in (self.key_box, self.model_box, self.fillers):
             w.setEnabled(on)
 
@@ -335,19 +383,33 @@ class SettingsDialog(QDialog):
         if d:
             self.folder.setText(d)
 
-    def _hotkey_text(self) -> str:
-        seq = self.hotkey.keySequence()
+    @staticmethod
+    def _hotkey_text(edit: QKeySequenceEdit) -> str:
+        seq = edit.keySequence()
         if seq.isEmpty():
             return ""
         return seq.toString(QKeySequence.PortableText).lower().replace("meta", "win")
 
     def _save(self):
-        hk = self._hotkey_text()
-        if hk and parse_hotkey(hk) is None:
-            QMessageBox.warning(self, APP_NAME,
-                                "That hotkey can't be used. Include Ctrl, Alt, Shift or Win plus one key,\n"
-                                "for example Ctrl+Shift+Space.")
-            return
+        hk = self._hotkey_text(self.hotkey)
+        dhk = self._hotkey_text(self.dictate_hotkey)
+        chk = self._hotkey_text(self.compose_hotkey)
+        for label, val in (("recording hotkey", hk), ("dictation hotkey", dhk), ("Ask AI hotkey", chk)):
+            if val and parse_hotkey(val) is None:
+                QMessageBox.warning(self, APP_NAME,
+                                    f"That {label} can't be used. Include Ctrl, Alt, Shift or Win plus one key,\n"
+                                    "for example Ctrl+Shift+Space, Ctrl+Alt+Space, or Ctrl+Alt+A.")
+                return
+        used = {}
+        for name, val in (("Recording", hk), ("Dictation", dhk), ("Ask AI", chk)):
+            if not val:
+                continue
+            k = val.lower()
+            if k in used:
+                QMessageBox.warning(self, APP_NAME,
+                                    f"{used[k]} and {name} shortcuts must be different.")
+                return
+            used[k] = name
         s = self.s
         s.gemini_api_key = self.key.text().strip()
         s.llm_model = self.model.text().strip() or s.llm_model
@@ -359,6 +421,12 @@ class SettingsDialog(QDialog):
         s.device = self.mic.currentData()
         s.loopback_device = self.loopback.currentData()
         s.hotkey = hk
+        s.dictate_hotkey = dhk
+        s.compose_hotkey = chk
+        s.dictation_cleanup = self.dictation_cleanup.isChecked()
+        s.compose_selection = self.compose_selection.isChecked()
+        s.restore_clipboard = self.restore_clipboard.isChecked()
+        s.dictation_sound = self.dictation_sound.isChecked()
         folder = self.folder.text().strip()
         s.sessions_dir = "" if folder == str(s.resolved_sessions_dir()) and not s.sessions_dir else folder
         s.save()

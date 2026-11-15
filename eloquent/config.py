@@ -53,7 +53,13 @@ class Settings:
     # --- interface ---
     ui: str = "widget"                # widget | terminal | web
     hotkey: str = "ctrl+shift+space"  # start/stop recording while the widget runs (empty = off)
+    dictate_hotkey: str = "ctrl+alt+space"  # start/stop dictation & paste at cursor (empty = off)
+    compose_hotkey: str = "ctrl+alt+a"      # start/stop Ask AI (speak prompt -> generate & paste, empty = off)
     launch_hotkey: str = "ctrl+shift+e"  # starts Eloquent from anywhere (background launcher)
+    dictation_cleanup: bool = True    # clean dictated text with AI even if live transcript polishing is off
+    compose_selection: bool = True    # read highlighted text on screen for Ask AI when available
+    restore_clipboard: bool = True    # restore previous clipboard text after dictation paste
+    dictation_sound: bool = True      # play subtle chimes on dictation start and paste
     always_on_top: bool = True
     widget_pos: Optional[list] = None
     web_port: int = 8765

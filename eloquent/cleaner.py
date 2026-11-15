@@ -10,15 +10,46 @@ import time
 from .textutil import accept_cleaned, ends_sentence, mark_changes
 
 
+DICTATION_PAUSE_SEC = 2.8
+
+
+def _join_raw_segments(chunk: list[dict], preserve_pauses: bool) -> str:
+    if not preserve_pauses:
+        return " ".join(s["text"] for s in chunk)
+    parts = []
+    for i, s in enumerate(chunk):
+        txt = s["text"].strip()
+        if not txt:
+            continue
+        if parts:
+            parts.append("\n\n" if (i > 0 and s.get("gap_before", 0.0) >= DICTATION_PAUSE_SEC) else " ")
+        parts.append(txt)
+    return "".join(parts)
+
+
 class Cleaner(threading.Thread):
-    def __init__(self, state, session, provider, settings, log=print):
+    def __init__(self, state, session, provider, settings, mode: str = "meeting",
+                 selected_text: str = "", compose_history: list = None, log=print):
         super().__init__(daemon=True, name="eloquent-cleaner")
         self.state, self.session, self.provider, self.log = state, session, provider, log
-        self.n_sent, self.min_words, self.max_words = settings.chunk_sentences, 25, 90
-        self.idle_flush, self.min_sim = settings.idle_flush, settings.min_similarity
+        self.compose = (mode == "compose")
+        self.dictation = (mode == "dictation")
+        self.selected_text = selected_text
+        self.compose_history = list(compose_history or ())
+        self.min_sim = settings.min_similarity
+        if self.compose:
+            # Hold the complete spoken prompt until stop so it generates as a single request
+            self.n_sent, self.min_words, self.max_words = 999, 99999, 99999
+            self.idle_flush, self.max_seg = 99999.0, 256
+        elif self.dictation:
+            # Keep full context together for prompts/posts; only split mid-stream on very long dictations
+            self.n_sent, self.min_words, self.max_words = 12, 180, 220
+            self.idle_flush, self.max_seg = 9999.0, 24
+        else:
+            self.n_sent, self.min_words, self.max_words = settings.chunk_sentences, 25, 90
+            self.idle_flush, self.max_seg = settings.idle_flush, 8
         self.flushing = False
         self.abort = False
-        self.max_seg = 8                # cap per paragraph, even after a backlog
         self.fail_streak, self.cooldown_until = 0, 0.0
         self.last_error = ""
 
@@ -47,9 +78,12 @@ class Cleaner(threading.Thread):
                 same_n += 1
             speaker_switch = same_n < ready_n
 
+            if self.compose and not self.flushing:
+                return None
+
             take = same_n
             if self.flushing or speaker_switch:
-                take = min(take, self.max_seg)
+                take = take if self.compose else min(take, self.max_seg)
             else:
                 grp = segs[:same_n]
                 words = sum(len(s["text"].split()) for s in grp)
@@ -68,11 +102,13 @@ class Cleaner(threading.Thread):
                     return None
             chunk = segs[:take]
             del segs[:take]
-            raw = " ".join(s["text"] for s in chunk)
+            raw = _join_raw_segments(chunk, preserve_pauses=(self.dictation or self.compose))
+            break_before = bool(chunk and chunk[0].get("gap_before", 0.0) >= DICTATION_PAUSE_SEC)
             para = {
                 "id": st.next_id, "time": chunk[0]["t"], "raw": raw, "clean": None,
                 "tokens": None, "status": "cleaning" if self.provider else "raw",
-                "note": "", "speaker": first_spk, "seg_ids": [s["id"] for s in chunk],
+                "note": "", "speaker": first_spk, "break_before": break_before,
+                "seg_ids": [s["id"] for s in chunk],
                 "segs": [{"id": s["id"], "t": s["t"], "text": s["text"], "speaker": s.get("speaker", "")}
                          for s in chunk],
             }
@@ -97,10 +133,14 @@ class Cleaner(threading.Thread):
     def _clean(self, raw: str, ctx: str):
         if time.time() < self.cooldown_until:      # LLM keeps failing: do not even try for a while
             return None, f"{self.provider.name} unavailable, kept raw"
+        prompt_mode = "dictation" if self.dictation else "proofread"
         text, err = None, ""
         for _ in range(2):
             try:
-                text = self.provider.proofread(raw, ctx)
+                if self.compose:
+                    text = self.provider.compose(raw, self.selected_text, self.compose_history)
+                else:
+                    text = self.provider.proofread(raw, ctx, mode=prompt_mode)
                 if text:
                     break
                 err = "empty reply"
@@ -113,11 +153,12 @@ class Cleaner(threading.Thread):
             if self.fail_streak >= 3:              # 3 failed paragraphs in a row -> pause 30 s
                 self.cooldown_until = time.time() + 30
                 self.fail_streak = 0
-            return None, f"{self.provider.name} unavailable, kept raw"
+            return None, (err or f"{self.provider.name} unavailable") if self.compose else f"{self.provider.name} unavailable, kept raw"
         self.fail_streak = 0
-        ok, sim = accept_cleaned(raw, text, self.min_sim)
-        if not ok:
-            return None, f"kept raw (model changed too much, {sim:.0%} similar)"
+        if not self.compose:
+            ok, sim = accept_cleaned(raw, text, self.min_sim, dictation=self.dictation)
+            if not ok:
+                return None, f"kept raw (model changed too much, {sim:.0%} similar)"
         self._set_error("")
         return text, ""
 
@@ -153,7 +194,7 @@ class Cleaner(threading.Thread):
                 else:
                     para.update(status="raw", note=note)
             self.state.touch("paragraph", para["id"])
-            if not self.abort:
+            if not self.abort and self.session is not None:
                 self.session.add_clean(result or raw)
 
     def flush_and_wait(self, timeout: float = 30.0):
@@ -161,8 +202,9 @@ class Cleaner(threading.Thread):
         self.join(timeout)
         if self.is_alive():  # LLM too slow: stop waiting and save what is left as raw text
             self.abort = True
-            with self.state.lock:
-                left = [p["raw"] for p in self.state.paragraphs if p["status"] == "cleaning"]
-                left += [x["text"] for x in self.state.loose]
-            for t in left:
-                self.session.add_clean(t)
+            if self.session is not None:
+                with self.state.lock:
+                    left = [p["raw"] for p in self.state.paragraphs if p["status"] == "cleaning"]
+                    left += [x["text"] for x in self.state.loose]
+                for t in left:
+                    self.session.add_clean(t)

@@ -10,13 +10,16 @@ def norm_words(text: str):
     return [w.lower() for w in WORD_RE.findall(text)]
 
 
-def accept_cleaned(raw: str, clean: str, min_sim: float):
+def accept_cleaned(raw: str, clean: str, min_sim: float, dictation: bool = False):
     """Reject the model's output if it rewrote, shortened or padded the text."""
     a, b = norm_words(raw), norm_words(clean)
     if not b:
         return False, 0.0
     sim = difflib.SequenceMatcher(None, a, b, autojunk=False).ratio()
     ratio = len(b) / max(1, len(a))
+    if dictation:
+        threshold = min(min_sim, 0.25)
+        return (sim >= threshold and 0.20 <= ratio <= 1.35), sim
     threshold = min_sim if len(a) >= 12 else min(min_sim, 0.5)
     return (sim >= threshold and 0.5 <= ratio <= 1.3), sim
 

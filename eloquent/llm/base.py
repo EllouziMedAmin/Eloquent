@@ -14,8 +14,12 @@ class LLMProvider:
         """Cheap request that raises if the key/model/endpoint is not usable."""
         raise NotImplementedError
 
-    def proofread(self, raw: str, context: str) -> str:
-        """Return the corrected text. Raise on network/quota errors."""
+    def proofread(self, raw: str, context: str, mode: str = "proofread") -> str:
+        """Return the corrected text (`mode`: 'proofread' or 'dictation'). Raise on network/quota errors."""
+        raise NotImplementedError
+
+    def compose(self, instruction: str, selected: str = "", history: list = None) -> str:
+        """Turn a spoken request (+ optional highlighted text / session history) into ready-to-paste text."""
         raise NotImplementedError
 
     def generate(self, instruction: str, text: str, max_tokens: int = 4096) -> str:
