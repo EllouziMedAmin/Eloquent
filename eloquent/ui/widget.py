@@ -45,7 +45,7 @@ WM_HOTKEY = 0x0312
 HOTKEY_ID = 1
 HOTKEY_DICTATE_ID = 2
 HOTKEY_COMPOSE_ID = 3
-COMPACT_WIDTH = 560
+COMPACT_WIDTH = 660
 PANEL_HEIGHT = 380
 
 STATUS_COLORS = {
@@ -625,7 +625,8 @@ class EloquentWidget(QWidget):
 
     def _render_caption(self):
         fm = self.caption.fontMetrics()
-        self.caption.setText(fm.elidedText(self.caption_text, Qt.ElideLeft, max(50, self.caption.width() - 4)))
+        elide = Qt.ElideLeft if self.caption_kind in ("", "partial") else Qt.ElideRight
+        self.caption.setText(fm.elidedText(self.caption_text, elide, max(50, self.caption.width() - 4)))
         self.caption.setToolTip(self.caption_text if len(self.caption_text) > 60 else "")
 
     def _dot_status(self) -> str:
@@ -640,14 +641,21 @@ class EloquentWidget(QWidget):
         e = self.engine
         if e.status != "idle":
             return
-        hk = f" or {self.s.hotkey}" if self.hotkey_ok and self.s.hotkey else ""
-        dk = f" · Dictate: {self.s.dictate_hotkey}" if self.dictate_hotkey_ok and self.s.dictate_hotkey else ""
-        ck = f" · Ask AI: {self.s.compose_hotkey}" if self.compose_hotkey_ok and self.s.compose_hotkey else ""
-        src_tag = {"system": " (System audio)", "both": " (Mic + System)"}.get(self.s.audio_source, "")
-        msg = f"Ready{src_tag}. Press ▶{hk}{dk}{ck}"
+        parts = []
+        src_tag = {"system": "System audio", "both": "Mic + System"}.get(self.s.audio_source, "")
+        if src_tag:
+            parts.append(src_tag)
+        if self.hotkey_ok and self.s.hotkey:
+            parts.append(f"▶ {self.s.hotkey}")
+        elif not (self.dictate_hotkey_ok or self.compose_hotkey_ok):
+            parts.append("Ready. Press ▶")
+        if self.dictate_hotkey_ok and self.s.dictate_hotkey:
+            parts.append(f"Dictate: {self.s.dictate_hotkey}")
+        if self.compose_hotkey_ok and self.s.compose_hotkey:
+            parts.append(f"Ask AI: {self.s.compose_hotkey}")
         if e.llm["state"] == "off" and self.s.cleanup:
-            msg += "  ·  no Gemini key, raw text only"
-        self._caption(msg, "hint")
+            parts.append("no Gemini key, raw text only")
+        self._caption(" · ".join(parts) if parts else "Ready. Press ▶", "hint")
 
     def _update_controls(self):
         st = self.engine.status
