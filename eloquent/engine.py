@@ -17,6 +17,7 @@ so a new recording starts instantly.
 """
 
 import collections
+import gc
 import queue
 import threading
 import time
@@ -30,7 +31,7 @@ from .diarizer import Diarizer, build_speaker_extractor, ensure_speaker_model
 from .llm import make_provider
 from .llm.prompts import build_format_instruction
 from .session import Session, write_session_files
-from .speech import (SAMPLE_RATE, WINDOW, build_recognizer, build_vad, ensure_asr_model,
+from .speech import (SAMPLE_RATE, WINDOW, build_speech_recognizer, build_vad, close_recognizer,
                      ensure_vad_model, read_wav_16k, transcribe, transcribe_detailed)
 from .state import State, fmt_time
 
@@ -83,11 +84,13 @@ class Engine:
         self.compose_provider = None
         self.compose_history = []
         self._diar_lock = threading.Lock()
+        self._model_lock = threading.Lock()
         self._provider_key = None
         self._listeners = []
         self._stop = threading.Event()
         self._worker = None
         self._loaded = False
+        self._loaded_speech_lang = None
 
     # ------------------------------------------------------------------ #
     # events
@@ -117,25 +120,55 @@ class Engine:
     # ------------------------------------------------------------------ #
     # setup
     # ------------------------------------------------------------------ #
+    def _load_active_model(self, force_reload: bool = False):
+        """Load the speech recognizer matching settings.speech_language, swapping cleanly if changed."""
+        with self._model_lock:
+            if self.busy:
+                return
+            s = self.settings
+            lang = s.resolved_speech_language()
+            if not force_reload and self._loaded and self._loaded_speech_lang == lang:
+                return
+            self._set_status("loading")
+            try:
+                if self.recognizer is not None:
+                    close_recognizer(self.recognizer)
+                    self.recognizer = None
+                    self._loaded = False
+                    self._loaded_speech_lang = None
+                    gc.collect()
+                models = s.resolved_models_dir()
+                self.vad_path = ensure_vad_model(models, self.log)
+                threads = s.resolved_threads()
+                t0 = time.time()
+                self.recognizer = build_speech_recognizer(lang, models, threads, self.log)
+                self._loaded = True
+                self._loaded_speech_lang = lang
+                self.log(f"Speech model ready in {time.time() - t0:.1f}s")
+                if s.diarize:
+                    self._load_speaker_extractor(models)
+                self.refresh_provider()
+            except Exception:
+                self._loaded = False
+                self._loaded_speech_lang = None
+                raise
+            finally:
+                if not self.busy:
+                    self._set_status("idle")
+
     def load(self):
         """Download (first run) and load the speech models. Blocking; call from a worker thread in GUIs."""
-        if self._loaded:
+        self._load_active_model(force_reload=False)
+
+    def reload_speech_model(self):
+        """Hot-swap the speech recognizer when settings.speech_language changes while idle."""
+        lang = self.settings.resolved_speech_language()
+        if self._loaded and self._loaded_speech_lang == lang:
             return
-        self._set_status("loading")
-        s = self.settings
-        models = s.resolved_models_dir()
-        model_dir = ensure_asr_model(models, self.log)
-        self.vad_path = ensure_vad_model(models, self.log)
-        threads = s.resolved_threads()
-        self.log(f"Loading Parakeet on CPU with {threads} threads...")
-        t0 = time.time()
-        self.recognizer = build_recognizer(model_dir, threads)
-        self._loaded = True
-        self.log(f"Speech model ready in {time.time() - t0:.1f}s")
-        if s.diarize:
-            self._load_speaker_extractor(models)
-        self.refresh_provider()
-        self._set_status("idle")
+        try:
+            self._load_active_model(force_reload=True)
+        except Exception as e:
+            self.log(f"Could not switch speech model ({type(e).__name__}: {e})", "error")
 
     def _load_speaker_extractor(self, models_dir: Path = None):
         with self._diar_lock:
@@ -161,7 +194,7 @@ class Engine:
         """(Re)create the LLM provider(s) when settings change. The key check runs in the background."""
         s = self.settings
         key = (s.cleanup, s.dictation_cleanup, bool(s.compose_hotkey),
-               s.resolved_api_key(), s.llm_model, s.keep_fillers)
+               s.resolved_api_key(), s.llm_model, s.keep_fillers, s.resolved_speech_language())
         if key == self._provider_key and not force:
             return
         self._provider_key = key
@@ -253,31 +286,32 @@ class Engine:
         self.cleaner.start()
 
         # per-session pipeline state (one VAD pipe per live source, or single file pipe)
+        silence, max_utt_raw, partial_sec = s.resolved_timing()
         preroll = int(0.3 * SAMPLE_RATE)
-        partial_every = int(s.partial_interval * SAMPLE_RATE)
+        partial_every = int(partial_sec * SAMPLE_RATE)
         src = "mic" if paste_mode else (s.audio_source if s.audio_source in ("mic", "system", "both") else "mic")
-        max_utt = min(float(s.max_utterance), 8.0)
+        max_utt = min(float(max_utt_raw), 8.0)
         self._is_file_run = wav_path is not None
         self._session_t0 = time.monotonic()
         self._pipes: dict[str, _StreamPipe] = {}
         if wav_path is not None:
             self._pipes["file"] = _StreamPipe(
-                "file", build_vad(self.vad_path, s.vad_threshold, s.silence, max_utt),
+                "file", build_vad(self.vad_path, s.vad_threshold, silence, max_utt),
                 preroll, partial_every, use_diarizer=(self.diarizer is not None),
             )
         elif src == "both":
             self._pipes["mic"] = _StreamPipe(
-                "mic", build_vad(self.vad_path, s.vad_threshold, s.silence, max_utt),
+                "mic", build_vad(self.vad_path, s.vad_threshold, silence, max_utt),
                 preroll, partial_every, use_diarizer=False, fixed_speaker="You", partial_prefix="You: ",
             )
             self._pipes["system"] = _StreamPipe(
-                "system", build_vad(self.vad_path, s.vad_threshold, s.silence, max_utt),
+                "system", build_vad(self.vad_path, s.vad_threshold, silence, max_utt),
                 preroll, partial_every, use_diarizer=(self.diarizer is not None),
                 fixed_speaker="" if self.diarizer is not None else "Remote",
             )
         else:
             self._pipes[src] = _StreamPipe(
-                src, build_vad(self.vad_path, s.vad_threshold, s.silence, max_utt),
+                src, build_vad(self.vad_path, s.vad_threshold, silence, max_utt),
                 preroll, partial_every, use_diarizer=(self.diarizer is not None),
             )
 
@@ -424,13 +458,14 @@ class Engine:
         # Prefix-locked partial decoding: keep decoded tail <= ~5.2 s + bounded adaptive cooldown
         base_iv = pipe.partial_every if buf_sec <= 4.5 else int(pipe.partial_every * 1.6)
         min_iv = max(base_iv, min(int(1.4 * SAMPLE_RATE), int(pipe.last_partial_dt * 1.5 * SAMPLE_RATE)))
-        if speaking and allow_partial and pipe.since_partial >= min_iv:
+        supports_words = bool(getattr(self.recognizer, "supports_word_timestamps", True))
+        if speaking and vad.empty() and allow_partial and pipe.since_partial >= min_iv:
             pipe.since_partial = 0
             full = np.concatenate(pipe.buf)
             tail = full[pipe.partial_cut:]
             t_dec = time.monotonic()
-            if len(tail) > int(4.4 * SAMPLE_RATE):
-                _, pwords = transcribe_detailed(self.recognizer, tail)
+            if supports_words and len(tail) > int(4.4 * SAMPLE_RATE):
+                tail_raw, pwords = transcribe_detailed(self.recognizer, tail)
                 tail_dur = len(tail) / SAMPLE_RATE
                 cut_idx = None
                 for wi in range(len(pwords) - 1, -1, -1):
@@ -451,8 +486,10 @@ class Engine:
                         t_adv = t_adv + min(0.03, 0.5 * max(0.0, gap))
                     pipe.partial_cut += min(len(tail), max(0, int(t_adv * SAMPLE_RATE)))
                     text = f"{pipe.partial_prefix_text} {rest}".strip()
-                else:
+                elif pwords:
                     text = f"{pipe.partial_prefix_text} {' '.join(w['w'] for w in pwords)}".strip()
+                else:
+                    text = f"{pipe.partial_prefix_text} {tail_raw}".strip()
             else:
                 tail_text = transcribe(self.recognizer, tail)
                 text = f"{pipe.partial_prefix_text} {tail_text}".strip()

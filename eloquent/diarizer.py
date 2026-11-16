@@ -43,7 +43,7 @@ ESTABLISHED_MULTI_MEDIAN = 0.52 # minimum median cross-turn similarity for multi
 SPLIT_CROSS_THRESHOLD = 0.36  # 2-window sliding acoustic change-point threshold inside a chunk
 SLICE_MERGE_THRESHOLD = 0.45 # direct slice verification merge threshold
 SHORT_ATTACH_THRESHOLD = 0.30
-SENTENCE_END = (".", "?", "!", "…")
+SENTENCE_END = (".", "?", "!", "…", "؟")
 
 
 def ensure_speaker_model(models_dir: Path, log=print) -> Path:

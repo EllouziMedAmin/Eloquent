@@ -44,6 +44,11 @@ main{max-width:860px;margin:0 auto;padding:20px 20px 120px}
 .para.cleaning p{color:var(--mut);font-style:italic}
 .para.cleaning .time::after{content:" - polishing...";color:var(--acc)}
 .para .note{display:block;font-size:12px;color:var(--warn);margin-top:4px}
+.para.rtl,.loose.rtl,.partial.rtl,.report-body.rtl{direction:rtl;text-align:right}
+.para.rtl .time,.loose.rtl .time{direction:ltr;unicode-bidi:isolate}
+.report-body.rtl pre,.report-body.rtl code{direction:ltr;text-align:left}
+.report-body.rtl ul,.report-body.rtl ol{padding-left:0;padding-right:22px}
+.report-body.rtl blockquote{border-left:none;border-right:3px solid var(--acc)}
 .spk{display:inline-block;font-size:11px;font-weight:600;padding:0 6px;border-radius:4px;margin-right:8px;background:rgba(128,128,128,.15);cursor:pointer}
 .spk0{color:#2b6cb0}.spk1{color:#1f7a4c}.spk2{color:#a15c00}.spk3{color:#9d2d6b}.spk4{color:#6b46c1}.spk5{color:#c05621}
 @media (prefers-color-scheme: dark){.spk0{color:#7db4ff}.spk1{color:#6ee7b7}.spk2{color:#fbbf24}.spk3{color:#f472b6}.spk4{color:#c084fc}.spk5{color:#fb923c}}
@@ -109,10 +114,11 @@ function allText(s){
 function render(s){
   const nearBottom=window.innerHeight+window.scrollY>=document.body.offsetHeight-120;
   const box=$('log'); box.textContent='';
+  const isRtl=(s.speech_language==='arabic'||s.speech_language==='ar');
   if(s.report){
     const r=el('div','report');
     r.append(el('b','title',s.report.label+(s.report.status==='generating'?' (generating…)':'')));
-    const body=el('div','report-body');
+    const body=el('div','report-body'+(isRtl?' rtl':''));
     if(s.report.status==='done'&&s.report.html){
       body.innerHTML=s.report.html;
     }else{
@@ -123,12 +129,12 @@ function render(s){
     box.append(r);
   }
   for(const p of s.paragraphs){
-    const d=el('div','para '+p.status);
+    const d=el('div','para '+p.status+(isRtl?' rtl':''));
     const meta=el('span','time');
     if(s.multi_speaker&&p.speaker){const b=spkBadge(p.speaker,p.speaker_id); if(b)meta.append(b);}
     meta.append(document.createTextNode(p.time));
     d.append(meta);
-    const body=el('p');
+    const body=el('p'); body.dir=isRtl?'rtl':'auto';
     if(p.tokens && !showRaw){
       const fresh=!seenDone.has(p.id); if(fresh){d.classList.add('fresh'); seenDone.add(p.id);}
       p.tokens.forEach(([w,f])=>{body.append(el('span',f?'fix':'',w),' ');});
@@ -138,12 +144,13 @@ function render(s){
     box.append(d);
   }
   for(const l of s.loose){
-    const d=el('div','loose');
+    const d=el('div','loose'+(isRtl?' rtl':''));
     if(s.multi_speaker&&l.speaker){const b=spkBadge(l.speaker,l.speaker_id); if(b)d.append(b);}
-    d.append(el('span','time',l.t), document.createTextNode(l.text));
+    const lt=el('span','',l.text); lt.dir=isRtl?'rtl':'auto';
+    d.append(el('span','time',l.t), lt);
     box.append(d);
   }
-  if(s.partial) box.append(el('div','partial','... '+s.partial));
+  if(s.partial) box.append(el('div','partial'+(isRtl?' rtl':''),'... '+s.partial));
   $('rename').hidden=!s.multi_speaker;
   if(s.audio_source){$('src').value=s.audio_source;}
   $('src').disabled=(s.status!=='idle');
@@ -201,7 +208,12 @@ class WebUI:
     def payload(self) -> bytes:
         e = self.engine
         data = e.state.snapshot()
-        data.update({"status": e.status, "llm": e.llm, "audio_source": e.settings.audio_source})
+        data.update({
+            "status": e.status,
+            "llm": e.llm,
+            "audio_source": e.settings.audio_source,
+            "speech_language": e.settings.resolved_speech_language(),
+        })
         rep = data.get("report")
         if rep and rep.get("status") == "done" and rep.get("text"):
             data["report"] = dict(rep, html=render_report_web(rep["text"]))

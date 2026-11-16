@@ -14,7 +14,7 @@ import os
 import sys
 
 from . import APP_NAME, __version__
-from .config import SETTINGS_FILE, Settings
+from .config import SETTINGS_FILE, Settings, normalize_speech_language
 from .llm.prompts import REPORT_FORMATS
 
 
@@ -40,7 +40,9 @@ def build_parser(s: Settings) -> argparse.ArgumentParser:
                       help="disable multi-speaker identification")
     p.add_argument("--model", help=f"LLM model (default {s.llm_model})")
     p.add_argument("--keep-fillers", action="store_true", default=None, help="keep uh/um in the cleaned text")
-    p.add_argument("--threads", type=int, help="CPU threads for Parakeet (default: half the cores, max 8)")
+    p.add_argument("--threads", type=int, help="CPU threads for ASR (default: half the cores, max 8)")
+    p.add_argument("--speech-lang", choices=["parakeet", "arabic", "en", "ar"], default=None,
+                   help="speech model: parakeet (25 European languages) or arabic (Cohere Arabic)")
     p.add_argument("--source", choices=["mic", "system", "both"], default=None,
                    help=f"audio source (default from settings: {s.audio_source})")
     p.add_argument("--device", type=int, help="microphone index (see --list-devices)")
@@ -105,6 +107,8 @@ def main(argv=None):
         s.keep_fillers = True
     if args.threads:
         s.threads = args.threads
+    if args.speech_lang:
+        s.speech_language = normalize_speech_language(args.speech_lang)
     if args.source:
         s.audio_source = args.source
     if args.device is not None:
@@ -113,6 +117,7 @@ def main(argv=None):
         s.loopback_device = args.loopback
     if args.silence:
         s.silence = args.silence
+        s.ar_silence = args.silence
     if args.out:
         s.sessions_dir = args.out
     if args.port:

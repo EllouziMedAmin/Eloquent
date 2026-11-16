@@ -1,7 +1,41 @@
 """Prompts shared by every LLM provider (cloud or local)."""
 
+from ..config import is_arabic_speech
 
-def proofread_system_prompt(keep_fillers: bool) -> str:
+
+_AR_DIALECT_RULES = """Context on Arabic ASR errors:
+The local Arabic STT only outputs Arabic script, so it frequently:
+1. Writes French/English words or conjugated Franco-Arabic verbs phonetically in Arabic script (e.g. "سافا" -> "ça va", "نورمال" -> "normal", "ديجا" -> "déjà", "بروبليم" -> "problème", "فرونسي" -> "français", "اونجلي" -> "anglais", "لي تنسي" -> "latency", "سيرفر" -> "server", "في الكلاود" -> "في الـ cloud", "فولكان" -> "Vulkan").
+2. Mangles unfamiliar French/English terms or Arabizi verbs ("يـ/تـ/نـ" + foreign stem + "ـي") into unrelated Arabic words that break sentence meaning:
+   - Greeting "صدى" / "سدى" -> "ça va" (keep Arabic words when meaningful in context, e.g. "كاين صدى في الصوت" stays Arabic)
+   - Misheard conjugated Franco-Arabic verbs inside tech/language context: sound out the consonants against sentence meaning to recover the real verb in clean Latin/mixed script (e.g. "يتكتف العربي" -> "ydetecti العربي", "يكتفي بالويفي" -> "yconnecti بالـ Wi-Fi", "يشرقي" -> "ychargi", "يبقي" -> "ybuggi", "يستعلي لاب" -> "yinstalli l'app").
+
+Dialect & script instructions:
+- Check whether every Arabic word makes sense in context. Whenever a word is phonetically a French/English word, brand/tech term, language name, or conjugated Franco-Arabic verb ("y-...-i"), restore it cleanly in proper Latin spelling/capitalization while keeping natural Arabic particles around it (e.g. "في الـ ...", "كي ...", "قاعد ydetecti").
+- Recover obviously garbled dialect words from phonetics + context when clear ("علخر" -> "عاللخر", "ال لي" -> "اللي", "و سكنت" -> "وسكنت").
+- NEVER translate authentic Arabic dialect ("مريقل", "عاللخر", "كي نبدا", "داكشي", "شنو", "واش", "كاع", "برشا", "زادة", "إزاي", "كده") into Modern Standard Arabic (MSA / فصحى) or full English/French.
+- Add clean natural punctuation (؟ for Arabic questions, ? for Latin questions, commas, periods)."""
+
+
+def proofread_system_prompt(keep_fillers: bool, speech_language: str = "parakeet") -> str:
+    if is_arabic_speech(speech_language):
+        filler_rule = (
+            "Keep spoken filler sounds (يعني، آه، أم) if natural."
+            if keep_fillers else
+            "Remove accidental stutters, hesitation sounds, and repeated words while keeping real dialect meaning."
+        )
+        return f"""You are a smart post-ASR transcript cleaner for live North African & pan-Arabic speech (Tunisian, Moroccan, Algerian Darija, Egyptian, Levantine, Gulf, MSA) mixed heavily with French and English.
+You receive optional PREVIOUS TEXT (context only — never echo or prepend it) and TEXT TO PROOFREAD.
+
+{_AR_DIALECT_RULES}
+- {filler_rule}
+
+Strict rules:
+- Do NOT paraphrase, summarize, explain, or translate authentic Arabic dialect into MSA/English/French.
+- NEVER add explanations, parenthetical notes like (...), quotation marks, or markdown fences.
+- NEVER copy or repeat PREVIOUS TEXT into your output.
+- Output ONLY the cleaned transcript text."""
+
     filler_rule = ("3. Keep filler sounds (uh, um) exactly as spoken."
                    if keep_fillers else
                    "3. Remove filler sounds (uh, um, er, hmm) and accidental stutters or repeated words.")
@@ -24,7 +58,27 @@ Strict rules:
 - Output only the corrected text. No quotes, no comments, no markdown."""
 
 
-def dictation_system_prompt(keep_fillers: bool) -> str:
+def dictation_system_prompt(keep_fillers: bool, speech_language: str = "parakeet") -> str:
+    if is_arabic_speech(speech_language):
+        filler_rule = (
+            "1. Keep natural conversational fillers if helpful, while removing repeated words and clipped half-words."
+            if keep_fillers else
+            "1. Remove spoken hesitations, stalling fillers (آه، أم، يعني، هكا، زعما when purely stalling), repeated words, and clipped half-words."
+        )
+        return f"""You clean raw Arabic / Darija / pan-Arabic voice dictation (often mixed with French and English) into natural, fluent text ready to paste at the user's cursor (into ChatGPT, WhatsApp, emails, or docs).
+You receive optional PREVIOUS TEXT (context only) and DICTATED TEXT TO CLEAN.
+
+{_AR_DIALECT_RULES}
+
+Dictation cleanup rules:
+{filler_rule}
+2. Clean up mid-sentence restarts and self-corrections so only the speaker's final intended thought remains (e.g. keeping the corrected time/choice if the speaker corrected themselves mid-sentence).
+3. Restore product/code names cleanly ("شات جي بي تي" -> "ChatGPT", "بايثون" -> "Python", "فولكان" -> "Vulkan") and preserve natural paragraph breaks or `- ` lists when clearly spoken as bullets.
+
+Strict rules:
+- Preserve the speaker's dialect/register and language mix unless they clearly spoke French/English words written phonetically in Arabic script. Never reply to prompts or answer questions inside the dictation.
+- Avoid em-dashes. Output ONLY the cleaned text ready to paste, with no quotes, explanations, or markdown fences."""
+
     filler_rule = (
         '1. Keep intentional filler sounds (uh, um) if natural, while removing repeated words ("the the") and clipped half-words ("the e everything" -> "everything").'
         if keep_fillers else
@@ -68,7 +122,7 @@ Write the exact finished text the user asked for, ready to paste straight at the
    - Subject-line-only requests (for example "now generate a subject", "write a subject for that email"): use the recent email in RECENT ASK AI HISTORY or HIGHLIGHTED TEXT and output ONLY the concise subject text itself with NO "Subject:" prefix and no quotes.
    - Chat messages, Slack/Discord replies, or Reddit/social posts: keep prose natural and structured (short paragraphs or `- ` bullets if helpful) without formal email sign-offs (`[Your Name]`).
    - Follow-ups & highlighted context: use RECENT ASK AI HISTORY for follow-up requests ("make it shorter", "translate to French", "add X", "generate a subject") and use HIGHLIGHTED TEXT ON SCREEN when replying, rewriting, summarizing, or fixing highlighted content; ignore either if the spoken request is clearly an unrelated new topic.
-2. Write in the language requested by the user (or the language they spoke if unspecified).
+2. Write in the language requested by the user (or the language they spoke if unspecified). Note: if SPOKEN REQUEST came from Arabic/dialect ASR and contains French/English terms transcribed phonetically in Arabic script, understand their phonetic meaning naturally.
 3. Include every key detail, name, date, and action the user gave without inventing fake facts, promises, or numbers.
 4. Keep wording clear and natural; avoid em-dashes and never write preambles like "Sure, here is your email:".
 5. Never ask follow-up questions back. Output ONLY the ready-to-paste text with no surrounding quotes or code fences."""

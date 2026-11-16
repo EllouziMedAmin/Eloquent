@@ -7,7 +7,8 @@ If the LLM is slow, offline or rewrites too much, the raw text is kept.
 import threading
 import time
 
-from .textutil import accept_cleaned, ends_sentence, mark_changes
+from .config import is_arabic_speech
+from .textutil import accept_bilingual_fix, accept_cleaned, ends_sentence, mark_changes
 
 
 DICTATION_PAUSE_SEC = 2.8
@@ -36,6 +37,9 @@ class Cleaner(threading.Thread):
         self.dictation = (mode == "dictation")
         self.selected_text = selected_text
         self.compose_history = list(compose_history or ())
+        self.speech_language = (settings.resolved_speech_language()
+                                if hasattr(settings, "resolved_speech_language")
+                                else getattr(settings, "speech_language", "parakeet"))
         self.min_sim = settings.min_similarity
         if self.compose:
             # Hold the complete spoken prompt until stop so it generates as a single request
@@ -156,7 +160,12 @@ class Cleaner(threading.Thread):
             return None, (err or f"{self.provider.name} unavailable") if self.compose else f"{self.provider.name} unavailable, kept raw"
         self.fail_streak = 0
         if not self.compose:
-            ok, sim = accept_cleaned(raw, text, self.min_sim, dictation=self.dictation)
+            if is_arabic_speech(self.speech_language):
+                ok, sim = accept_bilingual_fix(
+                    raw, text, min(self.min_sim, 0.4), context=ctx, dictation=self.dictation,
+                )
+            else:
+                ok, sim = accept_cleaned(raw, text, self.min_sim, dictation=self.dictation)
             if not ok:
                 return None, f"kept raw (model changed too much, {sim:.0%} similar)"
         self._set_error("")
