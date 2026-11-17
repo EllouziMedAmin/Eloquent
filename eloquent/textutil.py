@@ -57,21 +57,21 @@ def phonetic_skeleton(text: str) -> str:
 
 def accept_bilingual_fix(raw: str, clean: str, min_sim: float, context: str = "",
                          dictation: bool = False) -> tuple[bool, float]:
-    """Allow French/English script restorations in Arabic speech while blocking hallucinations and echoes."""
+    """Allow meaning-based word fixes and French/English term restorations while blocking rewrites and hallucinations."""
     rw = WORD_RE.findall(norm_ar_for_sim(strip_diacritics_and_norm(raw)))
     cw = WORD_RE.findall(norm_ar_for_sim(strip_diacritics_and_norm(clean)))
     if not cw:
         return False, 0.0
     nr, nc = len(rw), len(cw)
     if dictation:
-        if nc < max(1, int(nr * 0.20)) or (nr > 4 and nc > int(nr * 1.75) + 3):
+        if nc < max(1, int(nr * 0.20)) or (nr > 4 and nc > int(nr * 1.55) + 2):
             return False, 0.0
-        if nr <= 4 and (nc > max(8, nr * 2 + 3) or len(clean) > max(80, len(raw) * 3 + 20)):
+        if nr <= 4 and (nc > max(7, nr * 2 + 2) or len(clean) > max(75, len(raw) * 3 + 15)):
             return False, 0.0
     elif nr <= 4:
-        if nc > max(6, nr * 2 + 2) or len(clean) > max(60, len(raw) * 3 + 15):
+        if nc > max(6, nr * 2 + 1) or len(clean) > max(55, len(raw) * 2 + 20):
             return False, 0.0
-    elif nc < max(1, int(nr * 0.45)) or nc > int(nr * 1.7) + 2:
+    elif nc < max(1, int(nr * 0.60)) or nc > int(nr * 1.45) + 2:
         return False, 0.0
 
     if context and nc > nr:
@@ -85,10 +85,24 @@ def accept_bilingual_fix(raw: str, clean: str, min_sim: float, context: str = ""
     sk_raw, sk_clean = phonetic_skeleton(raw), phonetic_skeleton(clean)
     ph_sim = difflib.SequenceMatcher(None, sk_raw, sk_clean, autojunk=False).ratio() if (sk_raw or sk_clean) else lex_sim
     sim = max(lex_sim, ph_sim)
+
+    if not dictation and nr >= 4:
+        # Ensure the LLM kept most of the sentence's words (allowing 1-2 meaning fixes in the middle)
+        raw_sks = [phonetic_skeleton(w) for w in rw]
+        anchored = 0
+        for w, c_sk in zip(cw, (phonetic_skeleton(x) for x in cw)):
+            if w in rw or (c_sk and any(
+                c_sk == r_sk or difflib.SequenceMatcher(None, c_sk, r_sk, autojunk=False).ratio() >= 0.6
+                for r_sk in raw_sks if r_sk
+            )):
+                anchored += 1
+        if anchored / max(1, len(cw)) < 0.55:
+            return False, sim
+
     if dictation:
-        eff_thresh = min(min_sim, 0.25)
+        eff_thresh = min(min_sim, 0.30)
     else:
-        eff_thresh = min(min_sim, 0.35) if nr <= 3 else min_sim
+        eff_thresh = min(min_sim, 0.45) if nr <= 3 else max(min_sim, 0.52)
     return sim >= eff_thresh, sim
 
 

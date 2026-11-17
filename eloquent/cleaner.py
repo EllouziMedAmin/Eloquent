@@ -162,7 +162,7 @@ class Cleaner(threading.Thread):
         if not self.compose:
             if is_arabic_speech(self.speech_language):
                 ok, sim = accept_bilingual_fix(
-                    raw, text, min(self.min_sim, 0.4), context=ctx, dictation=self.dictation,
+                    raw, text, self.min_sim, context=ctx, dictation=self.dictation,
                 )
             else:
                 ok, sim = accept_cleaned(raw, text, self.min_sim, dictation=self.dictation)
