@@ -37,7 +37,7 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QDia
 
 from .. import APP_NAME, __version__
 from ..audio import AUDIO_SOURCES, AUDIO_SOURCE_LABELS
-from ..config import ROOT, SETTINGS_FILE, config_dir
+from ..config import ROOT, SETTINGS_FILE, config_dir, is_arabic_speech, normalize_speech_language
 from ..llm.prompts import REPORT_FORMATS
 from ..paste import capture_selection_copy, get_external_foreground, play_cue, send_paste
 
@@ -45,6 +45,7 @@ WM_HOTKEY = 0x0312
 HOTKEY_ID = 1
 HOTKEY_DICTATE_ID = 2
 HOTKEY_COMPOSE_ID = 3
+HOTKEY_SWITCH_MODEL_ID = 4
 COMPACT_WIDTH = 660
 PANEL_HEIGHT = 380
 
@@ -142,15 +143,17 @@ def _speaker_badge(spk: str, esc, spk_id: str = "") -> str:
             f'text-decoration:none">{esc(spk)}</a>&nbsp; ')
 
 
-def transcript_html(snap: dict, show_raw: bool) -> str:
+def transcript_html(snap: dict, show_raw: bool, rtl: bool = False) -> str:
     esc = html.escape
     multi = bool(snap.get("multi_speaker"))
+    dir_attr = 'dir="rtl" align="right"' if rtl else 'dir="ltr"'
     out = []
     for p in snap["paragraphs"]:
         badge = _speaker_badge(p.get("speaker", ""), esc, p.get("speaker_id", "")) if multi else ""
-        head = f'{badge}<span style="color:#7d7d7d;font-size:11px">{esc(p["time"])}</span>'
+        t_html = f'<span dir="ltr" style="color:#7d7d7d;font-size:11px">{esc(p["time"])}</span>'
+        head = f'{badge}{t_html}'
         if p["status"] == "cleaning":
-            head += '<span style="color:#7db4ff;font-size:11px"> · polishing…</span>'
+            head += '<span dir="ltr" style="color:#7db4ff;font-size:11px"> · polishing…</span>'
             body = f'<span style="color:#9a9a9a"><i>{esc(p["raw"])}</i></span>'
         elif p["tokens"] and not show_raw:
             body = " ".join(
@@ -158,15 +161,19 @@ def transcript_html(snap: dict, show_raw: bool) -> str:
                 for w, f in p["tokens"])
         else:
             body = esc(p["raw"])
-        note = (f'<br><span style="color:#e0a526;font-size:11px">{esc(p["note"])}</span>'
-                if p["note"] else "")
-        out.append(f'<p style="margin:0 0 12px 0">{head}<br>{body}{note}</p>')
+        out.append(f'<p style="margin:0 0 2px 0" {dir_attr}>{head}</p>')
+        if p["note"]:
+            out.append(f'<p style="margin:0 0 2px 0" {dir_attr}>{body}</p>')
+            out.append(f'<p style="margin:0 0 12px 0;color:#e0a526;font-size:11px" dir="ltr" align="left">{esc(p["note"])}</p>')
+        else:
+            out.append(f'<p style="margin:0 0 12px 0" {dir_attr}>{body}</p>')
     for x in snap["loose"]:
         badge = _speaker_badge(x.get("speaker", ""), esc, x.get("speaker_id", "")) if multi else ""
-        out.append(f'<p style="margin:0 0 6px 0">{badge}<span style="color:#7d7d7d;font-size:11px">'
-                   f'{esc(x["t"])}</span>&nbsp;&nbsp;{esc(x["text"])}</p>')
+        t_html = f'<span dir="ltr" style="color:#7d7d7d;font-size:11px">{esc(x["t"])}</span>'
+        out.append(f'<p style="margin:0 0 2px 0" {dir_attr}>{badge}{t_html}</p>'
+                   f'<p style="margin:0 0 6px 0" {dir_attr}>{esc(x["text"])}</p>')
     if not out:
-        out.append('<p style="color:#7d7d7d">The transcript will appear here.</p>')
+        out.append('<p dir="ltr" align="left" style="color:#7d7d7d">The transcript will appear here.</p>')
     return "".join(out)
 
 
@@ -253,6 +260,7 @@ class EloquentWidget(QWidget):
         self.hotkey_ok = False
         self.dictate_hotkey_ok = False
         self.compose_hotkey_ok = False
+        self.switch_model_hotkey_ok = False
         self.dictate_target_hwnd = 0
         self._compose_starting = False
         self.caption_text, self.caption_kind = "Starting…", "hint"
@@ -285,6 +293,7 @@ class EloquentWidget(QWidget):
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         self.card = QFrame(objectName="card")
+        self.card.setLayoutDirection(Qt.LeftToRight)
         outer.addWidget(self.card)
         v = QVBoxLayout(self.card)
         v.setContentsMargins(12, 8, 10, 8)
@@ -322,6 +331,7 @@ class EloquentWidget(QWidget):
         self.view.setOpenLinks(False)
         self.view.anchorClicked.connect(self._on_anchor)
         self.view.setMinimumHeight(PANEL_HEIGHT - 60)
+        self._sync_view_direction()
         pv.addWidget(self.view, 1)
         bottom = QHBoxLayout()
         self.chk_raw = QCheckBox("show raw")
@@ -362,6 +372,7 @@ class EloquentWidget(QWidget):
 
         self.menu = QMenu(self)
         self.act_settings = self.menu.addAction("Settings…", self.open_settings)
+        self.act_switch_model = self.menu.addAction("Switch speech model", self._toggle_speech_model)
         src_menu = self.menu.addMenu("Audio source")
         self.src_group = QActionGroup(self)
         self.src_actions: dict[str, QAction] = {}
@@ -623,10 +634,21 @@ class EloquentWidget(QWidget):
             self.caption.style().polish(self.caption)
         self._render_caption()
 
+    def _is_rtl_language(self) -> bool:
+        return hasattr(self.s, "resolved_speech_language") and is_arabic_speech(self.s.resolved_speech_language())
+
+    def _sync_view_direction(self):
+        rtl = self._is_rtl_language()
+        self.view.setLayoutDirection(Qt.RightToLeft if rtl else Qt.LeftToRight)
+
     def _render_caption(self):
+        rtl_speech = self._is_rtl_language() and self.caption_kind in ("", "partial")
+        self.caption.setLayoutDirection(Qt.RightToLeft if rtl_speech else Qt.LeftToRight)
+        self.caption.setAlignment((Qt.AlignRight if rtl_speech else Qt.AlignLeft) | Qt.AlignVCenter)
         fm = self.caption.fontMetrics()
         elide = Qt.ElideLeft if self.caption_kind in ("", "partial") else Qt.ElideRight
-        self.caption.setText(fm.elidedText(self.caption_text, elide, max(50, self.caption.width() - 4)))
+        shown = fm.elidedText(self.caption_text, elide, max(50, self.caption.width() - 4))
+        self.caption.setText(("\u200F" + shown) if (rtl_speech and shown) else shown)
         self.caption.setToolTip(self.caption_text if len(self.caption_text) > 60 else "")
 
     def _dot_status(self) -> str:
@@ -642,6 +664,8 @@ class EloquentWidget(QWidget):
         if e.status != "idle":
             return
         parts = []
+        if self._is_rtl_language():
+            parts.append("AR")
         src_tag = {"system": "System audio", "both": "Mic + System"}.get(self.s.audio_source, "")
         if src_tag:
             parts.append(src_tag)
@@ -712,6 +736,8 @@ class EloquentWidget(QWidget):
     def _rebuild(self):
         if not self.panel.isVisible():
             return
+        rtl = self._is_rtl_language()
+        self._sync_view_direction()
         snap = self.engine.state.snapshot()
         rep = snap.get("report")
         has_rep = bool(rep and rep.get("status") in ("generating", "done", "error"))
@@ -722,16 +748,16 @@ class EloquentWidget(QWidget):
             st = rep["status"]
             if st == "generating":
                 self.view.setHtml(
-                    f'<p style="color:#7db4ff"><i>Generating {html.escape(rep["label"])}…</i></p>')
+                    f'<p dir="ltr" align="left" style="color:#7db4ff"><i>Generating {html.escape(rep["label"])}…</i></p>')
             elif st == "error":
                 self.view.setHtml(
-                    f'<p style="color:#ff8a80"><b>{html.escape(rep["label"])}</b><br>'
+                    f'<p dir="ltr" align="left" style="color:#ff8a80"><b>{html.escape(rep["label"])}</b><br>'
                     f'{html.escape(rep.get("error", ""))}</p>')
             else:
                 from eloquent.ui.markdown_math import render_report_qt
                 max_w = max(240, self.view.viewport().width() - 28)
                 self.view.setHtml(
-                    render_report_qt(self.view.document(), rep["label"], rep["text"], max_width=max_w)
+                    render_report_qt(self.view.document(), rep["label"], rep["text"], max_width=max_w, rtl=rtl)
                 )
         else:
             self.view_mode = "transcript"
@@ -741,10 +767,14 @@ class EloquentWidget(QWidget):
                 self.btn_back.show()
             else:
                 self.btn_back.hide()
+            opt = self.view.document().defaultTextOption()
+            opt.setTextDirection(Qt.RightToLeft if rtl else Qt.LeftToRight)
+            opt.setAlignment(Qt.AlignRight if rtl else Qt.AlignLeft)
+            self.view.document().setDefaultTextOption(opt)
             sb = self.view.verticalScrollBar()
             at_bottom = sb.value() >= sb.maximum() - 30
             keep = sb.value()
-            self.view.setHtml(transcript_html(snap, self.show_raw))
+            self.view.setHtml(transcript_html(snap, self.show_raw, rtl=rtl))
             sb.setValue(sb.maximum() if at_bottom else keep)
         self.dirty = False
 
@@ -846,6 +876,10 @@ class EloquentWidget(QWidget):
 
     # -- menu / settings ------------------------------------------------------
     def _show_menu(self):
+        is_ar = self._is_rtl_language()
+        hk = f" ({self.s.switch_model_hotkey})" if self.s.switch_model_hotkey else ""
+        self.act_switch_model.setText(("Switch to Parakeet (Default)" if is_ar else "Switch to Arabic") + hk)
+        self.act_switch_model.setEnabled(not self.engine.busy and self.engine.status != "loading")
         cur_src = self.s.audio_source if self.s.audio_source in self.src_actions else "mic"
         for k, act in self.src_actions.items():
             act.blockSignals(True)
@@ -884,16 +918,47 @@ class EloquentWidget(QWidget):
         self.show()
         self.register_hotkey()
 
+    def _toggle_speech_model(self):
+        if self.engine.busy or self.engine.status == "loading":
+            self._caption("Stop the current recording before switching models", "hint")
+            self.caption_reset.start()
+            return
+        target = "parakeet" if self._is_rtl_language() else "arabic"
+        if hasattr(self.s, "set_active_speech_language"):
+            self.s.set_active_speech_language(target)
+        else:
+            self.s.speech_language = target
+        self._sync_view_direction()
+        self._render_caption()
+        if self.panel.isVisible():
+            self._rebuild()
+        label = "Arabic (Cohere)" if target == "arabic" else "Parakeet (Default)"
+        self._caption(f"Switching to {label}…", "hint")
+        threading.Thread(target=self.engine.reload_speech_model, daemon=True,
+                         name="eloquent-asr-reload").start()
+
     def open_settings(self, first_run=False):
-        dlg = SettingsDialog(self.s, self, first_run=first_run)
+        old_active = self.s.resolved_speech_language() if hasattr(self.s, "resolved_speech_language") else "parakeet"
+        old_saved = normalize_speech_language(getattr(self.s, "speech_language", "parakeet"))
+        dlg = SettingsDialog(self.s, self, first_run=first_run,
+                             speech_busy=(self.engine.busy or self.engine.status == "loading"))
         dlg.setWindowFlag(Qt.WindowStaysOnTopHint, True)
         if dlg.exec():
+            if normalize_speech_language(self.s.speech_language) != old_saved and hasattr(self.s, "set_active_speech_language"):
+                self.s.set_active_speech_language(None)
+            new_active = self.s.resolved_speech_language() if hasattr(self.s, "resolved_speech_language") else "parakeet"
             hk_ok = self.register_hotkey()
             self.engine.refresh_provider()
             self.engine.sync_diarizer()
+            self._sync_view_direction()
             self._update_llm_label()
             self._update_controls()
-            if self.engine.status == "idle" and hk_ok:
+            if self.panel.isVisible():
+                self._rebuild()
+            if new_active != old_active and not self.engine.busy:
+                threading.Thread(target=self.engine.reload_speech_model, daemon=True,
+                                 name="eloquent-asr-reload").start()
+            elif self.engine.status == "idle" and hk_ok:
                 self._idle_caption()
 
     def _toggle_visible(self):
@@ -915,6 +980,7 @@ class EloquentWidget(QWidget):
             (HOTKEY_ID, self.s.hotkey, "hotkey_ok"),
             (HOTKEY_DICTATE_ID, self.s.dictate_hotkey, "dictate_hotkey_ok"),
             (HOTKEY_COMPOSE_ID, self.s.compose_hotkey, "compose_hotkey_ok"),
+            (HOTKEY_SWITCH_MODEL_ID, self.s.switch_model_hotkey, "switch_model_hotkey_ok"),
         ):
             ok = False
             if text:
@@ -939,6 +1005,7 @@ class EloquentWidget(QWidget):
                 (HOTKEY_ID, "hotkey_ok"),
                 (HOTKEY_DICTATE_ID, "dictate_hotkey_ok"),
                 (HOTKEY_COMPOSE_ID, "compose_hotkey_ok"),
+                (HOTKEY_SWITCH_MODEL_ID, "switch_model_hotkey_ok"),
             ):
                 if getattr(self, attr, False):
                     ctypes.windll.user32.UnregisterHotKey(hwnd, hk_id)
@@ -958,6 +1025,9 @@ class EloquentWidget(QWidget):
                         return True, 0
                     if msg.wParam == HOTKEY_COMPOSE_ID:
                         self._toggle_compose()
+                        return True, 0
+                    if msg.wParam == HOTKEY_SWITCH_MODEL_ID:
+                        self._toggle_speech_model()
                         return True, 0
         except Exception:
             pass

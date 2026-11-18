@@ -1649,10 +1649,15 @@ a { color: #7db4ff; }
 """
 
 
-def render_report_qt(doc, label: str, md_text: str, max_width: int = 0) -> str:
+def render_report_qt(doc, label: str, md_text: str, max_width: int = 0, rtl: bool = False) -> str:
     """Render Markdown + LaTeX to Qt Rich HTML and register math QImages on `doc`."""
-    from PySide6.QtCore import QUrl
+    from PySide6.QtCore import Qt, QUrl
     from PySide6.QtGui import QTextDocument
+
+    opt = doc.defaultTextOption()
+    opt.setTextDirection(Qt.RightToLeft if rtl else Qt.LeftToRight)
+    opt.setAlignment(Qt.AlignRight if rtl else Qt.AlignLeft)
+    doc.setDefaultTextOption(opt)
 
     base_px = 15.0
     try:
@@ -1696,4 +1701,10 @@ def render_report_qt(doc, label: str, md_text: str, max_width: int = 0) -> str:
         rendered_body,
         flags=re.DOTALL,
     )
+    if rtl:
+        return (
+            f'<!DOCTYPE html><html><head>{_QT_CSS}'
+            f'<style>body {{ direction: rtl; text-align: right; }} pre, code {{ direction: ltr; text-align: left; }}</style>'
+            f'</head><body dir="rtl"><div dir="rtl"><h1>{html.escape(label)}</h1>{rendered_body}</div></body></html>'
+        )
     return f"<!DOCTYPE html><html><head>{_QT_CSS}</head><body><h1>{html.escape(label)}</h1>{rendered_body}</body></html>"

@@ -3,27 +3,31 @@
 from .base import LLMProvider
 from .prompts import (build_compose_prompt, build_proofread_prompt, compose_system_prompt,
                       dictation_system_prompt, proofread_system_prompt)
+from ..config import is_arabic_speech
 from ..textutil import strip_wrappers
 
 
 class GeminiProvider(LLMProvider):
     name = "Gemini"
 
-    def __init__(self, api_key: str, model: str, keep_fillers: bool, timeout_ms: int = 12_000):
+    def __init__(self, api_key: str, model: str, keep_fillers: bool,
+                 speech_language: str = "parakeet", timeout_ms: int = 12_000):
         from google import genai
         from google.genai import types
         self._types = types
         self.model = model
+        ar = is_arabic_speech(speech_language)
+        clean_think = "low" if ar else "minimal"
         self.client = genai.Client(api_key=api_key, http_options=types.HttpOptions(timeout=timeout_ms))
         self.proof_cfg = types.GenerateContentConfig(
-            system_instruction=proofread_system_prompt(keep_fillers),
-            thinking_config=types.ThinkingConfig(thinking_level="minimal"),
+            system_instruction=proofread_system_prompt(keep_fillers, speech_language=speech_language),
+            thinking_config=types.ThinkingConfig(thinking_level=clean_think),
             max_output_tokens=2048,
             # Gemini 3 works best at its default temperature, so we leave it alone.
         )
         self.dict_cfg = types.GenerateContentConfig(
-            system_instruction=dictation_system_prompt(keep_fillers),
-            thinking_config=types.ThinkingConfig(thinking_level="minimal"),
+            system_instruction=dictation_system_prompt(keep_fillers, speech_language=speech_language),
+            thinking_config=types.ThinkingConfig(thinking_level=clean_think),
             max_output_tokens=4096,
         )
         self.comp_cfg = types.GenerateContentConfig(

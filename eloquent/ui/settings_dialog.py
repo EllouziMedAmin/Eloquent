@@ -7,7 +7,7 @@ from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QFileDialog, QFram
 
 from .. import APP_NAME
 from ..audio import AUDIO_SOURCES, list_input_devices, list_loopback_devices
-from ..config import config_dir
+from ..config import SPEECH_LANGUAGES, config_dir, is_arabic_speech, normalize_speech_language
 from ..hotkeys import parse_hotkey
 
 
@@ -79,9 +79,10 @@ def _label(text: str, name: str = "", wrap: bool = False) -> QLabel:
 
 
 class SettingsDialog(QDialog):
-    def __init__(self, settings, parent=None, first_run=False):
+    def __init__(self, settings, parent=None, first_run=False, speech_busy=False):
         super().__init__(parent)
         self.s = settings
+        self._speech_busy = speech_busy
         self._positioned = False
         self.setWindowTitle(f"{APP_NAME} settings")
         self.setMinimumSize(460, 380)
@@ -232,6 +233,18 @@ class SettingsDialog(QDialog):
         s = self.s
         card, lay = self._card()
 
+        self.speech_lang = QComboBox()
+        for key, label in SPEECH_LANGUAGES:
+            self.speech_lang.addItem(label, key)
+        cur_lang = normalize_speech_language(getattr(s, "speech_language", "parakeet"))
+        self.speech_lang.setCurrentIndex(max(0, self.speech_lang.findData(cur_lang)))
+        self.speech_lang.setEnabled(not self._speech_busy)
+        self.speech_lang.currentIndexChanged.connect(self._sync_speech_language)
+        self.speech_lang_hint = _label("", "hint", wrap=True)
+        lay.addLayout(self._field("Default speech model", self.speech_lang))
+        lay.addWidget(self.speech_lang_hint)
+        self._sync_speech_language()
+
         self.source = QComboBox()
         for key, label in AUDIO_SOURCES:
             self.source.addItem(label, key)
@@ -332,6 +345,13 @@ class SettingsDialog(QDialog):
             self.compose_hotkey.textChanged.connect(self._sync_llm_enabled)
         lay.addWidget(comp_box)
 
+        self.switch_model_hotkey, sw_box = self._hotkey_row(
+            "Switch speech model (Parakeet ↔ Arabic)",
+            self.s.switch_model_hotkey,
+            "Toggle live between Parakeet (default) and Cohere Arabic without changing your startup default.",
+        )
+        lay.addWidget(sw_box)
+
         self.dictation_cleanup = QCheckBox("Clean dictated text with AI (dictation prompt)")
         self.dictation_cleanup.setChecked(self.s.dictation_cleanup)
         self.dictation_cleanup.toggled.connect(self._sync_llm_enabled)
@@ -354,6 +374,21 @@ class SettingsDialog(QDialog):
         return self._section("Shortcuts & dictation", card)
 
     # ------------------------------------------------------------------ #
+    def _sync_speech_language(self):
+        lang = self.speech_lang.currentData() or "parakeet"
+        sw = (self._hotkey_text(self.switch_model_hotkey) if hasattr(self, "switch_model_hotkey")
+              else self.s.switch_model_hotkey) or "the menu"
+        if self._speech_busy:
+            self.speech_lang_hint.setText("Stop the active recording before changing the speech model.")
+        elif is_arabic_speech(lang):
+            self.speech_lang_hint.setText(
+                f"Starts Eloquent in Arabic (+ FR/EN cleanup with Gemini). Switch anytime with {sw}."
+            )
+        else:
+            self.speech_lang_hint.setText(
+                f"Default main model covering 25 European languages (fastest on CPU, word-level speaker splitting). Switch to Arabic anytime with {sw}."
+            )
+
     def _sync_audio_source(self):
         src = self.source.currentData()
         self.mic.setEnabled(src in ("mic", "both"))
@@ -394,14 +429,20 @@ class SettingsDialog(QDialog):
         hk = self._hotkey_text(self.hotkey)
         dhk = self._hotkey_text(self.dictate_hotkey)
         chk = self._hotkey_text(self.compose_hotkey)
-        for label, val in (("recording hotkey", hk), ("dictation hotkey", dhk), ("Ask AI hotkey", chk)):
+        smhk = self._hotkey_text(self.switch_model_hotkey)
+        for label, val in (
+            ("recording hotkey", hk),
+            ("dictation hotkey", dhk),
+            ("Ask AI hotkey", chk),
+            ("switch model hotkey", smhk),
+        ):
             if val and parse_hotkey(val) is None:
                 QMessageBox.warning(self, APP_NAME,
                                     f"That {label} can't be used. Include Ctrl, Alt, Shift or Win plus one key,\n"
-                                    "for example Ctrl+Shift+Space, Ctrl+Alt+Space, or Ctrl+Alt+A.")
+                                    "for example Ctrl+Shift+Space, Ctrl+Alt+Space, Ctrl+Alt+A, or Ctrl+Alt+M.")
                 return
         used = {}
-        for name, val in (("Recording", hk), ("Dictation", dhk), ("Ask AI", chk)):
+        for name, val in (("Recording", hk), ("Dictation", dhk), ("Ask AI", chk), ("Switch model", smhk)):
             if not val:
                 continue
             k = val.lower()
@@ -417,12 +458,14 @@ class SettingsDialog(QDialog):
         s.keep_fillers = self.fillers.isChecked()
         s.save_audio = self.audio.isChecked()
         s.diarize = self.diarize.isChecked()
+        s.speech_language = normalize_speech_language(self.speech_lang.currentData())
         s.audio_source = self.source.currentData() or "mic"
         s.device = self.mic.currentData()
         s.loopback_device = self.loopback.currentData()
         s.hotkey = hk
         s.dictate_hotkey = dhk
         s.compose_hotkey = chk
+        s.switch_model_hotkey = smhk
         s.dictation_cleanup = self.dictation_cleanup.isChecked()
         s.compose_selection = self.compose_selection.isChecked()
         s.restore_clipboard = self.restore_clipboard.isChecked()
