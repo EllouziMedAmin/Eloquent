@@ -1,6 +1,7 @@
 """Prompts shared by every LLM provider (cloud or local)."""
 
 from ..config import is_arabic_speech
+from ..textutil import match_custom_vocabulary
 
 
 _AR_DIALECT_RULES = """How to fix Arabic ASR errors accurately (MSA + all Arabic dialects):
@@ -10,7 +11,7 @@ _AR_DIALECT_RULES = """How to fix Arabic ASR errors accurately (MSA + all Arabic
      * MSA example: "علينا مناقشة هذا المقر قبل الاجتماع" -> "علينا مناقشة هذا الأمر قبل الاجتماع"
      * General Arabic example: "صوت المايك وادي في التسجيل" -> "صوت المايك واطي في التسجيل"
      * Dialect / Arabized verb example: "الموديل يتكتف العربي مليح" -> "الموديل يديتيكتي العربي مليح"
-   - Fix words that ASR split or fused incorrectly ("ع اللخر" -> "عاللخر", "ال لي" -> "اللي", "و سكنت" -> "وسكنت", "ان شاء الله" -> "إن شاء الله") and join sentences cut in two by a short pause.
+   - Fix words that ASR split or fused incorrectly ("ع اللخر" -> "عاللخر", "ال لي" -> "اللي", "و سكنت" -> "وسكنت", "ان شاء الله" -> "إن شاء الله", "normal mo" -> "normalement") and join sentences cut in two by a short pause.
 3. Script rule (keep Arabic in Arabic script; only pure foreign words in Latin script):
    - Keep ALL Arabic words, dialect words, and verbs conjugated with Arabic prefixes/suffixes (such as "يديتيكتي", "يشارجي", "يكونيكتي", "تبارطاجي", "يبوقي") in ARABIC script. Never write Arabized verbs in Latin script (do NOT write "ydetecti" or "ychargi").
    - Only when the speaker said a standalone French or English word, brand, or technical term that ASR wrote phonetically in Arabic letters, restore that specific word in Latin script (e.g. "سيرفر" -> "server", "بروبليم" -> "problème", "نورمال" -> "normal", "ديجا" -> "déjà", "سافا" -> "ça va", "في الكلاود" -> "في الـ cloud", "فولكان" -> "Vulkan", "شات جي بي تي" -> "ChatGPT").
@@ -106,10 +107,32 @@ Strict rules:
 - Output ONLY the cleaned text ready to paste. No quotes, no explanations, no markdown fences."""
 
 
-def build_proofread_prompt(raw: str, ctx: str, mode: str = "proofread") -> str:
+def _format_vocab_hint(raw: str, custom_vocabulary: str) -> str:
+    terms, pairs = match_custom_vocabulary(raw, custom_vocabulary)
+    if not terms and not pairs:
+        return ""
+    lines = []
+    if pairs:
+        lines.append(
+            "Learned ASR fixes (apply if it fits the sentence meaning): "
+            + ", ".join(f'"{w}" -> "{r}"' for w, r in pairs)
+        )
+    if terms:
+        lines.append(
+            "Candidate proper names/terms (use this spelling only if a phonetically similar word in the text "
+            "refers to it; otherwise ignore): " + ", ".join(terms)
+        )
+    return "USER VOCABULARY CANDIDATES:\n" + "\n".join(lines)
+
+
+def build_proofread_prompt(raw: str, ctx: str, mode: str = "proofread",
+                           custom_vocabulary: str = "") -> str:
     parts = []
     if ctx:
         parts.append("PREVIOUS TEXT (context only, do not output it):\n" + ctx)
+    hint = _format_vocab_hint(raw, custom_vocabulary)
+    if hint:
+        parts.append(hint)
     label = "DICTATED TEXT TO CLEAN" if mode == "dictation" else "TEXT TO PROOFREAD"
     parts.append(f"{label}:\n" + raw)
     return "\n\n".join(parts)
@@ -131,7 +154,8 @@ Write the exact finished text the user asked for, ready to paste straight at the
 5. Never ask follow-up questions back. Output ONLY the ready-to-paste text with no surrounding quotes or code fences."""
 
 
-def build_compose_prompt(instruction: str, selected: str = "", history: list = None) -> str:
+def build_compose_prompt(instruction: str, selected: str = "", history: list = None,
+                         custom_vocabulary: str = "") -> str:
     parts = []
     if history:
         hist_lines = []
@@ -141,6 +165,9 @@ def build_compose_prompt(instruction: str, selected: str = "", history: list = N
                      + "\n\n".join(hist_lines))
     if selected.strip():
         parts.append("HIGHLIGHTED TEXT ON SCREEN:\n" + selected.strip())
+    hint = _format_vocab_hint(instruction, custom_vocabulary)
+    if hint:
+        parts.append(hint)
     parts.append("SPOKEN REQUEST:\n" + instruction.strip())
     return "\n\n".join(parts)
 

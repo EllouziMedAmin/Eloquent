@@ -40,6 +40,7 @@ from ..audio import AUDIO_SOURCES, AUDIO_SOURCE_LABELS
 from ..config import ROOT, SETTINGS_FILE, config_dir, is_arabic_speech, normalize_speech_language
 from ..llm.prompts import REPORT_FORMATS
 from ..paste import capture_selection_copy, get_external_foreground, play_cue, send_paste
+from ..textutil import parse_custom_vocabulary
 
 WM_HOTKEY = 0x0312
 HOTKEY_ID = 1
@@ -242,7 +243,7 @@ class LevelDot(QWidget):
         p.drawEllipse(c, 5, 5)
 
 
-from .settings_dialog import SettingsDialog  # noqa: E402
+from .settings_dialog import SettingsDialog, VocabularyDialog  # noqa: E402
 
 
 # --------------------------------------------------------------------------- #
@@ -330,6 +331,8 @@ class EloquentWidget(QWidget):
         self.view = QTextBrowser()
         self.view.setOpenLinks(False)
         self.view.anchorClicked.connect(self._on_anchor)
+        self.view.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.view.customContextMenuRequested.connect(self._show_view_context_menu)
         self.view.setMinimumHeight(PANEL_HEIGHT - 60)
         self._sync_view_direction()
         pv.addWidget(self.view, 1)
@@ -372,6 +375,7 @@ class EloquentWidget(QWidget):
 
         self.menu = QMenu(self)
         self.act_settings = self.menu.addAction("Settings…", self.open_settings)
+        self.menu.addAction("Personal dictionary…", self.open_vocabulary)
         self.act_switch_model = self.menu.addAction("Switch speech model", self._toggle_speech_model)
         src_menu = self.menu.addMenu("Audio source")
         self.src_group = QActionGroup(self)
@@ -811,6 +815,42 @@ class EloquentWidget(QWidget):
         if dlg.exec():
             self.engine.rename_speakers(dlg.values())
 
+    def _show_view_context_menu(self, pos: QPoint):
+        menu = self.view.createStandardContextMenu(pos)
+        if self.view_mode == "transcript":
+            sel = self.view.textCursor().selectedText().replace("\u2029", " ").strip()
+            if 1 <= len(sel) <= 80:
+                short = sel if len(sel) <= 28 else sel[:25] + "…"
+                safe_short = short.replace("&", "&&")
+                act_fix = QAction(f'Correct "{safe_short}"…', menu)
+                act_fix.triggered.connect(lambda _c=False, t=sel: self._fix_and_remember_selection(t))
+                acts = menu.actions()
+                if acts:
+                    sep = menu.insertSeparator(acts[0])
+                    menu.insertAction(sep, act_fix)
+                else:
+                    menu.addAction(act_fix)
+        menu.exec(self.view.viewport().mapToGlobal(pos))
+
+    def _fix_and_remember_selection(self, selected: str):
+        dlg = QInputDialog(self)
+        dlg.setWindowTitle(f"{APP_NAME} - Correct Word")
+        dlg.setLabelText(f'Correct "{selected}" to (also remembered for future transcripts):')
+        dlg.setTextValue(selected)
+        dlg.setWindowFlag(Qt.WindowStaysOnTopHint, True)
+        dlg.setStyleSheet("")
+        if not dlg.exec():
+            return
+        replacement = dlg.textValue().strip()
+        if not replacement or replacement == selected:
+            return
+        count = self.engine.apply_vocabulary_fix(selected, replacement, remember=True)
+        self._rebuild()
+        msg = (f'Corrected ({count}): {selected} -> {replacement}'
+               if count else f'Remembered: {selected} -> {replacement}')
+        self._caption(msg, "hint")
+        self.caption_reset.start()
+
     def _trigger_gen(self, format_id: str, custom_prompt: str = ""):
         self.engine.generate_report(format_id, custom_prompt)
 
@@ -960,6 +1000,16 @@ class EloquentWidget(QWidget):
                                  name="eloquent-asr-reload").start()
             elif self.engine.status == "idle" and hk_ok:
                 self._idle_caption()
+
+    def open_vocabulary(self):
+        dlg = VocabularyDialog(getattr(self.s, "custom_vocabulary", ""), self)
+        if dlg.exec():
+            self.s.custom_vocabulary = dlg.vocabulary_string()
+            self.s.save()
+            self.engine.refresh_provider()
+            terms, pairs = parse_custom_vocabulary(self.s.custom_vocabulary)
+            self._caption(f"Dictionary saved ({len(terms)} names, {len(pairs)} corrections)", "hint")
+            self.caption_reset.start()
 
     def _toggle_visible(self):
         if self.isVisible():

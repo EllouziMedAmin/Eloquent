@@ -8,7 +8,7 @@ import threading
 import time
 
 from .config import is_arabic_speech
-from .textutil import accept_bilingual_fix, accept_cleaned, ends_sentence, mark_changes
+from .textutil import accept_bilingual_fix, accept_cleaned, apply_learned_replacements, ends_sentence, mark_changes
 
 
 DICTATION_PAUSE_SEC = 2.8
@@ -40,6 +40,7 @@ class Cleaner(threading.Thread):
         self.speech_language = (settings.resolved_speech_language()
                                 if hasattr(settings, "resolved_speech_language")
                                 else getattr(settings, "speech_language", "parakeet"))
+        self.custom_vocabulary = getattr(settings, "custom_vocabulary", "")
         self.min_sim = settings.min_similarity
         if self.compose:
             # Hold the complete spoken prompt until stop so it generates as a single request
@@ -190,7 +191,8 @@ class Cleaner(threading.Thread):
                 continue
             raw = para["raw"]
             if self.provider is None:
-                result, note = None, ""
+                fixed = apply_learned_replacements(raw, self.custom_vocabulary) if self.custom_vocabulary else raw
+                result, note = (fixed, "") if fixed != raw else (None, "")
             else:
                 result, note = self._clean(raw, self._context(para))
             tokens = mark_changes(raw, result) if result else None   # outside the lock

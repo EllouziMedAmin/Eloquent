@@ -11,11 +11,13 @@ class GeminiProvider(LLMProvider):
     name = "Gemini"
 
     def __init__(self, api_key: str, model: str, keep_fillers: bool,
-                 speech_language: str = "parakeet", timeout_ms: int = 12_000):
+                 speech_language: str = "parakeet", custom_vocabulary: str = "",
+                 timeout_ms: int = 12_000):
         from google import genai
         from google.genai import types
         self._types = types
         self.model = model
+        self.custom_vocabulary = custom_vocabulary
         ar = is_arabic_speech(speech_language)
         clean_think = "low" if ar else "minimal"
         self.client = genai.Client(api_key=api_key, http_options=types.HttpOptions(timeout=timeout_ms))
@@ -47,13 +49,16 @@ class GeminiProvider(LLMProvider):
     def proofread(self, raw: str, context: str, mode: str = "proofread") -> str:
         cfg = self.dict_cfg if mode == "dictation" else self.proof_cfg
         resp = self.client.models.generate_content(
-            model=self.model, contents=build_proofread_prompt(raw, context, mode=mode), config=cfg)
+            model=self.model,
+            contents=build_proofread_prompt(raw, context, mode=mode, custom_vocabulary=self.custom_vocabulary),
+            config=cfg,
+        )
         return strip_wrappers(resp.text or "")
 
     def compose(self, instruction: str, selected: str = "", history: list = None) -> str:
         resp = self.client.models.generate_content(
             model=self.model,
-            contents=build_compose_prompt(instruction, selected, history),
+            contents=build_compose_prompt(instruction, selected, history, custom_vocabulary=self.custom_vocabulary),
             config=self.comp_cfg,
         )
         return strip_wrappers(resp.text or "")

@@ -131,8 +131,10 @@ def ensure_transcribe_cpp(models_dir: Path, log=print):
 
 
 def clean_arabic_asr_artifacts(text: str) -> str:
-    """Strip Cohere silence/noise control tokens (e.g. '@@@فراغ', '@@@ضوضاء') and bare punctuation."""
-    cleaned = re.sub(r"@+\s*فراغ|\S*@@@\S*", "", text).strip()
+    """Strip Cohere silence/noise control tokens, stray truncation '#' markers, and repetition loops."""
+    cleaned = re.sub(r"@+\s*فراغ|\S*@@@\S*|###\S*|#+", "", text)
+    cleaned = re.sub(r"\s{2,}", " ", cleaned).strip()
+    cleaned = re.sub(r"\b(\S+(?:\s+\S+)?)(?:\s+\1){2,}\b", r"\1", cleaned).strip()
     return "" if cleaned in ("", ".", "،", "؟", "!", "...") else cleaned
 
 

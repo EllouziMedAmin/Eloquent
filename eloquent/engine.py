@@ -21,12 +21,14 @@ import gc
 import queue
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
 
 from .audio import LoopbackCapture, MicCapture
 from .cleaner import Cleaner, DICTATION_PAUSE_SEC
+from .config import config_dir
 from .diarizer import Diarizer, build_speaker_extractor, ensure_speaker_model
 from .llm import make_provider
 from .llm.prompts import build_format_instruction
@@ -42,11 +44,14 @@ class _StreamPipe:
     """Per-audio-source VAD + partial buffer + speaker routing state."""
 
     def __init__(self, tag: str, vad, preroll: int, partial_every: int,
+                 max_samples: int = int(8.0 * SAMPLE_RATE),
                  use_diarizer: bool = True, fixed_speaker: str = "", partial_prefix: str = ""):
         self.tag = tag
         self.vad = vad
         self.preroll = preroll
         self.partial_every = partial_every
+        self.max_samples = max(int(SAMPLE_RATE), int(max_samples))
+        self.speech_samples = 0
         self.use_diarizer = use_diarizer
         self.fixed_speaker = fixed_speaker
         self.partial_prefix = partial_prefix
@@ -85,6 +90,7 @@ class Engine:
         self.compose_history = []
         self._diar_lock = threading.Lock()
         self._model_lock = threading.Lock()
+        self._log_lock = threading.Lock()
         self._provider_key = None
         self._listeners = []
         self._stop = threading.Event()
@@ -106,6 +112,13 @@ class Engine:
                 print(f"[engine] listener error on {kind}: {e}")
 
     def log(self, msg: str, level: str = "info"):
+        try:
+            line = f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} [{level.upper()}] {msg}\n"
+            with self._log_lock:
+                with open(config_dir() / "eloquent.log", "a", encoding="utf-8") as f:
+                    f.write(line)
+        except Exception:
+            pass
         self._emit("log", (level, msg))
 
     def _set_status(self, status: str):
@@ -193,6 +206,10 @@ class Engine:
     def refresh_provider(self, force: bool = False):
         """(Re)create the LLM provider(s) when settings change. The key check runs in the background."""
         s = self.settings
+        vocab = getattr(s, "custom_vocabulary", "")
+        for p in (self.provider, self.dict_provider, self.compose_provider):
+            if p is not None and hasattr(p, "custom_vocabulary"):
+                p.custom_vocabulary = vocab
         key = (s.cleanup, s.dictation_cleanup, bool(s.compose_hotkey),
                s.resolved_api_key(), s.llm_model, s.keep_fillers, s.resolved_speech_language())
         if key == self._provider_key and not force:
@@ -293,26 +310,27 @@ class Engine:
         max_utt = min(float(max_utt_raw), 8.0)
         self._is_file_run = wav_path is not None
         self._session_t0 = time.monotonic()
+        max_samples = int(max_utt * SAMPLE_RATE)
         self._pipes: dict[str, _StreamPipe] = {}
         if wav_path is not None:
             self._pipes["file"] = _StreamPipe(
                 "file", build_vad(self.vad_path, s.vad_threshold, silence, max_utt),
-                preroll, partial_every, use_diarizer=(self.diarizer is not None),
+                preroll, partial_every, max_samples=max_samples, use_diarizer=(self.diarizer is not None),
             )
         elif src == "both":
             self._pipes["mic"] = _StreamPipe(
                 "mic", build_vad(self.vad_path, s.vad_threshold, silence, max_utt),
-                preroll, partial_every, use_diarizer=False, fixed_speaker="You", partial_prefix="You: ",
+                preroll, partial_every, max_samples=max_samples, use_diarizer=False, fixed_speaker="You", partial_prefix="You: ",
             )
             self._pipes["system"] = _StreamPipe(
                 "system", build_vad(self.vad_path, s.vad_threshold, silence, max_utt),
-                preroll, partial_every, use_diarizer=(self.diarizer is not None),
+                preroll, partial_every, max_samples=max_samples, use_diarizer=(self.diarizer is not None),
                 fixed_speaker="" if self.diarizer is not None else "Remote",
             )
         else:
             self._pipes[src] = _StreamPipe(
                 src, build_vad(self.vad_path, s.vad_threshold, silence, max_utt),
-                preroll, partial_every, use_diarizer=(self.diarizer is not None),
+                preroll, partial_every, max_samples=max_samples, use_diarizer=(self.diarizer is not None),
             )
 
         self._stop.clear()
@@ -446,11 +464,30 @@ class Engine:
         pipe.buf_len += len(frame)
         speaking = vad.is_speech_detected()
 
+        # sherpa-onnx Silero VAD suppresses max_speech_duration after its first forced cut until silence;
+        # flush cleanly at max_samples so continuous fast speech still emits bounded segments and partials.
+        if speaking:
+            pipe.speech_samples += len(frame)
+            if pipe.speech_samples >= pipe.max_samples and vad.empty():
+                vad.flush()
+                pipe.speech_samples = 0
+                speaking = vad.is_speech_detected()
+        else:
+            pipe.speech_samples = 0
+
         if not speaking and vad.empty():
             # keep a short pre-roll so the first syllable is not cut
             while pipe.buf_len - len(pipe.buf[0]) >= pipe.preroll and len(pipe.buf) > 1:
-                pipe.buf_len -= len(pipe.buf.popleft())
+                dropped = len(pipe.buf.popleft())
+                pipe.buf_len -= dropped
+                pipe.partial_cut = max(0, pipe.partial_cut - dropped)
             return
+
+        max_buf = pipe.max_samples + pipe.preroll
+        while pipe.buf_len - len(pipe.buf[0]) >= max_buf and len(pipe.buf) > 1:
+            dropped = len(pipe.buf.popleft())
+            pipe.buf_len -= dropped
+            pipe.partial_cut = max(0, pipe.partial_cut - dropped)
 
         pipe.since_partial += len(frame)
         buf_sec = pipe.buf_len / SAMPLE_RATE
@@ -491,6 +528,8 @@ class Engine:
                 else:
                     text = f"{pipe.partial_prefix_text} {tail_raw}".strip()
             else:
+                if len(tail) > pipe.max_samples:
+                    tail = tail[-pipe.max_samples:]
                 tail_text = transcribe(self.recognizer, tail)
                 text = f"{pipe.partial_prefix_text} {tail_text}".strip()
             pipe.last_partial_dt = time.monotonic() - t_dec
@@ -530,6 +569,7 @@ class Engine:
                 self.state.set_partial("")
             pipe.buf.clear()
             pipe.buf_len = 0
+            pipe.speech_samples = 0
             pipe.since_partial = 0
             pipe.last_partial = ""
             pipe.partial_cut = 0
@@ -629,6 +669,22 @@ class Engine:
             self.session.sync_from_state(self.state)
         elif self.last_session_dir:
             write_session_files(Path(self.last_session_dir), self.state)
+
+    def apply_vocabulary_fix(self, wrong: str, right: str, remember: bool = True) -> int:
+        """Fix a misheard word/phrase in State (+ session files) and save to custom vocabulary."""
+        wrong, right = (wrong or "").strip(), (right or "").strip()
+        count = self.state.replace_text(wrong, right) if (wrong and right and wrong != right) else 0
+        if remember:
+            entry = f"{wrong} -> {right}" if (wrong and right and wrong.lower() != right.lower()) else (right or wrong)
+            if self.settings.add_vocabulary_entry(entry):
+                self.settings.save()
+                self.refresh_provider()
+        if count > 0:
+            if self.session is not None and not self.session.raw_f.closed:
+                self.session.sync_from_state(self.state)
+            elif self.last_session_dir:
+                write_session_files(Path(self.last_session_dir), self.state)
+        return count
 
     def generate_report(self, format_id: str, custom_prompt: str = "", blocking: bool = False):
         """Format or summarize the current transcript with the LLM and save to the session folder."""

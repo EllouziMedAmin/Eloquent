@@ -9,6 +9,8 @@ Event kinds emitted from here: "partial", "segment", "paragraph", "error".
 import json
 import threading
 
+from .textutil import mark_changes
+
 
 def fmt_time(seconds: float) -> str:
     s = max(0, int(seconds))
@@ -262,6 +264,30 @@ class State:
                 return
             self.rev += 1
         self.emit("speakers", None)
+
+    def replace_text(self, old_text: str, new_text: str) -> int:
+        """Replace *old_text* with *new_text* across active paragraphs and loose segments."""
+        if not old_text or not new_text or old_text == new_text:
+            return 0
+        changed = 0
+        with self.lock:
+            for p in self.paragraphs:
+                cur = p["clean"] if p.get("clean") else p["raw"]
+                if old_text in cur:
+                    updated = cur.replace(old_text, new_text)
+                    p["clean"] = updated
+                    p["tokens"] = mark_changes(p["raw"], updated)
+                    p["status"] = "done"
+                    changed += 1
+            for x in self.loose:
+                if old_text in x["text"]:
+                    x["text"] = x["text"].replace(old_text, new_text)
+                    changed += 1
+            if changed:
+                self.rev += 1
+        if changed:
+            self.emit("paragraph", None)
+        return changed
 
     def _build(self) -> dict:
         return {
