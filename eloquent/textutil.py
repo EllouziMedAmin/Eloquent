@@ -156,8 +156,21 @@ def match_custom_vocabulary(raw: str, vocab, max_matches: int = 8) -> tuple[list
     return matched_terms, matched_pairs
 
 
+def _copies_upcoming_tail(raw_w: list[str], clean_w: list[str], up_w: list[str]) -> bool:
+    """Return True if *clean_w* appended 2+ extra words copied from *up_w*."""
+    if not up_w or len(clean_w) <= len(raw_w):
+        return False
+    span = min(len(up_w), max(2, len(clean_w) - len(raw_w)))
+    tail = clean_w[-span:]
+    return (
+        len(tail) >= 2
+        and raw_w[-len(tail):] != tail
+        and any(up_w[i:i + len(tail)] == tail for i in range(max(0, len(up_w) - len(tail) + 1)))
+    )
+
+
 def accept_bilingual_fix(raw: str, clean: str, min_sim: float, context: str = "",
-                         dictation: bool = False) -> tuple[bool, float]:
+                         dictation: bool = False, upcoming: str = "") -> tuple[bool, float]:
     """Allow meaning-based word fixes and French/English term restorations while blocking rewrites and hallucinations."""
     rw = WORD_RE.findall(norm_ar_for_sim(strip_diacritics_and_norm(raw)))
     cw = WORD_RE.findall(norm_ar_for_sim(strip_diacritics_and_norm(clean)))
@@ -180,6 +193,10 @@ def accept_bilingual_fix(raw: str, clean: str, min_sim: float, context: str = ""
         span = min(len(ctx_w), max(2, nc - nr))
         head = cw[:span]
         if len(head) >= 2 and any(ctx_w[i:i + len(head)] == head for i in range(max(0, len(ctx_w) - len(head) + 1))):
+            return False, 0.0
+    if upcoming:
+        up_w = WORD_RE.findall(norm_ar_for_sim(strip_diacritics_and_norm(upcoming)))[:16]
+        if _copies_upcoming_tail(rw, cw, up_w):
             return False, 0.0
 
     lex_sim = difflib.SequenceMatcher(None, rw, cw, autojunk=False).ratio()
@@ -211,10 +228,12 @@ def norm_words(text: str):
     return [w.lower() for w in WORD_RE.findall(text)]
 
 
-def accept_cleaned(raw: str, clean: str, min_sim: float, dictation: bool = False):
+def accept_cleaned(raw: str, clean: str, min_sim: float, dictation: bool = False, upcoming: str = ""):
     """Reject the model's output if it rewrote, shortened or padded the text."""
     a, b = norm_words(raw), norm_words(clean)
     if not b:
+        return False, 0.0
+    if upcoming and _copies_upcoming_tail(a, b, norm_words(upcoming)[:16]):
         return False, 0.0
     word_sim = difflib.SequenceMatcher(None, a, b, autojunk=False).ratio()
     compact_sim = difflib.SequenceMatcher(None, "".join(a), "".join(b), autojunk=False).ratio()

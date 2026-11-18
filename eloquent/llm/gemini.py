@@ -46,11 +46,13 @@ class GeminiProvider(LLMProvider):
             config=t.GenerateContentConfig(
                 max_output_tokens=16, thinking_config=t.ThinkingConfig(thinking_level="minimal")))
 
-    def proofread(self, raw: str, context: str, mode: str = "proofread") -> str:
+    def proofread(self, raw: str, context: str, mode: str = "proofread", upcoming: str = "") -> str:
         cfg = self.dict_cfg if mode == "dictation" else self.proof_cfg
         resp = self.client.models.generate_content(
             model=self.model,
-            contents=build_proofread_prompt(raw, context, mode=mode, custom_vocabulary=self.custom_vocabulary),
+            contents=build_proofread_prompt(
+                raw, context, mode=mode, custom_vocabulary=self.custom_vocabulary, upcoming=upcoming,
+            ),
             config=cfg,
         )
         return strip_wrappers(resp.text or "")

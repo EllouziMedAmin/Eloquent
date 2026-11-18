@@ -14,7 +14,7 @@ class LLMProvider:
         """Cheap request that raises if the key/model/endpoint is not usable."""
         raise NotImplementedError
 
-    def proofread(self, raw: str, context: str, mode: str = "proofread") -> str:
+    def proofread(self, raw: str, context: str, mode: str = "proofread", upcoming: str = "") -> str:
         """Return the corrected text (`mode`: 'proofread' or 'dictation'). Raise on network/quota errors."""
         raise NotImplementedError
 

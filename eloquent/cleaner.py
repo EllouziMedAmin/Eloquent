@@ -134,8 +134,27 @@ class Cleaner(threading.Thread):
             text = " ".join(parts)
         return text[-1000:]
 
+    def _upcoming_context(self, current) -> str:
+        with self.state.lock:
+            parts = []
+            seen_cur = False
+            for p in self.state.paragraphs:
+                if p is current:
+                    seen_cur = True
+                    continue
+                if seen_cur:
+                    t = (p.get("clean") or p.get("raw") or "").strip()
+                    if t:
+                        parts.append(t)
+            for x in self.state.loose:
+                t = (x.get("text") or "").strip()
+                if t:
+                    parts.append(t)
+            text = " ".join(parts)
+        return text[:600]
+
     # -- LLM call ----------------------------------------------------------
-    def _clean(self, raw: str, ctx: str):
+    def _clean(self, raw: str, ctx: str, upcoming: str = ""):
         if time.time() < self.cooldown_until:      # LLM keeps failing: do not even try for a while
             return None, f"{self.provider.name} unavailable, kept raw"
         prompt_mode = "dictation" if self.dictation else "proofread"
@@ -145,7 +164,10 @@ class Cleaner(threading.Thread):
                 if self.compose:
                     text = self.provider.compose(raw, self.selected_text, self.compose_history)
                 else:
-                    text = self.provider.proofread(raw, ctx, mode=prompt_mode)
+                    try:
+                        text = self.provider.proofread(raw, ctx, mode=prompt_mode, upcoming=upcoming)
+                    except TypeError:
+                        text = self.provider.proofread(raw, ctx, mode=prompt_mode)
                 if text:
                     break
                 err = "empty reply"
@@ -163,10 +185,10 @@ class Cleaner(threading.Thread):
         if not self.compose:
             if is_arabic_speech(self.speech_language):
                 ok, sim = accept_bilingual_fix(
-                    raw, text, self.min_sim, context=ctx, dictation=self.dictation,
+                    raw, text, self.min_sim, context=ctx, dictation=self.dictation, upcoming=upcoming,
                 )
             else:
-                ok, sim = accept_cleaned(raw, text, self.min_sim, dictation=self.dictation)
+                ok, sim = accept_cleaned(raw, text, self.min_sim, dictation=self.dictation, upcoming=upcoming)
             if not ok:
                 return None, f"kept raw (model changed too much, {sim:.0%} similar)"
         self._set_error("")
@@ -194,7 +216,7 @@ class Cleaner(threading.Thread):
                 fixed = apply_learned_replacements(raw, self.custom_vocabulary) if self.custom_vocabulary else raw
                 result, note = (fixed, "") if fixed != raw else (None, "")
             else:
-                result, note = self._clean(raw, self._context(para))
+                result, note = self._clean(raw, self._context(para), self._upcoming_context(para))
             tokens = mark_changes(raw, result) if result else None   # outside the lock
             with self.state.lock:
                 if para["raw"] != raw:
