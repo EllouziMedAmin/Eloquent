@@ -11,9 +11,9 @@
 [![Arabic ASR: Cohere Q4_K_M GGUF](https://img.shields.io/badge/Arabic%20ASR-Cohere%20Q4__K__M%20(Vulkan%20%2F%20CPU)-ff6f00.svg)]()
 [![Built by axbuilt.net](https://img.shields.io/badge/Built%20by-axbuilt.net-0d1b2a.svg)](https://axbuilt.net)
 
-**Open-source live speech-to-text for Windows that runs fast on an ordinary CPU.**
-Built for **meetings, classes, lectures, interviews, calls, and voice notes**. Speech recognition runs **100% locally on your PC** (audio never leaves your device), with **NVIDIA Parakeet TDT 0.6B v3** as the main default (**25 European languages** on CPU) plus built-in **Arabic & Dialects** support (**Cohere Arabic Q4_K_M GGUF** on Vulkan iGPU / CPU, toggleable anytime with **`Ctrl+Alt+M`**).
-Optionally, a free **Gemini 3.1 Flash-Lite** API key polishes the transcript in the background and generates **Meeting Minutes, Lecture Notes, Summaries, Bullet Points, or Reports** at the end of a session.
+**Open-source live speech-to-text, voice dictation, and AI writing assistant for Windows that runs fast on an ordinary CPU.**
+Built for **voice dictation into any app, AI writing at your cursor, meetings, classes, lectures, interviews, calls, and voice notes**. Speech recognition runs **100% locally on your PC** (audio never leaves your device), with **NVIDIA Parakeet TDT 0.6B v3** as the main default (**25 European languages** on CPU) plus built-in **Arabic & Dialects** support (**Cohere Arabic Q4_K_M GGUF** on Vulkan iGPU / CPU, toggleable anytime with **`Ctrl+Alt+M`**).
+Optionally, a free **Gemini 3.1 Flash-Lite** API key polishes the transcript in the background, powers **Dictate** / **Ask AI at cursor**, and generates **Meeting Minutes, Lecture Notes, Summaries, Bullet Points, or Reports** at the end of a session.
 
 <!-- Add your 20s demo GIF or video here:
 ![Eloquent Demo](docs/demo.gif)
@@ -25,6 +25,9 @@ Optionally, a free **Gemini 3.1 Flash-Lite** API key polishes the transcript in 
 
 - **Fast on CPU, zero recognition lag (Default):** Powered by NVIDIA **Parakeet TDT 0.6B v3 (INT8)** and **Silero VAD** via `sherpa-onnx`. Supports 25 European languages automatically.
 - **Local Arabic & Dialects support (`Ctrl+Alt+M`):** Switch anytime to **Cohere Transcribe Arabic (`Q4_K_M` GGUF)** via `transcribe.cpp` (accelerated on Vulkan iGPU or CPU) with automatic right-to-left (RTL) UI and dialect-aware Gemini proofreading across Modern Standard Arabic (الفصحى), Maghrebi/Darija, Egyptian, Levantine, and Gulf speech (including French/English technical terms).
+- **Voice Dictation into Any App (`Ctrl+Alt+Space`):** Place your cursor in any text box (ChatGPT, Cursor/VS Code, WhatsApp, Slack, browser, email, docs), press `Ctrl+Alt+Space` to speak, and press again to clean up hesitations/self-corrections and auto-paste directly at your cursor while preserving your clipboard.
+- **Ask AI / Compose at Cursor (`Ctrl+Alt+A`):** Speak an instruction (e.g. *"write an email to Sarah pushing tomorrow's meeting to Thursday"*, *"translate this to French"*, *"reply to this message"*) to generate and paste finished text straight at your cursor. Automatically reads highlighted text on screen for context and remembers recent turns in the current session for follow-ups (like *"now generate a subject"*).
+- **Mic, System Audio, or Both:** Capture your microphone, Windows speaker audio (`WASAPI loopback` with zero speaker echo for YouTube, calls, and lectures), or both simultaneously (`You` vs `Remote`).
 - **Multi-speaker diarization:** Identifies **Speaker 1, Speaker 2, …** on a low-priority background thread (`NVIDIA NeMo TitaNet-Small`) with zero impact on live speech latency, including mid-turn speaker handoffs using Parakeet word timestamps.
 - **Background LLM proofreading:** Every few sentences, Gemini 3.1 Flash-Lite fixes misheard words, punctuation, and spoken fillers in a background thread without slowing down live captions. If offline or if the model rewrites too much, raw text is kept automatically.
 - **3 Interfaces, 1 Engine:**
@@ -120,6 +123,8 @@ All sessions are saved to `sessions/<YYYY-MM-DD_HH-MM-SS>/` with `raw.txt`, `cle
 - [x] Shared low-latency engine + Widget, Terminal, and SSE Web UIs
 - [x] Post-session generation (Summary, Bullets, Meeting Minutes, Lecture Notes, Report, Memo, Custom Prompt)
 - [x] Multi-speaker diarization (`Speaker 1`, `Speaker 2`, …)
+- [x] System-wide Voice Dictation (`Ctrl+Alt+Space`) and Ask AI / Compose at Cursor (`Ctrl+Alt+A`) with screen selection context
+- [x] Windows WASAPI system audio loopback (`Microphone`, `System audio`, `Mic + System`)
 - [x] Local Arabic & dialects speech engine (`Cohere Transcribe Arabic Q4_K_M GGUF` on Vulkan / CPU) + RTL UI
 - [ ] Local LLM backend (Ollama / LM Studio / `llama.cpp` OpenAI-compatible endpoints)
 - [ ] Standalone Windows installer (`.exe`)
