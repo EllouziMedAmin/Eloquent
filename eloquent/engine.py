@@ -28,7 +28,7 @@ import numpy as np
 
 from .audio import LoopbackCapture, MicCapture
 from .cleaner import Cleaner, DICTATION_PAUSE_SEC
-from .config import config_dir
+from .config import config_dir, is_arabic_speech
 from .diarizer import Diarizer, build_speaker_extractor, ensure_speaker_model
 from .llm import make_provider
 from .llm.prompts import build_format_instruction
@@ -289,9 +289,10 @@ class Engine:
         use_diar = (not paste_mode) and s.diarize
         if use_diar and self.extractor is None:
             self._load_speaker_extractor()
-        self.diarizer = Diarizer(self.extractor, self.state, self.session, log=self.log) if (
-            use_diar and self.extractor is not None
-        ) else None
+        self.diarizer = Diarizer(
+            self.extractor, self.state, self.session, log=self.log,
+            arabic_mode=is_arabic_speech(s.resolved_speech_language()),
+        ) if (use_diar and self.extractor is not None) else None
         if self.diarizer is not None:
             self.diarizer.start()
         self.cleaner = Cleaner(
@@ -501,41 +502,44 @@ class Engine:
             full = np.concatenate(pipe.buf)
             tail = full[pipe.partial_cut:]
             t_dec = time.monotonic()
-            if supports_words and len(tail) > int(4.4 * SAMPLE_RATE):
-                tail_raw, pwords = transcribe_detailed(self.recognizer, tail)
-                tail_dur = len(tail) / SAMPLE_RATE
-                cut_idx = None
-                for wi in range(len(pwords) - 1, -1, -1):
-                    if pwords[wi]["t1"] <= tail_dur - 1.8:
-                        if wi + 1 < len(pwords) and (pwords[wi + 1]["t0"] - pwords[wi]["t1"]) >= 0.06:
-                            cut_idx = wi
-                            break
-                        if cut_idx is None:
-                            cut_idx = wi
-                if cut_idx is not None:
-                    committed = " ".join(w["w"] for w in pwords[:cut_idx + 1]).strip()
-                    rest = " ".join(w["w"] for w in pwords[cut_idx + 1:]).strip()
-                    if committed:
-                        pipe.partial_prefix_text = f"{pipe.partial_prefix_text} {committed}".strip()
-                    t_adv = float(pwords[cut_idx]["t1"])
-                    if cut_idx + 1 < len(pwords):
-                        gap = float(pwords[cut_idx + 1]["t0"]) - t_adv
-                        t_adv = t_adv + min(0.03, 0.5 * max(0.0, gap))
-                    pipe.partial_cut += min(len(tail), max(0, int(t_adv * SAMPLE_RATE)))
-                    text = f"{pipe.partial_prefix_text} {rest}".strip()
-                elif pwords:
-                    text = f"{pipe.partial_prefix_text} {' '.join(w['w'] for w in pwords)}".strip()
+            try:
+                if supports_words and len(tail) > int(4.4 * SAMPLE_RATE):
+                    tail_raw, pwords = transcribe_detailed(self.recognizer, tail)
+                    tail_dur = len(tail) / SAMPLE_RATE
+                    cut_idx = None
+                    for wi in range(len(pwords) - 1, -1, -1):
+                        if pwords[wi]["t1"] <= tail_dur - 1.8:
+                            if wi + 1 < len(pwords) and (pwords[wi + 1]["t0"] - pwords[wi]["t1"]) >= 0.06:
+                                cut_idx = wi
+                                break
+                            if cut_idx is None:
+                                cut_idx = wi
+                    if cut_idx is not None:
+                        committed = " ".join(w["w"] for w in pwords[:cut_idx + 1]).strip()
+                        rest = " ".join(w["w"] for w in pwords[cut_idx + 1:]).strip()
+                        if committed:
+                            pipe.partial_prefix_text = f"{pipe.partial_prefix_text} {committed}".strip()
+                        t_adv = float(pwords[cut_idx]["t1"])
+                        if cut_idx + 1 < len(pwords):
+                            gap = float(pwords[cut_idx + 1]["t0"]) - t_adv
+                            t_adv = t_adv + min(0.03, 0.5 * max(0.0, gap))
+                        pipe.partial_cut += min(len(tail), max(0, int(t_adv * SAMPLE_RATE)))
+                        text = f"{pipe.partial_prefix_text} {rest}".strip()
+                    elif pwords:
+                        text = f"{pipe.partial_prefix_text} {' '.join(w['w'] for w in pwords)}".strip()
+                    else:
+                        text = f"{pipe.partial_prefix_text} {tail_raw}".strip()
                 else:
-                    text = f"{pipe.partial_prefix_text} {tail_raw}".strip()
-            else:
-                if len(tail) > pipe.max_samples:
-                    tail = tail[-pipe.max_samples:]
-                tail_text = transcribe(self.recognizer, tail)
-                text = f"{pipe.partial_prefix_text} {tail_text}".strip()
-            pipe.last_partial_dt = time.monotonic() - t_dec
-            if text and text != pipe.last_partial:
-                pipe.last_partial = text
-                self.state.set_partial(f"{pipe.partial_prefix}{text}" if pipe.partial_prefix else text)
+                    if len(tail) > pipe.max_samples:
+                        tail = tail[-pipe.max_samples:]
+                    tail_text = transcribe(self.recognizer, tail)
+                    text = f"{pipe.partial_prefix_text} {tail_text}".strip()
+                pipe.last_partial_dt = time.monotonic() - t_dec
+                if text and text != pipe.last_partial:
+                    pipe.last_partial = text
+                    self.state.set_partial(f"{pipe.partial_prefix}{text}" if pipe.partial_prefix else text)
+            except Exception as e:
+                self.log(f"[asr] partial skipped: {type(e).__name__}: {e}", "warn")
 
         self._drain_pipe(pipe, elapsed)
 
@@ -546,7 +550,11 @@ class Engine:
             seg = np.asarray(vad.front.samples, dtype=np.float32)
             vad.pop()
             t1 = time.time()
-            text, words = transcribe_detailed(self.recognizer, seg)
+            try:
+                text, words = transcribe_detailed(self.recognizer, seg)
+            except Exception as e:
+                self.log(f"[asr] segment skipped: {type(e).__name__}: {e}", "warn")
+                text, words = "", []
             dur = len(seg) / SAMPLE_RATE
             decode = time.time() - t1
             if text:

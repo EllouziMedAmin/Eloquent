@@ -154,10 +154,10 @@ def _find_window_changes(w_vecs: list[np.ndarray], w_centers: list[float],
 
 
 def _find_linguistic_cuts(words: list[dict], min_side_dur: float = 1.25,
-                          max_cuts: int = 8) -> list[int]:
+                          max_cuts: int = 8, min_words: int = 6) -> list[int]:
     """Return candidate word split indices at sentence endings or pauses (`>= 0.14 s`)."""
     n = len(words)
-    if n < 6:
+    if n < min_words:
         return []
     candidates = []
     for idx in range(2, n - 1):
@@ -183,13 +183,144 @@ def _find_linguistic_cuts(words: list[dict], min_side_dur: float = 1.25,
     return sorted(picked)
 
 
+def _detect_voiced_islands(samples: np.ndarray) -> tuple[np.ndarray, float, list[tuple[float, float]]]:
+    """Strip low-energy silence when word timestamps are absent and return `(trimmed, voiced_dur, islands)`."""
+    n = len(samples)
+    dur = n / SAMPLE_RATE
+    frame_n = int(0.02 * SAMPLE_RATE)
+    n_frames = n // frame_n
+    if n < int(0.06 * SAMPLE_RATE) or n_frames < 2:
+        return samples, dur, [(0.0, dur)]
+
+    frames = samples[:n_frames * frame_n].reshape(n_frames, frame_n)
+    rms = np.sqrt(np.mean(frames * frames, axis=1))
+    thr = max(0.0035, min(0.025, float(np.percentile(rms, 85)) * 0.20))
+    active = (rms >= thr).copy()
+
+    # Bridge brief consonant/micro pauses <= 60 ms (3 frames)
+    false_run = 0
+    seen_true = False
+    for i in range(n_frames):
+        if active[i]:
+            if seen_true and 0 < false_run <= 3:
+                active[i - false_run:i] = True
+            seen_true = True
+            false_run = 0
+        elif seen_true:
+            false_run += 1
+
+    # Drop isolated single-frame clicks
+    for i in range(n_frames):
+        if active[i] and not ((i > 0 and active[i - 1]) or (i + 1 < n_frames and active[i + 1])):
+            active[i] = False
+
+    raw_islands: list[tuple[float, float]] = []
+    i = 0
+    while i < n_frames:
+        if not active[i]:
+            i += 1
+            continue
+        j = i
+        while j < n_frames and active[j]:
+            j += 1
+        raw_islands.append((i * frame_n / SAMPLE_RATE, min(dur, j * frame_n / SAMPLE_RATE)))
+        i = j
+
+    islands: list[tuple[float, float]] = []
+    for t0, t1 in raw_islands:
+        if islands and (t0 - islands[-1][1]) < 0.12:
+            islands[-1] = (islands[-1][0], max(islands[-1][1], t1))
+        else:
+            islands.append((t0, t1))
+
+    if not islands:
+        return samples, dur, [(0.0, dur)]
+
+    voiced_dur = sum(t1 - t0 for t0, t1 in islands)
+    pad = int(0.05 * SAMPLE_RATE)
+    spans_s: list[list[int]] = []
+    for t0, t1 in islands:
+        s0 = max(0, int(t0 * SAMPLE_RATE) - pad)
+        s1 = min(n, int(t1 * SAMPLE_RATE) + pad)
+        if spans_s and s0 <= spans_s[-1][1]:
+            spans_s[-1][1] = max(spans_s[-1][1], s1)
+        else:
+            spans_s.append([s0, s1])
+
+    trimmed = np.concatenate([samples[a:b] for a, b in spans_s]) if len(spans_s) > 1 else samples[spans_s[0][0]:spans_s[0][1]]
+    if voiced_dur >= 1.8:
+        guard = int(0.08 * SAMPLE_RATE)
+        if len(trimmed) > 2 * guard + int(1.2 * SAMPLE_RATE):
+            trimmed = trimmed[guard:-guard]
+    return trimmed, voiced_dur, islands
+
+
+def _synthesize_arabic_word_spans(samples: np.ndarray, text: str) -> list[dict]:
+    """Align Arabic words onto voiced audio islands so mid-line speaker handoffs can split accurately."""
+    tokens = [w for w in (text or "").strip().split() if w]
+    if not tokens:
+        return []
+    _, _, islands = _detect_voiced_islands(samples)
+    while len(islands) > len(tokens):
+        gaps = [islands[k + 1][0] - islands[k][1] for k in range(len(islands) - 1)]
+        idx = int(np.argmin(gaps))
+        islands[idx:idx + 2] = [(islands[idx][0], islands[idx + 1][1])]
+
+    weights = [max(2, len(t)) for t in tokens]
+    cum_w = [0]
+    for w in weights:
+        cum_w.append(cum_w[-1] + w)
+    total_w = max(1, cum_w[-1])
+
+    island_durs = [max(0.05, t1 - t0) for t0, t1 in islands]
+    total_d = max(1e-6, sum(island_durs))
+
+    # Map each acoustic pause boundary onto the nearest token split, preferring punctuation nearby
+    cuts = [0]
+    acc_d = 0.0
+    punct = SENTENCE_END + ("،", ",", ";", ":")
+    for k in range(len(islands) - 1):
+        acc_d += island_durs[k]
+        target_w = (acc_d / total_d) * total_w
+        lo = cuts[-1] + 1
+        hi = len(tokens) - (len(islands) - 1 - k)
+        if lo >= hi:
+            cuts.append(lo)
+            continue
+        best = min(range(lo, hi + 1), key=lambda c: abs(cum_w[c] - target_w))
+        p_cands = [
+            c for c in range(max(lo, best - 2), min(hi, best + 2) + 1)
+            if tokens[c - 1].rstrip("\"'”)").endswith(punct)
+        ]
+        if p_cands:
+            best = min(p_cands, key=lambda c: (abs(cum_w[c] - target_w), not tokens[c - 1].rstrip("\"'”)").endswith(SENTENCE_END)))
+        cuts.append(best)
+    cuts.append(len(tokens))
+
+    spans: list[dict] = []
+    for (a0, a1), (c0, c1) in zip(islands, zip(cuts[:-1], cuts[1:])):
+        chunk = tokens[c0:c1]
+        if not chunk:
+            continue
+        cw = [max(2, len(t)) for t in chunk]
+        ctot = max(1, sum(cw))
+        span_d = max(0.04, a1 - a0)
+        cur_t = a0
+        for tok, w in zip(chunk, cw):
+            dt = span_d * (w / ctot)
+            spans.append({"w": tok, "t0": cur_t, "t1": cur_t + dt})
+            cur_t += dt
+    return spans
+
+
 def _voiced_samples(samples: np.ndarray, words: list[dict],
                     pad_sec: float = 0.08
                     ) -> tuple[np.ndarray, float]:
     """Trim leading/trailing VAD silence around ASR word spans and compute true voiced duration."""
     n = len(samples)
     if not words:
-        return samples, n / SAMPLE_RATE
+        trimmed, vdur, _ = _detect_voiced_islands(samples)
+        return trimmed, vdur
 
     pad = int(pad_sec * SAMPLE_RATE)
     s0 = max(0, int(words[0]["t0"] * SAMPLE_RATE) - pad)
@@ -258,52 +389,64 @@ def _same_speaker_pair(va: np.ndarray, vb: np.ndarray,
 def split_segment_by_speaker(samples: np.ndarray, words: list[dict],
                              embed_fn: Callable[[np.ndarray], Optional[np.ndarray]],
                              win_sec: float = 1.5, hop_sec: float = 0.75,
-                             known_speakers: Optional[list[tuple[str, np.ndarray]]] = None
+                             known_speakers: Optional[list[tuple[str, np.ndarray]]] = None,
+                             text: str = ""
                              ) -> list[tuple[int, int, str, np.ndarray, float, list[np.ndarray]]]:
     """Return `[(sample_start, sample_end, text, embedding_vec, voiced_dur, sub_vecs), ...]`.
 
-    Tests sentence/pause boundaries first (fast) and runs sliding `1.5 s / 0.75 s` acoustic
-    change detection only across long unbroken spans (`>= 3.9 s`), verified against pure slice
-    embeddings and known speaker centroids.
+    Tests sentence/pause boundaries first (fast) and runs sliding acoustic change detection
+    only across long unbroken spans, verified against pure slice embeddings and known speaker centroids.
     """
     dur = len(samples) / SAMPLE_RATE
-    full_text = " ".join(w["w"] for w in words).strip() if words else ""
+    synthesized = False
+    if not words and text and text.strip():
+        words = _synthesize_arabic_word_spans(samples, text)
+        synthesized = bool(words)
+    full_text = (text.strip() if text and text.strip()
+                 else (" ".join(w["w"] for w in words).strip() if words else ""))
 
     def _single_turn():
-        voiced, vdur = _voiced_samples(samples, words)
+        voiced, vdur = _voiced_samples(samples, [] if synthesized else words)
         vec = embed_fn(voiced)
         if vec is None:
             vec = embed_fn(samples)
         return [(0, len(samples), full_text, vec, vdur, [])] if vec is not None else []
 
-    if dur < 2.6 or not words or len(words) < 6:
+    min_dur = 2.2 if synthesized else 2.6
+    min_words = 4 if synthesized else 6
+    if dur < min_dur or not words or len(words) < min_words:
         return _single_turn()
+
+    min_side = 0.95 if synthesized else 1.25
+    min_span_scan = 2.2 if synthesized else 3.9
+    win_s = 1.25 if synthesized else win_sec
+    hop_s = 0.55 if synthesized else hop_sec
 
     t_start = max(0.0, words[0]["t0"] - 0.10)
     t_end = min(dur, words[-1]["t1"] + 0.10)
     span_dur = t_end - t_start
     max_cuts = max(4, min(8, int(span_dur // 1.6) + 1))
-    ling_cuts = _find_linguistic_cuts(words, min_side_dur=1.25, max_cuts=max_cuts)
+    ling_cuts = _find_linguistic_cuts(words, min_side_dur=min_side, max_cuts=max_cuts, min_words=min_words)
 
-    # Fast path for single unbroken turns under 4.0s with no sentence/pause boundaries
-    if span_dur < 4.0 and not ling_cuts:
+    # Fast path for single unbroken turns with no sentence/pause boundaries
+    if span_dur < (2.2 if synthesized else 4.0) and not ling_cuts:
         return _single_turn()
 
-    # Only scan sliding acoustic windows across unbroken spans (>= 3.9s) without punctuation/pauses
+    # Only scan sliding acoustic windows across unbroken spans without punctuation/pauses
     bounds = [0] + ling_cuts + [len(words)]
     cut_set = set(ling_cuts)
     w_vecs_all: list[np.ndarray] = []
     w_centers_all: list[float] = []
-    win_n = int(win_sec * SAMPLE_RATE)
-    hop_n = int(hop_sec * SAMPLE_RATE)
+    win_n = int(win_s * SAMPLE_RATE)
+    hop_n = int(hop_s * SAMPLE_RATE)
 
     for a, b in zip(bounds[:-1], bounds[1:]):
         sub = words[a:b]
-        if len(sub) < 6:
+        if len(sub) < min_words:
             continue
         sp_t0 = max(0.0, sub[0]["t0"] - 0.08)
         sp_t1 = min(dur, sub[-1]["t1"] + 0.08)
-        if sp_t1 - sp_t0 < 3.9:
+        if sp_t1 - sp_t0 < min_span_scan:
             continue
         s0, s1 = int(sp_t0 * SAMPLE_RATE), int(sp_t1 * SAMPLE_RATE)
         w_vecs: list[np.ndarray] = []
@@ -322,7 +465,7 @@ def split_segment_by_speaker(samples: np.ndarray, words: list[dict],
         w_centers_all.extend(w_centers)
         prev_c = a
         for t_cut in _find_window_changes(w_vecs, w_centers):
-            idx = _pick_word_cut(words, prev_c, b, t_cut)
+            idx = _pick_word_cut(words, prev_c, b, t_cut, min_side_dur=min_side)
             if idx is not None and idx > prev_c:
                 t_c = 0.5 * (words[idx - 1]["t1"] + words[idx]["t0"])
                 if all(abs(t_c - 0.5 * (words[c - 1]["t1"] + words[c]["t0"])) >= 0.85 for c in cut_set):
@@ -417,9 +560,11 @@ class SpeakerClusterer:
     """
 
     def __init__(self, merge_threshold: float = MERGE_THRESHOLD,
-                 min_confirm_dur: float = MIN_CONFIRM_DUR):
+                 min_confirm_dur: float = MIN_CONFIRM_DUR,
+                 arabic_mode: bool = False):
         self.merge_threshold = merge_threshold
         self.min_confirm_dur = min_confirm_dur
+        self.arabic_mode = arabic_mode
         self.turns: list[dict] = []  # {"id", "t0", "dur", "vec", "subs", "speaker", "bridge"}
         self._centroids: list[tuple[str, np.ndarray]] = []
         self._established: list[tuple[str, np.ndarray, float, int]] = []
@@ -580,7 +725,10 @@ class SpeakerClusterer:
                 sims = [float(np.dot(gv, kv)) for kv in kept_vecs]
                 bi = int(np.argmax(sims))
                 # Fold brief isolated fragments into the closest established speaker only when similar
-                need = 0.35 if gdur < 1.8 else 0.42
+                if self.arabic_mode and len(major) >= 2 and len(g) == 1:
+                    need = 0.20
+                else:
+                    need = 0.35 if gdur < 1.8 else 0.42
                 if sims[bi] >= need:
                     kept[bi].extend(g)
                     kept_vecs[bi] = _centroid(kept[bi])
@@ -647,13 +795,13 @@ class SpeakerClusterer:
 # Background worker thread integrated with Engine / State / Session
 # --------------------------------------------------------------------------- #
 class Diarizer(threading.Thread):
-    def __init__(self, extractor, state, session=None, log=print):
+    def __init__(self, extractor, state, session=None, log=print, arabic_mode: bool = False):
         super().__init__(daemon=True, name="eloquent-diarizer")
         self.extractor = extractor
         self.state = state
         self.session = session
         self.log = log
-        self.clusterer = SpeakerClusterer()
+        self.clusterer = SpeakerClusterer(arabic_mode=arabic_mode)
         self.q: "queue.Queue[Optional[tuple]]" = queue.Queue()
         self._stop_flag = False
         self._sync_needed = False
@@ -683,7 +831,7 @@ class Diarizer(threading.Thread):
     def _process_item(self, seg_id: int, start_sec: float, stamp: str,
                       samples: np.ndarray, text: str, words: list[dict]) -> None:
         parts = split_segment_by_speaker(
-            samples, words, self._embed, known_speakers=self.clusterer.known_centroids(),
+            samples, words, self._embed, known_speakers=self.clusterer.known_centroids(), text=text,
         )
         if not parts:
             fallback = self.clusterer.turns[-1]["speaker"] if self.clusterer.turns else "Speaker 1"
