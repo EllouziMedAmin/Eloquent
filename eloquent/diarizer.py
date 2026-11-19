@@ -626,24 +626,22 @@ class SpeakerClusterer:
 
         weights = np.array([min(4.0, max(0.75, self.turns[i]["dur"])) for i in confirmed_sub], dtype=np.float64)
         n = len(confirmed_sub)
-        sim_mat = np.eye(n, dtype=np.float64)
-        for i in range(n):
-            ti = self.turns[confirmed_sub[i]]
-            for j in range(i + 1, n):
-                tj = self.turns[confirmed_sub[j]]
-                s = _turn_similarity(ti, tj)
-                sim_mat[i, j] = sim_mat[j, i] = s
+        vecs = np.stack([self.turns[i]["vec"] for i in confirmed_sub]).astype(np.float64, copy=False)
+        sim_mat = vecs @ vecs.T
+        np.fill_diagonal(sim_mat, 1.0)
 
         # Clusters stored as lists of local indices into `confirmed_sub`
         clusters: list[list[int]] = [[i] for i in range(n)]
-        # Maintain pairwise weighted average similarity between active clusters
-        pair_sum = np.zeros((n, n), dtype=np.float64)
-        pair_wt = np.zeros((n, n), dtype=np.float64)
-        for i in range(n):
-            for j in range(i + 1, n):
-                w = weights[i] * weights[j]
-                pair_wt[i, j] = pair_wt[j, i] = w
-                pair_sum[i, j] = pair_sum[j, i] = sim_mat[i, j] * w
+        # Maintain pairwise weighted average similarity between active clusters (vectorized UPGMA)
+        pair_wt = np.outer(weights, weights)
+        pair_sum = sim_mat * pair_wt
+        np.fill_diagonal(pair_wt, 0.0)
+        np.fill_diagonal(pair_sum, 0.0)
+
+        avg_mat = np.full((n, n), -2.0, dtype=np.float64)
+        if n > 1:
+            iu = np.triu_indices(n, k=1)
+            avg_mat[iu] = sim_mat[iu]
 
         def _centroid(members_idx):
             wv = [self.turns[m]["vec"] * min(4.0, self.turns[m]["dur"]) for m in members_idx]
@@ -666,50 +664,61 @@ class SpeakerClusterer:
                 return csim >= ESTABLISHED_MERGE and med >= ESTABLISHED_MEDIAN_MIN
             return csim >= CENTROID_MERGE
 
-        active = list(range(n))
-        blocked: set[tuple[int, int]] = set()
-        while len(active) > 1:
-            best_sim = -1.0
-            best_a = best_b = -1
-            for ia in range(len(active)):
-                a = active[ia]
-                for ib in range(ia + 1, len(active)):
-                    b = active[ib]
-                    if (a, b) in blocked:
-                        continue
-                    avg = pair_sum[a, b] / max(1e-8, pair_wt[a, b])
-                    if avg > best_sim:
-                        best_sim = avg
-                        best_a, best_b = a, b
-            if best_sim < self.merge_threshold or best_a < 0:
+        active_mask = np.ones(n, dtype=bool)
+        blocked_mask = np.zeros((n, n), dtype=bool)
+        n_active = n
+        while n_active > 1:
+            flat = int(np.argmax(avg_mat))
+            best_a, best_b = divmod(flat, n)
+            best_sim = float(avg_mat[best_a, best_b])
+            if best_sim < self.merge_threshold:
                 break
             if not _can_merge(clusters[best_a], clusters[best_b], require_established_only=True):
-                blocked.add((best_a, best_b))
-                blocked.add((best_b, best_a))
+                blocked_mask[best_a, best_b] = blocked_mask[best_b, best_a] = True
+                avg_mat[best_a, best_b] = -2.0
                 continue
             clusters[best_a].extend(clusters[best_b])
             clusters[best_b] = []
-            active.remove(best_b)
-            for c in active:
-                if c == best_a:
-                    continue
-                pair_sum[best_a, c] = pair_sum[c, best_a] = pair_sum[best_a, c] + pair_sum[best_b, c]
-                pair_wt[best_a, c] = pair_wt[c, best_a] = pair_wt[best_a, c] + pair_wt[best_b, c]
+            active_mask[best_b] = False
+            n_active -= 1
+            avg_mat[best_b, :] = -2.0
+            avg_mat[:, best_b] = -2.0
+            pair_sum[best_a, :] += pair_sum[best_b, :]
+            pair_sum[:, best_a] = pair_sum[best_a, :]
+            pair_wt[best_a, :] += pair_wt[best_b, :]
+            pair_wt[:, best_a] = pair_wt[best_a, :]
+            valid = active_mask & (~blocked_mask[best_a])
+            valid[best_a] = False
+            if np.any(valid):
+                new_avg = pair_sum[best_a, valid] / np.maximum(1e-8, pair_wt[best_a, valid])
+                idxs = np.flatnonzero(valid)
+                lo = idxs < best_a
+                hi = ~lo
+                if np.any(lo):
+                    avg_mat[idxs[lo], best_a] = new_avg[lo]
+                if np.any(hi):
+                    avg_mat[best_a, idxs[hi]] = new_avg[hi]
+        active = [i for i in range(n) if active_mask[i]]
 
         # Consolidate clusters whose weighted speaker centroids match closely, while shielding
         # established independent speakers against cross-talk / late-bridge collapse.
         local_groups = [clusters[cid] for cid in active]
+        group_cents = [_centroid([confirmed_sub[idx] for idx in g]) for g in local_groups]
         merged_c = True
         while merged_c and len(local_groups) > 1:
             merged_c = False
-            for ia in range(len(local_groups)):
-                for ib in range(ia + 1, len(local_groups)):
-                    if _can_merge(local_groups[ia], local_groups[ib]):
-                        local_groups[ia].extend(local_groups[ib])
-                        del local_groups[ib]
-                        merged_c = True
-                        break
-                if merged_c:
+            cmat = np.stack(group_cents).astype(np.float64, copy=False)
+            csims = cmat @ cmat.T
+            np.fill_diagonal(csims, -2.0)
+            cand_pairs = np.argwhere(np.triu(csims, k=1) >= CENTROID_MERGE)
+            for ia, ib in cand_pairs:
+                ia_i, ib_i = int(ia), int(ib)
+                if _can_merge(local_groups[ia_i], local_groups[ib_i]):
+                    local_groups[ia_i].extend(local_groups[ib_i])
+                    del local_groups[ib_i]
+                    group_cents[ia_i] = _centroid([confirmed_sub[idx] for idx in local_groups[ia_i]])
+                    del group_cents[ib_i]
+                    merged_c = True
                     break
         groups = [[confirmed_sub[idx] for idx in g] for g in local_groups]
 

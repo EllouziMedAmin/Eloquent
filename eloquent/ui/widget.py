@@ -32,8 +32,8 @@ from PySide6.QtCore import QObject, QPoint, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QAction, QActionGroup, QColor, QDesktopServices, QFont, QGuiApplication, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
                                QFormLayout, QFrame, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QMenu,
-                               QMessageBox, QPushButton, QSizeGrip, QSystemTrayIcon, QTextBrowser, QToolButton,
-                               QVBoxLayout, QWidget)
+                               QMessageBox, QPushButton, QSizeGrip, QSizePolicy, QSystemTrayIcon, QTextBrowser,
+                               QToolButton, QVBoxLayout, QWidget)
 
 from .. import APP_NAME, __version__
 from ..audio import AUDIO_SOURCES, AUDIO_SOURCE_LABELS
@@ -216,6 +216,21 @@ class Bridge(QObject):
     event = Signal(str, object)
 
 
+class _CaptionLabel(QLabel):
+    """Responsive single-line caption label that never pushes past its layout bounds."""
+
+    def __init__(self, on_resize=None, **kwargs):
+        super().__init__(**kwargs)
+        self._on_resize = on_resize
+        self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.setMinimumWidth(0)
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        if self._on_resize is not None:
+            self._on_resize()
+
+
 class LevelDot(QWidget):
     def __init__(self):
         super().__init__()
@@ -303,8 +318,7 @@ class EloquentWidget(QWidget):
         top = QHBoxLayout()
         top.setSpacing(6)
         self.dot = LevelDot()
-        self.caption = QLabel(objectName="caption")
-        self.caption.setMinimumWidth(200)
+        self.caption = _CaptionLabel(on_resize=self._render_caption, objectName="caption")
         self.btn_toggle = QToolButton(objectName="toggle", text="▶")
         self.btn_toggle.clicked.connect(self._toggle_meeting)
         self.btn_expand = QToolButton(text="⤢", toolTip="Show transcript")
@@ -343,6 +357,8 @@ class EloquentWidget(QWidget):
         self.btn_back.clicked.connect(self._switch_view)
         self.btn_back.hide()
         self.lbl_llm = QLabel(objectName="llm")
+        self.lbl_llm.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.lbl_llm.setMinimumWidth(0)
         self.btn_gen = QPushButton("Generate ▾")
         self.btn_gen.clicked.connect(self._show_gen_menu)
         btn_copy = QPushButton("Copy")
@@ -651,7 +667,8 @@ class EloquentWidget(QWidget):
         self.caption.setAlignment((Qt.AlignRight if rtl_speech else Qt.AlignLeft) | Qt.AlignVCenter)
         fm = self.caption.fontMetrics()
         elide = Qt.ElideLeft if self.caption_kind in ("", "partial") else Qt.ElideRight
-        shown = fm.elidedText(self.caption_text, elide, max(50, self.caption.width() - 4))
+        avail = max(16, self.caption.contentsRect().width() - 4)
+        shown = fm.elidedText(self.caption_text, elide, avail)
         self.caption.setText(("\u200F" + shown) if (rtl_speech and shown) else shown)
         self.caption.setToolTip(self.caption_text if len(self.caption_text) > 60 else "")
 
