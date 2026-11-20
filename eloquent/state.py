@@ -242,6 +242,57 @@ class State:
             self.emit("speakers", None)
         return changed
 
+    def item_turn_ids(self, item_kind: str, item_id: int) -> list[int]:
+        """Return the diarizer turn IDs belonging to a clicked paragraph (`'p'`) or loose segment (`'l'`)."""
+        with self.lock:
+            if item_kind == "l":
+                return [item_id]
+            if item_kind == "p":
+                for p in self.paragraphs:
+                    if p["id"] == item_id:
+                        segs = p.get("segs")
+                        if segs:
+                            return [it["id"] for it in segs]
+                        return list(p.get("seg_ids") or ())
+        return []
+
+    def reassign_item_speaker(self, item_kind: str, item_id: int, dst_cid: str) -> bool:
+        """Reassign only a single paragraph (`'p'`) or loose segment (`'l'`) to *dst_cid*."""
+        if not dst_cid:
+            return False
+        changed = False
+        with self.lock:
+            if item_kind == "l":
+                for x in self.loose:
+                    if x["id"] == item_id:
+                        if x.get("speaker") != dst_cid:
+                            x["speaker"] = dst_cid
+                            changed = True
+                        break
+                else:
+                    # Loose segment may have just been grouped into a paragraph by Cleaner
+                    for p in self.paragraphs:
+                        if item_id in (p.get("seg_ids") or ()):
+                            self._apply_mapping_locked({item_id: dst_cid})
+                            changed = True
+                            break
+            elif item_kind == "p":
+                for p in self.paragraphs:
+                    if p["id"] == item_id:
+                        if p.get("speaker") != dst_cid:
+                            p["speaker"] = dst_cid
+                            changed = True
+                        for it in p.get("segs") or ():
+                            if it.get("speaker") != dst_cid:
+                                it["speaker"] = dst_cid
+                                changed = True
+                        break
+            if changed:
+                self.rev += 1
+        if changed:
+            self.emit("speakers", None)
+        return changed
+
     # -- cleaner side -----------------------------------------------------
     def touch(self, kind: str, data=None):
         """Call after mutating paragraphs/error under `lock` (and after releasing it)."""
@@ -356,7 +407,7 @@ class State:
             "speakers": [{"id": cid, "name": name} for cid, name in self._speakers_locked()],
             "report": dict(self.report) if self.report else None,
             "loose": [
-                {"t": x["t"], "text": x["text"],
+                {"id": x["id"], "t": x["t"], "text": x["text"],
                  "speaker": self._disp_spk(x.get("speaker", "")),
                  "speaker_id": x.get("speaker", "")}
                 for x in self.loose

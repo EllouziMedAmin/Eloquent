@@ -144,13 +144,14 @@ def _speaker_dot_icon(color: str) -> QIcon:
     return QIcon(pm)
 
 
-def _speaker_badge(spk: str, esc, spk_id: str = "") -> str:
+def _speaker_badge(spk: str, esc, spk_id: str = "", item_ref: str = "") -> str:
     if not spk:
         return ""
     key = spk_id or spk
     color = _speaker_color(key)
     href = urllib.parse.quote(key, safe="")
-    return (f'<a href="spk:{href}" title="Click to rename or merge {esc(spk)}" '
+    target = f"spk:{href}?ref={item_ref}" if item_ref else f"spk:{href}"
+    return (f'<a href="{target}" title="Click to change, rename, or merge {esc(spk)}" '
             f'style="color:{color};background:rgba(255,255,255,14);'
             f'border-radius:4px;padding:0 5px;font-size:10px;font-weight:600;'
             f'text-decoration:none">{esc(spk)}</a>&nbsp; ')
@@ -162,7 +163,9 @@ def transcript_html(snap: dict, show_raw: bool, rtl: bool = False) -> str:
     dir_attr = 'dir="rtl" align="right"' if rtl else 'dir="ltr"'
     out = []
     for p in snap["paragraphs"]:
-        badge = _speaker_badge(p.get("speaker", ""), esc, p.get("speaker_id", "")) if multi else ""
+        pid = p.get("id")
+        pref = f"p:{pid}" if pid is not None else ""
+        badge = _speaker_badge(p.get("speaker", ""), esc, p.get("speaker_id", ""), item_ref=pref) if multi else ""
         t_html = f'<span dir="ltr" style="color:#7d7d7d;font-size:11px">{esc(p["time"])}</span>'
         head = f'{badge}{t_html}'
         if p["status"] == "cleaning":
@@ -181,7 +184,9 @@ def transcript_html(snap: dict, show_raw: bool, rtl: bool = False) -> str:
         else:
             out.append(f'<p style="margin:0 0 12px 0" {dir_attr}>{body}</p>')
     for x in snap["loose"]:
-        badge = _speaker_badge(x.get("speaker", ""), esc, x.get("speaker_id", "")) if multi else ""
+        xid = x.get("id")
+        xref = f"l:{xid}" if xid is not None else ""
+        badge = _speaker_badge(x.get("speaker", ""), esc, x.get("speaker_id", ""), item_ref=xref) if multi else ""
         t_html = f'<span dir="ltr" style="color:#7d7d7d;font-size:11px">{esc(x["t"])}</span>'
         out.append(f'<p style="margin:0 0 2px 0" {dir_attr}>{badge}{t_html}</p>'
                    f'<p style="margin:0 0 6px 0" {dir_attr}>{esc(x["text"])}</p>')
@@ -226,11 +231,13 @@ class _RenameSpeakerDialog(QDialog):
 
         self.edit = QLineEdit("" if current_name == spk_id else current_name)
         self.edit.setPlaceholderText(f"Name for {spk_id}…")
+        self.edit.returnPressed.connect(self.accept)
         layout.addWidget(self.edit)
 
         row = QHBoxLayout()
         row.addStretch(1)
         btn_cancel = QPushButton("Cancel")
+        btn_cancel.setAutoDefault(False)
         btn_cancel.clicked.connect(self.reject)
         btn_save = QPushButton("Save")
         btn_save.setObjectName("primary")
@@ -295,6 +302,7 @@ class RenameSpeakersDialog(QDialog):
                 btn_row.addWidget(self.btn_reset)
         btn_row.addStretch(1)
         btn_cancel = QPushButton("Cancel")
+        btn_cancel.setAutoDefault(False)
         btn_cancel.clicked.connect(self.reject)
         btn_save = QPushButton("Save")
         btn_save.setObjectName("primary")
@@ -922,7 +930,7 @@ class EloquentWidget(QWidget):
         self.act_rename_sep.setVisible(multi)
         self.gen_menu.exec(self.btn_gen.mapToGlobal(QPoint(0, self.btn_gen.height())))
 
-    def _build_speaker_menu(self, spk_id: str) -> QMenu:
+    def _build_speaker_menu(self, spk_id: str, item_kind: str = "", item_id: int = None) -> QMenu:
         """Build the 1-click dark popover menu shown when clicking a speaker badge."""
         cur = self.engine.state.display_speaker(spk_id) or spk_id
         src_anchors = self.engine.speaker_anchor_ids(spk_id)
@@ -936,13 +944,25 @@ class EloquentWidget(QWidget):
 
         menu = QMenu(self)
         safe_cur = cur.replace("&", "&&")
+
+        if item_kind and item_id is not None and others:
+            line_sub = menu.addMenu("Change this line to")
+            for ocid, oname, oanc in others:
+                olbl = f"{oname} ({ocid})" if (oname and oname != ocid) else ocid
+                act_l = line_sub.addAction(_speaker_dot_icon(_speaker_color(ocid)), olbl.replace("&", "&&"))
+                act_l.triggered.connect(
+                    lambda _c=False, ik=item_kind, iid=item_id, d=ocid, da=oanc, dn=oname:
+                        self._reassign_one_line(ik, iid, d, da, dn)
+                )
+
         act_ren = menu.addAction(f'Rename "{safe_cur}"…')
         act_ren.triggered.connect(
             lambda _c=False, sid=spk_id, cname=cur, anc=src_anchors: self._rename_one_speaker(sid, cname, anc)
         )
 
         if others:
-            merge_sub = menu.addMenu("Merge into")
+            menu.addSeparator()
+            merge_sub = menu.addMenu(f'Merge all "{safe_cur}" into')
             for ocid, oname, oanc in others:
                 olbl = f"{oname} ({ocid})" if (oname and oname != ocid) else ocid
                 act_m = merge_sub.addAction(_speaker_dot_icon(_speaker_color(ocid)), olbl.replace("&", "&&"))
@@ -951,7 +971,7 @@ class EloquentWidget(QWidget):
                         self._merge_one_speaker(s, sa, sn, d, da, dn)
                 )
             if can_dissolve:
-                act_dis = menu.addAction("Reassign overlap turns")
+                act_dis = menu.addAction("Reassign all overlap turns")
                 act_dis.triggered.connect(
                     lambda _c=False, s=spk_id, sa=src_anchors, sn=cur: self._dissolve_one_speaker(s, sa, sn)
                 )
@@ -965,6 +985,13 @@ class EloquentWidget(QWidget):
                 act_r.triggered.connect(self._reset_speaker_edits)
         return menu
 
+    def _reassign_one_line(self, item_kind: str, item_id: int, dst_id: str,
+                           dst_anchors: list[int], dst_name: str):
+        if self.engine.reassign_line_speaker(item_kind, item_id, dst_id, dst_anchors=dst_anchors):
+            self._rebuild()
+            self._caption(f"Changed line to {dst_name}", "hint")
+            self.caption_reset.start()
+
     def _rename_one_speaker(self, spk_id: str, cur_name: str, src_anchors: list[int]):
         live_id = self.engine.resolve_speaker_from_anchors(spk_id, src_anchors)
         dlg = _RenameSpeakerDialog(live_id, self.engine.state.display_speaker(live_id) or cur_name, self)
@@ -976,7 +1003,7 @@ class EloquentWidget(QWidget):
                            dst_id: str, dst_anchors: list[int], dst_name: str):
         if self.engine.merge_speakers(src_id, dst_id, src_anchors=src_anchors, dst_anchors=dst_anchors):
             self._rebuild()
-            self._caption(f"Merged {src_name} into {dst_name}", "hint")
+            self._caption(f"Merged all {src_name} into {dst_name}", "hint")
             self.caption_reset.start()
 
     def _dissolve_one_speaker(self, src_id: str, src_anchors: list[int], src_name: str):
@@ -997,12 +1024,34 @@ class EloquentWidget(QWidget):
             self._caption("Reset all speaker edits", "hint")
             self.caption_reset.start()
 
-    def _on_anchor(self, url: QUrl):
+    @staticmethod
+    def _parse_speaker_url(url: QUrl) -> tuple[str, str, int | None]:
         raw = url.toString()
         if not raw.startswith("spk:"):
+            return "", "", None
+        payload = raw[4:]
+        item_kind, item_id = "", None
+        if "?" in payload:
+            spk_part, query = payload.split("?", 1)
+            spk_id = urllib.parse.unquote(spk_part)
+            ref_vals = urllib.parse.parse_qs(query).get("ref") or []
+            ref_part = ref_vals[0] if ref_vals else ""
+            if ":" in ref_part:
+                rk, rid = ref_part.split(":", 1)
+                if rk in ("p", "l"):
+                    try:
+                        item_kind, item_id = rk, int(rid)
+                    except ValueError:
+                        pass
+        else:
+            spk_id = urllib.parse.unquote(payload)
+        return spk_id, item_kind, item_id
+
+    def _on_anchor(self, url: QUrl):
+        spk_id, item_kind, item_id = self._parse_speaker_url(url)
+        if not spk_id:
             return
-        spk_id = urllib.parse.unquote(raw[4:])
-        menu = self._build_speaker_menu(spk_id)
+        menu = self._build_speaker_menu(spk_id, item_kind=item_kind, item_id=item_id)
         menu.exec(QCursor.pos())
 
     def rename_speakers(self):

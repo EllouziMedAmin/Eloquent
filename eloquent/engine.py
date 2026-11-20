@@ -749,6 +749,38 @@ class Engine:
             return True
         return False
 
+    def reassign_line_speaker(self, item_kind: str, item_id: int, dst_cid: str,
+                              dst_anchors: list[int] = None) -> bool:
+        """Reassign only one paragraph (`'p'`) or loose segment (`'l'`) to *dst_cid*."""
+        if dst_anchors:
+            dst_cid = self.resolve_speaker_from_anchors(dst_cid, dst_anchors)
+        if not item_kind or item_id is None or not dst_cid:
+            return False
+        turn_ids = self.state.item_turn_ids(item_kind, item_id)
+        old_names = self.state.speaker_names_copy()
+        diar = self.diarizer
+        if diar is not None and turn_ids and diar.has_speaker(dst_cid) and diar.has_any_turn(turn_ids):
+            mapping, remapped = diar.pin_turns_to_speaker(turn_ids, dst_cid, old_names=old_names)
+            if mapping:
+                id_remap = diar.last_id_remap()
+                self.state.apply_cluster_remap(mapping, remapped, id_remap=id_remap)
+                self.state.reassign_item_speaker(item_kind, item_id, id_remap.get(dst_cid, dst_cid))
+                self._sync_session_files()
+                return True
+        cl = self._last_clusterer
+        if diar is None and cl is not None and turn_ids and cl.has_speaker(dst_cid) and cl.has_any_turn(turn_ids):
+            mapping, remapped = cl.pin_turns_to_speaker(turn_ids, dst_cid, old_names=old_names)
+            if mapping:
+                id_remap = cl.last_id_remap
+                self.state.apply_cluster_remap(mapping, remapped, id_remap=id_remap)
+                self.state.reassign_item_speaker(item_kind, item_id, id_remap.get(dst_cid, dst_cid))
+                self._sync_session_files()
+                return True
+        if self.state.reassign_item_speaker(item_kind, item_id, dst_cid):
+            self._sync_session_files()
+            return True
+        return False
+
     def dissolve_speaker(self, src_cid: str, src_anchors: list[int] = None) -> bool:
         """Reassign a clash/overlap speaker's turns individually to the closest remaining speakers."""
         if src_anchors:
