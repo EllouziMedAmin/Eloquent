@@ -722,43 +722,68 @@ class SpeakerClusterer:
                     break
         groups = [[confirmed_sub[idx] for idx in g] for g in local_groups]
 
-        major = [g for g in groups if sum(self.turns[m]["dur"] for m in g) >= 2.8]
+        if self.arabic_mode:
+            multi_major = [
+                g for g in groups
+                if len(g) >= 2 and sum(self.turns[m]["dur"] for m in g) >= 2.8
+            ]
+            if len(multi_major) >= 2:
+                major = multi_major
+            else:
+                major = [g for g in groups if sum(self.turns[m]["dur"] for m in g) >= 2.8]
+        else:
+            major = [g for g in groups if sum(self.turns[m]["dur"] for m in g) >= 2.8]
+
+        attached: list[list[int]] = [[] for _ in groups]
         if major:
+            major_ids = {id(g) for g in major}
             kept = [list(g) for g in major]
             kept_vecs = [_centroid(g) for g in kept]
+            attached = [[] for _ in kept]
             for g in groups:
-                gdur = sum(self.turns[m]["dur"] for m in g)
-                if gdur >= 2.8:
+                if id(g) in major_ids:
                     continue
+                gdur = sum(self.turns[m]["dur"] for m in g)
                 gv = _centroid(g)
                 sims = [float(np.dot(gv, kv)) for kv in kept_vecs]
                 bi = int(np.argmax(sims))
-                # Fold brief isolated fragments into the closest established speaker only when similar
+                # Fold brief or isolated single-turn fragments into the closest established speaker
                 if self.arabic_mode and len(major) >= 2 and len(g) == 1:
                     need = 0.20
+                    if sims[bi] >= need:
+                        # Attach label without polluting the real speaker's centroid
+                        attached[bi].extend(g)
+                    else:
+                        kept.append(list(g))
+                        kept_vecs.append(gv)
+                        attached.append([])
                 else:
                     need = 0.35 if gdur < 1.8 else 0.42
-                if sims[bi] >= need:
-                    kept[bi].extend(g)
-                    kept_vecs[bi] = _centroid(kept[bi])
-                else:
-                    kept.append(list(g))
-                    kept_vecs.append(gv)
+                    if sims[bi] >= need:
+                        kept[bi].extend(g)
+                        kept_vecs[bi] = _centroid(kept[bi])
+                    else:
+                        kept.append(list(g))
+                        kept_vecs.append(gv)
+                        attached.append([])
             groups = kept
 
         # Build cluster centroids and order stably by earliest turn appearance
         comp = []
-        for members in groups:
+        for members, extra in zip(groups, attached):
             first_t0 = min(self.turns[m]["t0"] for m in members)
-            comp.append((first_t0, members, _centroid(members)))
+            comp.append((first_t0, members, extra, _centroid(members)))
         comp.sort(key=lambda x: x[0])
 
         id_to_spk: dict[int, str] = {}
         centroids = []
-        for spk_num, (_, members, centroid) in enumerate(comp, 1):
+        for spk_num, (_, members, extra, centroid) in enumerate(comp, 1):
             label = f"Speaker {spk_num}"
             centroids.append((label, centroid, members))
             for m in members:
+                self.turns[m]["speaker"] = label
+                id_to_spk[self.turns[m]["id"]] = label
+            for m in extra:
                 self.turns[m]["speaker"] = label
                 id_to_spk[self.turns[m]["id"]] = label
         self._centroids = [
