@@ -66,11 +66,11 @@ def build_speaker_extractor(model_path: Path, threads: int = 1):
     return sherpa_onnx.SpeakerEmbeddingExtractor(cfg)
 
 
-def compute_embedding(extractor, samples: np.ndarray) -> Optional[np.ndarray]:
+def compute_embedding(extractor, samples: np.ndarray, min_rms: float = 0.002) -> Optional[np.ndarray]:
     """Extract an L2-normalized speaker embedding vector, or None if clip is silent/too short."""
     if len(samples) < int(0.35 * SAMPLE_RATE):
         return None
-    if float(np.sqrt(np.mean(samples * samples))) < 0.002:
+    if float(np.sqrt(np.mean(samples * samples))) < min_rms:
         return None
     stream = extractor.create_stream()
     stream.accept_waveform(SAMPLE_RATE, samples)
@@ -194,7 +194,7 @@ def _detect_voiced_islands(samples: np.ndarray) -> tuple[np.ndarray, float, list
 
     frames = samples[:n_frames * frame_n].reshape(n_frames, frame_n)
     rms = np.sqrt(np.mean(frames * frames, axis=1))
-    thr = max(0.0035, min(0.025, float(np.percentile(rms, 85)) * 0.20))
+    thr = max(0.0006, min(0.025, float(np.percentile(rms, 85)) * 0.20))
     active = (rms >= thr).copy()
 
     # Bridge brief consonant/micro pauses <= 60 ms (3 frames)
@@ -573,6 +573,7 @@ class SpeakerClusterer:
         self._must_link_sets: list[set[int]] = []
         self._merged_protos: list[tuple[np.ndarray, np.ndarray, set[int]]] = []
         self._dissolved_prev_bridge: dict[int, bool] = {}
+        self.last_id_remap: dict[str, str] = {}
         self._edit_history: list[tuple[
             list[set[int]],
             list[tuple[np.ndarray, np.ndarray, set[int]]],
@@ -594,6 +595,39 @@ class SpeakerClusterer:
         if self._edit_history:
             return len(self._edit_history)
         return 1 if (self._must_link_sets or self._merged_protos or self._dissolved_prev_bridge) else 0
+
+    def speaker_anchor_ids(self, label: str) -> list[int]:
+        return [t["id"] for t in self.turns if t.get("speaker") == label]
+
+    def resolve_speaker_from_anchors(self, fallback_label: str, anchors: list[int]) -> str:
+        if anchors:
+            aset = set(anchors)
+            labels = [t.get("speaker", "") for t in self.turns if t["id"] in aset and t.get("speaker")]
+            if labels:
+                return max(set(labels), key=labels.count)
+        return fallback_label
+
+    @staticmethod
+    def _compute_id_remap(old_by_spk: dict[str, list[int]],
+                          new_mapping: dict[int, str],
+                          merged: Optional[tuple[str, str]] = None) -> dict[str, str]:
+        id_remap: dict[str, str] = {}
+        for old_cid, tids in old_by_spk.items():
+            counts: dict[str, int] = {}
+            for tid in tids:
+                ncid = new_mapping.get(tid)
+                if ncid:
+                    counts[ncid] = counts.get(ncid, 0) + 1
+            if counts:
+                best = max(counts.items(), key=lambda kv: kv[1])[0]
+                if best != old_cid:
+                    id_remap[old_cid] = best
+        if merged is not None:
+            src, dst = merged
+            dst_new = id_remap.get(dst, dst)
+            if src != dst_new:
+                id_remap[src] = dst_new
+        return id_remap
 
     def _push_edit_snapshot(self, old_by_spk: dict[str, list[int]], old_names: dict[str, str]) -> None:
         snap = (
@@ -693,6 +727,7 @@ class SpeakerClusterer:
         self._must_link_sets = kept_sets
 
         mapping = self._recluster()
+        self.last_id_remap = self._compute_id_remap(old_by_spk, mapping, merged=(src_label, dst_label))
         remapped = self._remap_names(old_by_spk, mapping, old_names or {}, merged=(src_label, dst_label))
         return mapping, remapped
 
@@ -714,6 +749,7 @@ class SpeakerClusterer:
                 t["bridge"] = True
         self._must_link_sets = [s - src_ids for s in self._must_link_sets if len(s - src_ids) >= 2]
         mapping = self._recluster()
+        self.last_id_remap = self._compute_id_remap(old_by_spk, mapping)
         remapped = self._remap_names(old_by_spk, mapping, old_names or {}, dissolved=src_label)
         return mapping, remapped
 
@@ -732,8 +768,10 @@ class SpeakerClusterer:
         self._merged_protos = prev_protos
         self._dissolved_prev_bridge = prev_dissolved
         if not self.turns:
+            self.last_id_remap = {}
             return {}, dict(prev_names)
         mapping = self._recluster()
+        self.last_id_remap = self._compute_id_remap(cur_by_spk, mapping)
         remapped = self._remap_names(prev_by_spk, mapping, prev_names)
         cur_remapped = self._remap_names(cur_by_spk, mapping, old_names or {})
         for k, v in cur_remapped.items():
@@ -760,8 +798,10 @@ class SpeakerClusterer:
         self._dissolved_prev_bridge.clear()
         self._edit_history.clear()
         if not self.turns:
+            self.last_id_remap = {}
             return {}, dict(first_names)
         mapping = self._recluster()
+        self.last_id_remap = self._compute_id_remap(cur_by_spk, mapping)
         remapped = self._remap_names(first_by_spk, mapping, first_names)
         cur_remapped = self._remap_names(cur_by_spk, mapping, old_names or {})
         for k, v in cur_remapped.items():
@@ -779,8 +819,10 @@ class SpeakerClusterer:
         old_by_spk = self._speaker_turn_ids()
         self.max_speakers = cap
         if not self.turns:
+            self.last_id_remap = {}
             return {}, dict(old_names or {})
         mapping = self._recluster()
+        self.last_id_remap = self._compute_id_remap(old_by_spk, mapping)
         remapped = self._remap_names(old_by_spk, mapping, old_names or {})
         return mapping, remapped
 
@@ -1102,14 +1144,22 @@ class SpeakerClusterer:
                 last_spk = id_to_spk[t["id"]]
                 continue
             best_lbl, best_s = last_spk, -1.0
+            last_s = -1.0
             for lbl, c, members in centroids:
                 s_c = float(np.dot(t["vec"], c))
                 s_m = max((_turn_similarity(t, self.turns[m]) for m in members), default=s_c)
                 s = max(s_c, s_m)
+                if lbl == last_spk:
+                    last_s = s
                 if s > best_s:
                     best_s = s
                     best_lbl = lbl
-            lbl = best_lbl if best_s >= SHORT_ATTACH_THRESHOLD else last_spk
+            if best_s >= SHORT_ATTACH_THRESHOLD:
+                lbl = best_lbl
+            elif self.arabic_mode and best_lbl != last_spk and best_s >= 0.22 and (best_s - last_s) >= 0.10:
+                lbl = best_lbl
+            else:
+                lbl = last_spk
             t["speaker"] = lbl
             id_to_spk[t["id"]] = lbl
             last_spk = lbl
@@ -1128,6 +1178,7 @@ class Diarizer(threading.Thread):
         self.state = state
         self.session = session
         self.log = log
+        self.arabic_mode = bool(arabic_mode)
         self.clusterer = SpeakerClusterer(arabic_mode=arabic_mode, max_speakers=max_speakers)
         self._cluster_lock = threading.Lock()
         self.q: "queue.Queue[Optional[tuple]]" = queue.Queue()
@@ -1151,6 +1202,18 @@ class Diarizer(threading.Thread):
     def manual_edit_count(self) -> int:
         with self._cluster_lock:
             return self.clusterer.manual_edit_count()
+
+    def speaker_anchor_ids(self, label: str) -> list[int]:
+        with self._cluster_lock:
+            return self.clusterer.speaker_anchor_ids(label)
+
+    def resolve_speaker_from_anchors(self, fallback_label: str, anchors: list[int]) -> str:
+        with self._cluster_lock:
+            return self.clusterer.resolve_speaker_from_anchors(fallback_label, anchors)
+
+    def last_id_remap(self) -> dict[str, str]:
+        with self._cluster_lock:
+            return dict(self.clusterer.last_id_remap)
 
     def merge_speakers(self, src_label: str, dst_label: str,
                        old_names: Optional[dict[str, str]] = None
@@ -1209,7 +1272,7 @@ class Diarizer(threading.Thread):
                 self.q.task_done()
 
     def _embed(self, seg: np.ndarray) -> Optional[np.ndarray]:
-        return compute_embedding(self.extractor, seg)
+        return compute_embedding(self.extractor, seg, min_rms=0.0008 if self.arabic_mode else 0.002)
 
     def _process_item(self, seg_id: int, start_sec: float, stamp: str,
                       samples: np.ndarray, text: str, words: list[dict]) -> None:

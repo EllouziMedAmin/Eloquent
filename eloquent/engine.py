@@ -699,8 +699,34 @@ class Engine:
             return cl.has_speaker(spk_cid) and cl.speaker_count() >= 2
         return False
 
-    def merge_speakers(self, src_cid: str, dst_cid: str) -> bool:
+    def speaker_anchor_ids(self, spk_cid: str) -> list[int]:
+        """Capture stable turn IDs for *spk_cid* so live UI clicks survive renumbering."""
+        if not spk_cid:
+            return []
+        diar = self.diarizer
+        if diar is not None:
+            return diar.speaker_anchor_ids(spk_cid)
+        cl = self._last_clusterer
+        if cl is not None:
+            return cl.speaker_anchor_ids(spk_cid)
+        return []
+
+    def resolve_speaker_from_anchors(self, fallback_cid: str, anchors: list[int]) -> str:
+        diar = self.diarizer
+        if diar is not None:
+            return diar.resolve_speaker_from_anchors(fallback_cid, anchors)
+        cl = self._last_clusterer
+        if cl is not None:
+            return cl.resolve_speaker_from_anchors(fallback_cid, anchors)
+        return fallback_cid
+
+    def merge_speakers(self, src_cid: str, dst_cid: str,
+                       src_anchors: list[int] = None, dst_anchors: list[int] = None) -> bool:
         """Merge *src_cid* into *dst_cid* (live voiceprint merge when available, else State merge)."""
+        if src_anchors:
+            src_cid = self.resolve_speaker_from_anchors(src_cid, src_anchors)
+        if dst_anchors:
+            dst_cid = self.resolve_speaker_from_anchors(dst_cid, dst_anchors)
         if not src_cid or not dst_cid or src_cid == dst_cid:
             return False
         old_names = self.state.speaker_names_copy()
@@ -708,14 +734,14 @@ class Engine:
         if diar is not None and diar.has_speaker(src_cid) and diar.has_speaker(dst_cid):
             mapping, remapped = diar.merge_speakers(src_cid, dst_cid, old_names=old_names)
             if mapping:
-                self.state.apply_cluster_remap(mapping, remapped)
+                self.state.apply_cluster_remap(mapping, remapped, id_remap=diar.last_id_remap())
                 self._sync_session_files()
                 return True
         cl = self._last_clusterer
         if diar is None and cl is not None and cl.has_speaker(src_cid) and cl.has_speaker(dst_cid):
             mapping, remapped = cl.merge_speakers(src_cid, dst_cid, old_names=old_names)
             if mapping:
-                self.state.apply_cluster_remap(mapping, remapped)
+                self.state.apply_cluster_remap(mapping, remapped, id_remap=cl.last_id_remap)
                 self._sync_session_files()
                 return True
         if self.state.merge_speakers_fallback(src_cid, dst_cid):
@@ -723,8 +749,10 @@ class Engine:
             return True
         return False
 
-    def dissolve_speaker(self, src_cid: str) -> bool:
+    def dissolve_speaker(self, src_cid: str, src_anchors: list[int] = None) -> bool:
         """Reassign a clash/overlap speaker's turns individually to the closest remaining speakers."""
+        if src_anchors:
+            src_cid = self.resolve_speaker_from_anchors(src_cid, src_anchors)
         if not src_cid:
             return False
         old_names = self.state.speaker_names_copy()
@@ -732,14 +760,14 @@ class Engine:
         if diar is not None and diar.has_speaker(src_cid) and diar.speaker_count() >= 2:
             mapping, remapped = diar.dissolve_speaker(src_cid, old_names=old_names)
             if mapping:
-                self.state.apply_cluster_remap(mapping, remapped)
+                self.state.apply_cluster_remap(mapping, remapped, id_remap=diar.last_id_remap())
                 self._sync_session_files()
                 return True
         cl = self._last_clusterer
         if diar is None and cl is not None and cl.has_speaker(src_cid) and cl.speaker_count() >= 2:
             mapping, remapped = cl.dissolve_speaker(src_cid, old_names=old_names)
             if mapping:
-                self.state.apply_cluster_remap(mapping, remapped)
+                self.state.apply_cluster_remap(mapping, remapped, id_remap=cl.last_id_remap)
                 self._sync_session_files()
                 return True
         return False
@@ -761,7 +789,7 @@ class Engine:
         if diar is not None and diar.manual_edit_count() > 0:
             mapping, remapped = diar.undo_last_speaker_edit(old_names=old_names)
             if mapping:
-                self.state.apply_cluster_remap(mapping, remapped)
+                self.state.apply_cluster_remap(mapping, remapped, id_remap=diar.last_id_remap())
                 self._sync_session_files()
                 return True
             return False
@@ -769,7 +797,7 @@ class Engine:
         if diar is None and cl is not None and cl.manual_edit_count() > 0:
             mapping, remapped = cl.undo_last_speaker_edit(old_names=old_names)
             if mapping:
-                self.state.apply_cluster_remap(mapping, remapped)
+                self.state.apply_cluster_remap(mapping, remapped, id_remap=cl.last_id_remap)
                 self._sync_session_files()
                 return True
         return False
@@ -781,7 +809,7 @@ class Engine:
         if diar is not None and diar.manual_edit_count() > 0:
             mapping, remapped = diar.reset_speaker_edits(old_names=old_names)
             if mapping:
-                self.state.apply_cluster_remap(mapping, remapped)
+                self.state.apply_cluster_remap(mapping, remapped, id_remap=diar.last_id_remap())
                 self._sync_session_files()
                 return True
             return False
@@ -789,7 +817,7 @@ class Engine:
         if diar is None and cl is not None and cl.manual_edit_count() > 0:
             mapping, remapped = cl.reset_speaker_edits(old_names=old_names)
             if mapping:
-                self.state.apply_cluster_remap(mapping, remapped)
+                self.state.apply_cluster_remap(mapping, remapped, id_remap=cl.last_id_remap)
                 self._sync_session_files()
                 return True
         return False
@@ -802,7 +830,7 @@ class Engine:
         if diar is not None:
             mapping, remapped = diar.set_max_speakers(cap, old_names=old_names)
             if mapping:
-                self.state.apply_cluster_remap(mapping, remapped)
+                self.state.apply_cluster_remap(mapping, remapped, id_remap=diar.last_id_remap())
                 self._sync_session_files()
                 return True
             return False
@@ -810,7 +838,7 @@ class Engine:
         if cl is not None:
             mapping, remapped = cl.set_max_speakers(cap, old_names=old_names)
             if mapping:
-                self.state.apply_cluster_remap(mapping, remapped)
+                self.state.apply_cluster_remap(mapping, remapped, id_remap=cl.last_id_remap)
                 self._sync_session_files()
                 return True
         return False

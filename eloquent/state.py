@@ -128,10 +128,14 @@ class State:
             self.rev += 1
         self.emit("speakers", seg_id)
 
-    def _apply_mapping_locked(self, mapping: dict[int, str]):
+    def _apply_mapping_locked(self, mapping: dict[int, str],
+                              id_remap: Optional[dict[str, str]] = None):
+        remap = id_remap or {}
         for x in self.loose:
             if x["id"] in mapping:
                 x["speaker"] = mapping[x["id"]]
+            elif remap and x.get("speaker") in remap:
+                x["speaker"] = remap[x["speaker"]]
         new_paragraphs = []
         for p in self.paragraphs:
             segs_meta = p.get("segs")
@@ -139,6 +143,8 @@ class State:
                 for item in segs_meta:
                     if item["id"] in mapping:
                         item["speaker"] = mapping[item["id"]]
+                    elif remap and item.get("speaker") in remap:
+                        item["speaker"] = remap[item["speaker"]]
                 # Split into consecutive speaker runs if multiple speakers exist inside this paragraph
                 spk_set = {item["speaker"] for item in segs_meta if item.get("speaker")}
                 if len(spk_set) > 1:
@@ -172,6 +178,8 @@ class State:
                     continue
                 if spk_set:
                     p["speaker"] = next(iter(spk_set))
+                elif remap and p.get("speaker") in remap:
+                    p["speaker"] = remap[p["speaker"]]
             else:
                 counts: dict[str, int] = {}
                 for tid in p.get("seg_ids", ()):
@@ -180,6 +188,8 @@ class State:
                         counts[sp] = counts.get(sp, 0) + 1
                 if counts:
                     p["speaker"] = max(counts.items(), key=lambda kv: kv[1])[0]
+                elif remap and p.get("speaker") in remap:
+                    p["speaker"] = remap[p["speaker"]]
             new_paragraphs.append(p)
         self.paragraphs = new_paragraphs
 
@@ -188,13 +198,14 @@ class State:
             return dict(self.speaker_names)
 
     def apply_cluster_remap(self, mapping: dict[int, str],
-                            new_speaker_names: Optional[dict[str, str]] = None) -> bool:
+                            new_speaker_names: Optional[dict[str, str]] = None,
+                            id_remap: Optional[dict[str, str]] = None) -> bool:
         """Apply a full cluster remap (from merge/dissolve/max-speakers) and updated names."""
-        if not mapping and new_speaker_names is None:
+        if not mapping and not id_remap and new_speaker_names is None:
             return False
         with self.lock:
-            if mapping:
-                self._apply_mapping_locked(mapping)
+            if mapping or id_remap:
+                self._apply_mapping_locked(mapping or {}, id_remap=id_remap)
             if new_speaker_names is not None:
                 self.speaker_names = {
                     k: v.strip() for k, v in new_speaker_names.items()
@@ -254,17 +265,12 @@ class State:
 
     # -- readers ----------------------------------------------------------
     def _multi_speaker_locked(self) -> bool:
-        seen = set()
         for p in self.paragraphs:
             if p.get("speaker"):
-                seen.add(p["speaker"])
-                if len(seen) >= 2:
-                    return True
+                return True
         for x in self.loose:
             if x.get("speaker"):
-                seen.add(x["speaker"])
-                if len(seen) >= 2:
-                    return True
+                return True
         return False
 
     def _disp_spk(self, spk_id: str) -> str:

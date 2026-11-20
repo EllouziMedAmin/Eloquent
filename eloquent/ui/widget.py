@@ -29,7 +29,7 @@ if sys.platform == "win32":
     os.environ.setdefault("QT_LOGGING_RULES", "qt.gui.icc.warning=false")
 
 from PySide6.QtCore import QObject, QPoint, Qt, QTimer, QUrl, Signal
-from PySide6.QtGui import QAction, QActionGroup, QColor, QDesktopServices, QFont, QGuiApplication, QIcon, QPainter, QPixmap
+from PySide6.QtGui import QAction, QActionGroup, QColor, QCursor, QDesktopServices, QFont, QGuiApplication, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
                                QFormLayout, QFrame, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QMenu,
                                QMessageBox, QPushButton, QSizeGrip, QSizePolicy, QSystemTrayIcon, QTextBrowser,
@@ -132,13 +132,25 @@ def _speaker_color(spk_id: str) -> str:
     return SPEAKER_COLORS[idx % len(SPEAKER_COLORS)]
 
 
+def _speaker_dot_icon(color: str) -> QIcon:
+    pm = QPixmap(12, 12)
+    pm.fill(Qt.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.Antialiasing)
+    p.setBrush(QColor(color))
+    p.setPen(Qt.NoPen)
+    p.drawEllipse(2, 2, 8, 8)
+    p.end()
+    return QIcon(pm)
+
+
 def _speaker_badge(spk: str, esc, spk_id: str = "") -> str:
     if not spk:
         return ""
     key = spk_id or spk
     color = _speaker_color(key)
     href = urllib.parse.quote(key, safe="")
-    return (f'<a href="spk:{href}" title="Click to rename {esc(spk)}" '
+    return (f'<a href="spk:{href}" title="Click to rename or merge {esc(spk)}" '
             f'style="color:{color};background:rgba(255,255,255,14);'
             f'border-radius:4px;padding:0 5px;font-size:10px;font-weight:600;'
             f'text-decoration:none">{esc(spk)}</a>&nbsp; ')
@@ -178,162 +190,118 @@ def transcript_html(snap: dict, show_raw: bool, rtl: bool = False) -> str:
     return "".join(out)
 
 
-class SpeakerActionDialog(QDialog):
-    """Single-speaker dialog on clicking a speaker badge: rename, merge into another speaker, or reassign clash turns."""
+DARK_DIALOG_STYLE = """
+QDialog { background: #1e1e22; color: #ececec; font: 10pt "Segoe UI"; }
+QLabel { color: #ececec; font: 10pt "Segoe UI"; }
+QLabel#hint { color: #9a9aa2; font: 9pt "Segoe UI"; }
+QLineEdit { background: #2a2a30; color: #f2f2f2; border: 1px solid #3f3f46; border-radius: 7px;
+            padding: 6px 9px; font: 10pt "Segoe UI"; selection-background-color: #2b6cb0; }
+QLineEdit:focus { border-color: #7db4ff; }
+QPushButton { background: #2d2d34; color: #ececec; border: 1px solid #44444d; border-radius: 7px;
+              padding: 5px 14px; font: 9.5pt "Segoe UI"; }
+QPushButton:hover { background: #3a3a44; }
+QPushButton#primary { background: #2e9e5b; border-color: #2e9e5b; color: white; font-weight: 600; }
+QPushButton#primary:hover { background: #36b368; }
+QPushButton#subtle { background: transparent; border: none; color: #9a9aa2; padding: 5px 8px; }
+QPushButton#subtle:hover { color: #ececec; background: rgba(255,255,255,14); }
+"""
 
-    def __init__(self, spk_id: str, current_name: str, other_speakers: list[tuple[str, str]],
-                 can_dissolve: bool = False, edit_count: int = 0, parent=None):
+
+class _RenameSpeakerDialog(QDialog):
+    """Compact dark-themed single-speaker rename dialog."""
+
+    def __init__(self, spk_id: str, current_name: str, parent=None):
         super().__init__(parent)
-        self.spk_id = spk_id
-        self._special_action = ""  # "", "undo", "reset_edits"
-        self.setWindowTitle(f"{APP_NAME} - {spk_id}")
-        self.setMinimumWidth(380)
-        self.setStyleSheet("")
+        self.setWindowTitle(f"Rename {spk_id}")
+        self.setMinimumWidth(320)
+        self.setStyleSheet(DARK_DIALOG_STYLE)
         self.setWindowFlag(Qt.WindowStaysOnTopHint, True)
 
         layout = QVBoxLayout(self)
-        title = QLabel(f'<b style="color:{_speaker_color(spk_id)}">{html.escape(spk_id)}</b>')
-        layout.addWidget(title)
+        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setSpacing(10)
 
-        form = QFormLayout()
-        self.name_edit = QLineEdit("" if current_name == spk_id else current_name)
-        self.name_edit.setPlaceholderText(spk_id)
-        form.addRow("Name:", self.name_edit)
+        lbl = QLabel(f'<b style="color:{_speaker_color(spk_id)}">{html.escape(spk_id)}</b>')
+        layout.addWidget(lbl)
 
-        self.action_combo: QComboBox | None = None
-        if other_speakers:
-            self.action_combo = QComboBox()
-            self.action_combo.addItem("Keep as separate speaker", ("keep", ""))
-            for cid, disp in other_speakers:
-                lbl = f"Merge into {disp} ({cid})" if disp and disp != cid else f"Merge into {cid}"
-                self.action_combo.addItem(lbl, ("merge", cid))
-            if can_dissolve and len(other_speakers) >= 2:
-                self.action_combo.addItem("Reassign turns to closest speakers (overlap)", ("dissolve", ""))
-            self.action_combo.currentIndexChanged.connect(self._sync_name_enabled)
-            form.addRow("Correction:", self.action_combo)
+        self.edit = QLineEdit("" if current_name == spk_id else current_name)
+        self.edit.setPlaceholderText(f"Name for {spk_id}…")
+        layout.addWidget(self.edit)
 
-        layout.addLayout(form)
+        row = QHBoxLayout()
+        row.addStretch(1)
+        btn_cancel = QPushButton("Cancel")
+        btn_cancel.clicked.connect(self.reject)
+        btn_save = QPushButton("Save")
+        btn_save.setObjectName("primary")
+        btn_save.setDefault(True)
+        btn_save.clicked.connect(self.accept)
+        row.addWidget(btn_cancel)
+        row.addWidget(btn_save)
+        layout.addLayout(row)
 
-        if other_speakers:
-            hint = QLabel(
-                "Tip: Use Merge if this speaker was split from an existing person (applies to past and future turns), "
-                "or Reassign if it only contains simultaneous cross-talk."
-            )
-            hint.setWordWrap(True)
-            hint.setStyleSheet("color: #666; font-size: 11px;")
-            layout.addWidget(hint)
+        self.edit.setFocus()
+        self.edit.selectAll()
 
-        btn_row = QHBoxLayout()
-        self.btn_undo = None
-        self.btn_reset = None
-        if edit_count >= 1:
-            self.btn_undo = QPushButton("Undo last" if edit_count >= 2 else "Undo last edit")
-            self.btn_undo.setAutoDefault(False)
-            self.btn_undo.clicked.connect(lambda: self._trigger_special("undo"))
-            btn_row.addWidget(self.btn_undo)
-            if edit_count >= 2:
-                self.btn_reset = QPushButton("Reset all")
-                self.btn_reset.setAutoDefault(False)
-                self.btn_reset.clicked.connect(lambda: self._trigger_special("reset_edits"))
-                btn_row.addWidget(self.btn_reset)
-        btn_row.addStretch(1)
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        btn_row.addWidget(buttons)
-        layout.addLayout(btn_row)
-        self.name_edit.setFocus()
-        self.name_edit.selectAll()
-
-    def _trigger_special(self, kind: str):
-        self._special_action = kind
-        self.accept()
-
-    def _sync_name_enabled(self):
-        if self.action_combo is None:
-            return
-        kind, _ = self.action_combo.currentData() or ("keep", "")
-        self.name_edit.setEnabled(kind == "keep")
-
-    def result_action(self) -> tuple[str, str, str]:
-        """Return `(kind, target_cid, new_name)` where `kind` is `'keep' | 'merge' | 'dissolve' | 'undo' | 'reset_edits'`."""
-        if self._special_action:
-            return self._special_action, "", ""
-        if self.action_combo is not None:
-            kind, target = self.action_combo.currentData() or ("keep", "")
-        else:
-            kind, target = "keep", ""
-        return kind, target, self.name_edit.text().strip()
+    def value(self) -> str:
+        return self.edit.text().strip()
 
 
 class RenameSpeakersDialog(QDialog):
-    def __init__(self, speakers: list[tuple[str, str]], can_dissolve_fn=None, edit_count: int = 0, parent=None):
+    """Clean dark-themed dialog to rename all detected speakers at once."""
+
+    def __init__(self, speakers: list[tuple[str, str]], edit_count: int = 0, parent=None):
         super().__init__(parent)
         self._special_action = ""  # "", "undo", "reset_edits"
-        self.setWindowTitle(f"{APP_NAME} - Manage Speakers")
-        self.setMinimumWidth(460)
-        self.setStyleSheet("")
+        self.setWindowTitle(f"{APP_NAME} - Rename Speakers")
+        self.setMinimumWidth(360)
+        self.setStyleSheet(DARK_DIALOG_STYLE)
         self.setWindowFlag(Qt.WindowStaysOnTopHint, True)
 
         layout = QVBoxLayout(self)
-        hint = QLabel("Rename speakers, merge a split speaker into another, or reassign overlap clusters.")
+        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setSpacing(10)
+
+        hint = QLabel("Assign names to speakers. Click any speaker badge in the transcript to merge or reassign.")
+        hint.setObjectName("hint")
         hint.setWordWrap(True)
         layout.addWidget(hint)
 
         form = QFormLayout()
+        form.setSpacing(8)
         self.inputs: dict[str, QLineEdit] = {}
-        self.actions: dict[str, QComboBox] = {}
-        multi = len(speakers) >= 2
         for cid, name in speakers:
-            lbl = QLabel(f"<b>{html.escape(cid)}</b>")
-            lbl.setStyleSheet(f"color: {_speaker_color(cid)};")
+            lbl = QLabel(f'<b style="color:{_speaker_color(cid)}">{html.escape(cid)}</b>')
             edit = QLineEdit("" if name == cid else name)
             edit.setPlaceholderText(cid)
+            form.addRow(lbl, edit)
             self.inputs[cid] = edit
-            if multi:
-                row = QHBoxLayout()
-                row.setContentsMargins(0, 0, 0, 0)
-                row.setSpacing(6)
-                row.addWidget(edit, 1)
-                combo = QComboBox()
-                combo.addItem("Keep", ("keep", ""))
-                for ocid, oname in speakers:
-                    if ocid == cid:
-                        continue
-                    olbl = f"Merge → {oname}" if oname and oname != ocid else f"Merge → {ocid}"
-                    combo.addItem(olbl, ("merge", ocid))
-                if can_dissolve_fn and can_dissolve_fn(cid) and len(speakers) >= 3:
-                    combo.addItem("Reassign (overlap)", ("dissolve", ""))
-                combo.currentIndexChanged.connect(
-                    lambda _idx, e=edit, cb=combo: e.setEnabled((cb.currentData() or ("keep", ""))[0] == "keep")
-                )
-                row.addWidget(combo)
-                self.actions[cid] = combo
-                wrap = QWidget()
-                wrap.setLayout(row)
-                form.addRow(lbl, wrap)
-            else:
-                form.addRow(lbl, edit)
         layout.addLayout(form)
 
         btn_row = QHBoxLayout()
         self.btn_undo = None
         self.btn_reset = None
         if edit_count >= 1:
-            self.btn_undo = QPushButton("Undo last" if edit_count >= 2 else "Undo last edit")
+            self.btn_undo = QPushButton("Undo last" if edit_count >= 2 else "Undo merge")
+            self.btn_undo.setObjectName("subtle")
             self.btn_undo.setAutoDefault(False)
             self.btn_undo.clicked.connect(lambda: self._trigger_special("undo"))
             btn_row.addWidget(self.btn_undo)
             if edit_count >= 2:
-                self.btn_reset = QPushButton("Reset all")
+                self.btn_reset = QPushButton("Reset edits")
+                self.btn_reset.setObjectName("subtle")
                 self.btn_reset.setAutoDefault(False)
                 self.btn_reset.clicked.connect(lambda: self._trigger_special("reset_edits"))
                 btn_row.addWidget(self.btn_reset)
         btn_row.addStretch(1)
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        btn_row.addWidget(buttons)
+        btn_cancel = QPushButton("Cancel")
+        btn_cancel.clicked.connect(self.reject)
+        btn_save = QPushButton("Save")
+        btn_save.setObjectName("primary")
+        btn_save.setDefault(True)
+        btn_save.clicked.connect(self.accept)
+        btn_row.addWidget(btn_cancel)
+        btn_row.addWidget(btn_save)
         layout.addLayout(btn_row)
 
     def _trigger_special(self, kind: str):
@@ -344,22 +312,7 @@ class RenameSpeakersDialog(QDialog):
         return self._special_action
 
     def values(self) -> dict[str, str]:
-        return {
-            cid: edit.text().strip()
-            for cid, edit in self.inputs.items()
-            if cid not in self.actions or (self.actions[cid].currentData() or ("keep", ""))[0] == "keep"
-        }
-
-    def merge_and_dissolve_actions(self) -> tuple[list[tuple[str, str]], list[str]]:
-        merges: list[tuple[str, str]] = []
-        dissolves: list[str] = []
-        for cid, combo in self.actions.items():
-            kind, target = combo.currentData() or ("keep", "")
-            if kind == "merge" and target and target != cid:
-                merges.append((cid, target))
-            elif kind == "dissolve":
-                dissolves.append(cid)
-        return merges, dissolves
+        return {cid: edit.text().strip() for cid, edit in self.inputs.items()}
 
 
 class Bridge(QObject):
@@ -528,7 +481,7 @@ class EloquentWidget(QWidget):
         v.addWidget(self.panel, 1)
 
         self.gen_menu = QMenu(self)
-        self.act_rename = self.gen_menu.addAction("Rename / merge speakers…", self.rename_speakers)
+        self.act_rename = self.gen_menu.addAction("Rename speakers…", self.rename_speakers)
         self.act_rename_sep = self.gen_menu.addSeparator()
         for fmt in REPORT_FORMATS:
             self.gen_menu.addAction(fmt["label"], lambda fid=fmt["id"]: self._trigger_gen(fid))
@@ -969,53 +922,104 @@ class EloquentWidget(QWidget):
         self.act_rename_sep.setVisible(multi)
         self.gen_menu.exec(self.btn_gen.mapToGlobal(QPoint(0, self.btn_gen.height())))
 
+    def _build_speaker_menu(self, spk_id: str) -> QMenu:
+        """Build the 1-click dark popover menu shown when clicking a speaker badge."""
+        cur = self.engine.state.display_speaker(spk_id) or spk_id
+        src_anchors = self.engine.speaker_anchor_ids(spk_id)
+        others = [
+            (cid, name, self.engine.speaker_anchor_ids(cid))
+            for cid, name in self.engine.state.speakers()
+            if cid != spk_id
+        ]
+        can_dissolve = self.engine.can_dissolve_speaker(spk_id) and len(others) >= 2
+        edit_count = self.engine.speaker_edit_count()
+
+        menu = QMenu(self)
+        safe_cur = cur.replace("&", "&&")
+        act_ren = menu.addAction(f'Rename "{safe_cur}"…')
+        act_ren.triggered.connect(
+            lambda _c=False, sid=spk_id, cname=cur, anc=src_anchors: self._rename_one_speaker(sid, cname, anc)
+        )
+
+        if others:
+            merge_sub = menu.addMenu("Merge into")
+            for ocid, oname, oanc in others:
+                olbl = f"{oname} ({ocid})" if (oname and oname != ocid) else ocid
+                act_m = merge_sub.addAction(_speaker_dot_icon(_speaker_color(ocid)), olbl.replace("&", "&&"))
+                act_m.triggered.connect(
+                    lambda _c=False, s=spk_id, sa=src_anchors, sn=cur, d=ocid, da=oanc, dn=oname:
+                        self._merge_one_speaker(s, sa, sn, d, da, dn)
+                )
+            if can_dissolve:
+                act_dis = menu.addAction("Reassign overlap turns")
+                act_dis.triggered.connect(
+                    lambda _c=False, s=spk_id, sa=src_anchors, sn=cur: self._dissolve_one_speaker(s, sa, sn)
+                )
+
+        if edit_count >= 1:
+            menu.addSeparator()
+            act_u = menu.addAction("Undo last speaker change")
+            act_u.triggered.connect(self._undo_speaker_edit)
+            if edit_count >= 2:
+                act_r = menu.addAction("Reset speaker edits")
+                act_r.triggered.connect(self._reset_speaker_edits)
+        return menu
+
+    def _rename_one_speaker(self, spk_id: str, cur_name: str, src_anchors: list[int]):
+        live_id = self.engine.resolve_speaker_from_anchors(spk_id, src_anchors)
+        dlg = _RenameSpeakerDialog(live_id, self.engine.state.display_speaker(live_id) or cur_name, self)
+        if dlg.exec():
+            self.engine.rename_speakers({live_id: dlg.value()})
+            self._rebuild()
+
+    def _merge_one_speaker(self, src_id: str, src_anchors: list[int], src_name: str,
+                           dst_id: str, dst_anchors: list[int], dst_name: str):
+        if self.engine.merge_speakers(src_id, dst_id, src_anchors=src_anchors, dst_anchors=dst_anchors):
+            self._rebuild()
+            self._caption(f"Merged {src_name} into {dst_name}", "hint")
+            self.caption_reset.start()
+
+    def _dissolve_one_speaker(self, src_id: str, src_anchors: list[int], src_name: str):
+        if self.engine.dissolve_speaker(src_id, src_anchors=src_anchors):
+            self._rebuild()
+            self._caption(f"Reassigned {src_name} turns to closest speakers", "hint")
+            self.caption_reset.start()
+
+    def _undo_speaker_edit(self):
+        if self.engine.undo_last_speaker_edit():
+            self._rebuild()
+            self._caption("Undid last speaker change", "hint")
+            self.caption_reset.start()
+
+    def _reset_speaker_edits(self):
+        if self.engine.reset_speaker_edits():
+            self._rebuild()
+            self._caption("Reset all speaker edits", "hint")
+            self.caption_reset.start()
+
     def _on_anchor(self, url: QUrl):
         raw = url.toString()
         if not raw.startswith("spk:"):
             return
         spk_id = urllib.parse.unquote(raw[4:])
-        cur = self.engine.state.display_speaker(spk_id) or spk_id
-        others = [(cid, name) for cid, name in self.engine.state.speakers() if cid != spk_id]
-        dlg = SpeakerActionDialog(
-            spk_id, cur, others,
-            can_dissolve=self.engine.can_dissolve_speaker(spk_id),
-            edit_count=self.engine.speaker_edit_count(),
-            parent=self,
-        )
-        if not dlg.exec():
-            return
-        kind, target_cid, new_name = dlg.result_action()
-        if kind == "undo":
-            self.engine.undo_last_speaker_edit()
-        elif kind == "reset_edits":
-            self.engine.reset_speaker_edits()
-        elif kind == "merge" and target_cid:
-            self.engine.merge_speakers(spk_id, target_cid)
-        elif kind == "dissolve":
-            self.engine.dissolve_speaker(spk_id)
-        else:
-            self.engine.rename_speakers({spk_id: new_name})
+        menu = self._build_speaker_menu(spk_id)
+        menu.exec(QCursor.pos())
 
     def rename_speakers(self):
         speakers = self.engine.state.speakers()
         edit_count = self.engine.speaker_edit_count()
         if not speakers and edit_count == 0:
             return
-        dlg = RenameSpeakersDialog(
-            speakers,
-            can_dissolve_fn=self.engine.can_dissolve_speaker,
-            edit_count=edit_count,
-            parent=self,
-        )
+        dlg = RenameSpeakersDialog(speakers, edit_count=edit_count, parent=self)
         if dlg.exec():
             special = dlg.special_action()
             if special == "undo":
-                self.engine.undo_last_speaker_edit()
+                self._undo_speaker_edit()
             elif special == "reset_edits":
-                self.engine.reset_speaker_edits()
+                self._reset_speaker_edits()
             else:
-                merges, dissolves = dlg.merge_and_dissolve_actions()
-                self.engine.apply_speaker_actions(dlg.values(), merges, dissolves)
+                self.engine.rename_speakers(dlg.values())
+                self._rebuild()
 
     def _show_view_context_menu(self, pos: QPoint):
         menu = self.view.createStandardContextMenu(pos)
