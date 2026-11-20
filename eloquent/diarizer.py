@@ -561,16 +561,228 @@ class SpeakerClusterer:
 
     def __init__(self, merge_threshold: float = MERGE_THRESHOLD,
                  min_confirm_dur: float = MIN_CONFIRM_DUR,
-                 arabic_mode: bool = False):
+                 arabic_mode: bool = False,
+                 max_speakers: int = 0):
         self.merge_threshold = merge_threshold
         self.min_confirm_dur = min_confirm_dur
         self.arabic_mode = arabic_mode
+        self.max_speakers = int(max_speakers) if int(max_speakers or 0) >= 2 else 0
         self.turns: list[dict] = []  # {"id", "t0", "dur", "vec", "subs", "speaker", "bridge"}
         self._centroids: list[tuple[str, np.ndarray]] = []
         self._established: list[tuple[str, np.ndarray, float, int]] = []
+        self._must_link_sets: list[set[int]] = []
+        self._merged_protos: list[tuple[np.ndarray, np.ndarray, set[int]]] = []
+        self._dissolved_prev_bridge: dict[int, bool] = {}
+        self._edit_history: list[tuple[
+            list[set[int]],
+            list[tuple[np.ndarray, np.ndarray, set[int]]],
+            dict[int, bool],
+            dict[str, list[int]],
+            dict[str, str],
+        ]] = []
 
     def known_centroids(self) -> list[tuple[str, np.ndarray]]:
         return list(self._centroids)
+
+    def has_speaker(self, label: str) -> bool:
+        return any(t.get("speaker") == label for t in self.turns)
+
+    def speaker_count(self) -> int:
+        return len({t.get("speaker") for t in self.turns if t.get("speaker")})
+
+    def manual_edit_count(self) -> int:
+        if self._edit_history:
+            return len(self._edit_history)
+        return 1 if (self._must_link_sets or self._merged_protos or self._dissolved_prev_bridge) else 0
+
+    def _push_edit_snapshot(self, old_by_spk: dict[str, list[int]], old_names: dict[str, str]) -> None:
+        snap = (
+            [set(s) for s in self._must_link_sets],
+            [(sv, dv, set(ids)) for sv, dv, ids in self._merged_protos],
+            dict(self._dissolved_prev_bridge),
+            {k: list(v) for k, v in old_by_spk.items()},
+            dict(old_names),
+        )
+        self._edit_history.append(snap)
+        if len(self._edit_history) > 25:
+            del self._edit_history[:-25]
+
+    def _speaker_turn_ids(self) -> dict[str, list[int]]:
+        by_spk: dict[str, list[int]] = {}
+        for t in self.turns:
+            sp = t.get("speaker")
+            if sp:
+                by_spk.setdefault(sp, []).append(t["id"])
+        return by_spk
+
+    @staticmethod
+    def _remap_names(old_by_spk: dict[str, list[int]],
+                     new_mapping: dict[int, str],
+                     old_names: dict[str, str],
+                     merged: Optional[tuple[str, str]] = None,
+                     dissolved: Optional[str] = None) -> dict[str, str]:
+        """Keep custom display names aligned with their real clusters after renumbering."""
+        if not old_names:
+            return {}
+        new_names: dict[str, str] = {}
+        items = list(old_names.items())
+        if merged is not None:
+            src, dst = merged
+            dst_name = old_names.get(dst, "") or old_names.get(src, "")
+            items = [(cid, nm) for cid, nm in items if cid not in (src, dst)]
+            if dst_name:
+                items.insert(0, (dst, dst_name))
+        if dissolved is not None:
+            items = [(cid, nm) for cid, nm in items if cid != dissolved]
+
+        for old_cid, custom_name in items:
+            if not custom_name:
+                continue
+            tids = old_by_spk.get(old_cid, [])
+            if not tids:
+                if old_cid not in new_names:
+                    new_names[old_cid] = custom_name
+                continue
+            counts: dict[str, int] = {}
+            for tid in tids:
+                ncid = new_mapping.get(tid)
+                if ncid:
+                    counts[ncid] = counts.get(ncid, 0) + 1
+            if counts:
+                best_ncid = max(counts.items(), key=lambda kv: kv[1])[0]
+                if best_ncid not in new_names and custom_name != best_ncid:
+                    new_names[best_ncid] = custom_name
+        return new_names
+
+    def _vec_centroid_for_ids(self, turn_ids: set[int]) -> Optional[np.ndarray]:
+        wv = [t["vec"] * min(4.0, max(0.5, t["dur"])) for t in self.turns if t["id"] in turn_ids]
+        if not wv:
+            return None
+        c = np.sum(np.stack(wv), axis=0)
+        nrm = float(np.linalg.norm(c))
+        if nrm < 1e-8:
+            return None
+        return (c / nrm).astype(np.float32)
+
+    def merge_speakers(self, src_label: str, dst_label: str,
+                       old_names: Optional[dict[str, str]] = None
+                       ) -> tuple[dict[int, str], dict[str, str]]:
+        """Permanently merge *src_label* into *dst_label* across past and future turns."""
+        if not src_label or not dst_label or src_label == dst_label:
+            return {}, dict(old_names or {})
+        old_by_spk = self._speaker_turn_ids()
+        src_ids = set(old_by_spk.get(src_label, ()))
+        dst_ids = set(old_by_spk.get(dst_label, ()))
+        if not src_ids or not dst_ids:
+            return {}, dict(old_names or {})
+        self._push_edit_snapshot(old_by_spk, old_names or {})
+
+        src_vec = self._vec_centroid_for_ids(src_ids)
+        dst_vec = self._vec_centroid_for_ids(dst_ids)
+        if src_vec is not None and dst_vec is not None:
+            self._merged_protos.append((src_vec, dst_vec, set(dst_ids)))
+
+        combined = src_ids | dst_ids
+        kept_sets: list[set[int]] = []
+        for existing in self._must_link_sets:
+            if not existing.isdisjoint(combined):
+                combined |= existing
+            else:
+                kept_sets.append(existing)
+        kept_sets.append(combined)
+        self._must_link_sets = kept_sets
+
+        mapping = self._recluster()
+        remapped = self._remap_names(old_by_spk, mapping, old_names or {}, merged=(src_label, dst_label))
+        return mapping, remapped
+
+    def dissolve_speaker(self, src_label: str,
+                         old_names: Optional[dict[str, str]] = None
+                         ) -> tuple[dict[int, str], dict[str, str]]:
+        """Mark *src_label* as overlap/clash turns and reassign each turn to its closest remaining speaker."""
+        if not src_label or self.speaker_count() < 2:
+            return {}, dict(old_names or {})
+        old_by_spk = self._speaker_turn_ids()
+        src_ids = set(old_by_spk.get(src_label, ()))
+        if not src_ids:
+            return {}, dict(old_names or {})
+        self._push_edit_snapshot(old_by_spk, old_names or {})
+        for t in self.turns:
+            if t["id"] in src_ids:
+                if t["id"] not in self._dissolved_prev_bridge:
+                    self._dissolved_prev_bridge[t["id"]] = bool(t.get("bridge", False))
+                t["bridge"] = True
+        self._must_link_sets = [s - src_ids for s in self._must_link_sets if len(s - src_ids) >= 2]
+        mapping = self._recluster()
+        remapped = self._remap_names(old_by_spk, mapping, old_names or {}, dissolved=src_label)
+        return mapping, remapped
+
+    def undo_last_speaker_edit(self, old_names: Optional[dict[str, str]] = None
+                               ) -> tuple[dict[int, str], dict[str, str]]:
+        """Revert the most recent manual merge or overlap reassignment."""
+        if not self._edit_history:
+            return self.reset_speaker_edits(old_names=old_names)
+        cur_by_spk = self._speaker_turn_ids()
+        prev_links, prev_protos, prev_dissolved, prev_by_spk, prev_names = self._edit_history.pop()
+        for t in self.turns:
+            tid = t["id"]
+            if tid in self._dissolved_prev_bridge and tid not in prev_dissolved:
+                t["bridge"] = self._dissolved_prev_bridge[tid]
+        self._must_link_sets = prev_links
+        self._merged_protos = prev_protos
+        self._dissolved_prev_bridge = prev_dissolved
+        if not self.turns:
+            return {}, dict(prev_names)
+        mapping = self._recluster()
+        remapped = self._remap_names(prev_by_spk, mapping, prev_names)
+        cur_remapped = self._remap_names(cur_by_spk, mapping, old_names or {})
+        for k, v in cur_remapped.items():
+            if k not in remapped:
+                remapped[k] = v
+        return mapping, remapped
+
+    def reset_speaker_edits(self, old_names: Optional[dict[str, str]] = None
+                            ) -> tuple[dict[int, str], dict[str, str]]:
+        """Clear all manual merges and overlap reassignments back to automatic clustering."""
+        if not (self._must_link_sets or self._merged_protos or self._dissolved_prev_bridge or self._edit_history):
+            return {}, dict(old_names or {})
+        cur_by_spk = self._speaker_turn_ids()
+        first_by_spk, first_names = (
+            (self._edit_history[0][3], self._edit_history[0][4])
+            if self._edit_history else (cur_by_spk, dict(old_names or {}))
+        )
+        for t in self.turns:
+            tid = t["id"]
+            if tid in self._dissolved_prev_bridge:
+                t["bridge"] = self._dissolved_prev_bridge[tid]
+        self._must_link_sets.clear()
+        self._merged_protos.clear()
+        self._dissolved_prev_bridge.clear()
+        self._edit_history.clear()
+        if not self.turns:
+            return {}, dict(first_names)
+        mapping = self._recluster()
+        remapped = self._remap_names(first_by_spk, mapping, first_names)
+        cur_remapped = self._remap_names(cur_by_spk, mapping, old_names or {})
+        for k, v in cur_remapped.items():
+            if k not in remapped:
+                remapped[k] = v
+        return mapping, remapped
+
+    def set_max_speakers(self, max_speakers: int,
+                         old_names: Optional[dict[str, str]] = None
+                         ) -> tuple[dict[int, str], dict[str, str]]:
+        """Update max speaker cap (0 = Auto, >= 2 caps to top K) and immediately recluster."""
+        cap = int(max_speakers) if int(max_speakers or 0) >= 2 else 0
+        if cap == self.max_speakers:
+            return {}, dict(old_names or {})
+        old_by_spk = self._speaker_turn_ids()
+        self.max_speakers = cap
+        if not self.turns:
+            return {}, dict(old_names or {})
+        mapping = self._recluster()
+        remapped = self._remap_names(old_by_spk, mapping, old_names or {})
+        return mapping, remapped
 
     def _is_overlap_bridge(self, vec: np.ndarray, dur: float) -> bool:
         """Return True when an incoming turn strongly matches two distinct established speakers at once."""
@@ -722,6 +934,50 @@ class SpeakerClusterer:
                     break
         groups = [[confirmed_sub[idx] for idx in g] for g in local_groups]
 
+        # Enforce user-confirmed speaker merges (keeps merged clusters united on future turns)
+        if self._must_link_sets and len(groups) > 1:
+            changed = True
+            while changed and len(groups) > 1:
+                changed = False
+                group_id_sets = [{self.turns[m]["id"] for m in g} for g in groups]
+                for link_set in self._must_link_sets:
+                    hits = [gi for gi, gids in enumerate(group_id_sets) if not gids.isdisjoint(link_set)]
+                    if len(hits) >= 2:
+                        base = hits[0]
+                        for gi in reversed(hits[1:]):
+                            groups[base].extend(groups[gi])
+                            del groups[gi]
+                        changed = True
+                        break
+        if self._merged_protos and len(groups) > 1:
+            changed = True
+            while changed and len(groups) > 1:
+                changed = False
+                group_id_sets = [{self.turns[m]["id"] for m in g} for g in groups]
+                group_cents = [_centroid(g) for g in groups]
+                for src_vec, dst_vec, dst_ids in self._merged_protos:
+                    dst_gi = next(
+                        (gi for gi, gids in enumerate(group_id_sets) if not gids.isdisjoint(dst_ids)),
+                        None,
+                    )
+                    if dst_gi is None:
+                        sims_d = [float(np.dot(gv, dst_vec)) for gv in group_cents]
+                        best_d = int(np.argmax(sims_d))
+                        if sims_d[best_d] >= self.merge_threshold:
+                            dst_gi = best_d
+                    if dst_gi is None:
+                        continue
+                    for gi, gv in enumerate(group_cents):
+                        if gi == dst_gi:
+                            continue
+                        if float(np.dot(gv, src_vec)) >= self.merge_threshold:
+                            groups[dst_gi].extend(groups[gi])
+                            del groups[gi]
+                            changed = True
+                            break
+                    if changed:
+                        break
+
         if self.arabic_mode:
             multi_major = [
                 g for g in groups
@@ -768,6 +1024,31 @@ class SpeakerClusterer:
                         attached.append([])
             groups = kept
 
+        # Optional user-configured speaker cap: keep top K strongest clusters and attach
+        # extra clusters' turns individually to their closest real speaker without centroid drift
+        if self.max_speakers >= 2 and len(groups) > self.max_speakers:
+            ranked = sorted(
+                range(len(groups)),
+                key=lambda gi: (
+                    sum(self.turns[m]["dur"] for m in groups[gi]),
+                    len(groups[gi]),
+                    -min(self.turns[m]["t0"] for m in groups[gi]),
+                ),
+                reverse=True,
+            )
+            keep_set = set(ranked[:self.max_speakers])
+            kept_g = [groups[gi] for gi in range(len(groups)) if gi in keep_set]
+            kept_a = [attached[gi] for gi in range(len(groups)) if gi in keep_set]
+            kept_c = [_centroid(g) for g in kept_g]
+            for gi in range(len(groups)):
+                if gi in keep_set:
+                    continue
+                for m in groups[gi] + attached[gi]:
+                    v = self.turns[m]["vec"]
+                    bi = int(np.argmax([float(np.dot(v, kv)) for kv in kept_c]))
+                    kept_a[bi].append(m)
+            groups, attached = kept_g, kept_a
+
         # Build cluster centroids and order stably by earliest turn appearance
         comp = []
         for members, extra in zip(groups, attached):
@@ -803,6 +1084,17 @@ class SpeakerClusterer:
             self.turns[m]["speaker"] = best_lbl
             id_to_spk[self.turns[m]["id"]] = best_lbl
 
+        # Ensure short turns explicitly merged by the user stay with their merged cluster
+        if self._must_link_sets:
+            for link_set in self._must_link_sets:
+                linked_labels = [id_to_spk[tid] for tid in link_set if tid in id_to_spk]
+                if linked_labels:
+                    target_lbl = max(set(linked_labels), key=linked_labels.count)
+                    for t in self.turns:
+                        if t["id"] in link_set and t["id"] not in id_to_spk:
+                            t["speaker"] = target_lbl
+                            id_to_spk[t["id"]] = target_lbl
+
         # Attach ultra-short utterances (< min_confirm_dur) to closest cluster or neighbor
         last_spk = "Speaker 1"
         for t in self.turns:
@@ -829,13 +1121,15 @@ class SpeakerClusterer:
 # Background worker thread integrated with Engine / State / Session
 # --------------------------------------------------------------------------- #
 class Diarizer(threading.Thread):
-    def __init__(self, extractor, state, session=None, log=print, arabic_mode: bool = False):
+    def __init__(self, extractor, state, session=None, log=print,
+                 arabic_mode: bool = False, max_speakers: int = 0):
         super().__init__(daemon=True, name="eloquent-diarizer")
         self.extractor = extractor
         self.state = state
         self.session = session
         self.log = log
-        self.clusterer = SpeakerClusterer(arabic_mode=arabic_mode)
+        self.clusterer = SpeakerClusterer(arabic_mode=arabic_mode, max_speakers=max_speakers)
+        self._cluster_lock = threading.Lock()
         self.q: "queue.Queue[Optional[tuple]]" = queue.Queue()
         self._stop_flag = False
         self._sync_needed = False
@@ -845,6 +1139,61 @@ class Diarizer(threading.Thread):
         if self.extractor is None:
             return
         self.q.put((seg_id, start_sec, stamp, samples, text, words))
+
+    def has_speaker(self, label: str) -> bool:
+        with self._cluster_lock:
+            return self.clusterer.has_speaker(label)
+
+    def speaker_count(self) -> int:
+        with self._cluster_lock:
+            return self.clusterer.speaker_count()
+
+    def manual_edit_count(self) -> int:
+        with self._cluster_lock:
+            return self.clusterer.manual_edit_count()
+
+    def merge_speakers(self, src_label: str, dst_label: str,
+                       old_names: Optional[dict[str, str]] = None
+                       ) -> tuple[dict[int, str], dict[str, str]]:
+        with self._cluster_lock:
+            mapping, remapped = self.clusterer.merge_speakers(src_label, dst_label, old_names=old_names)
+            if mapping:
+                self._sync_needed = True
+            return mapping, remapped
+
+    def dissolve_speaker(self, src_label: str,
+                         old_names: Optional[dict[str, str]] = None
+                         ) -> tuple[dict[int, str], dict[str, str]]:
+        with self._cluster_lock:
+            mapping, remapped = self.clusterer.dissolve_speaker(src_label, old_names=old_names)
+            if mapping:
+                self._sync_needed = True
+            return mapping, remapped
+
+    def undo_last_speaker_edit(self, old_names: Optional[dict[str, str]] = None
+                               ) -> tuple[dict[int, str], dict[str, str]]:
+        with self._cluster_lock:
+            mapping, remapped = self.clusterer.undo_last_speaker_edit(old_names=old_names)
+            if mapping:
+                self._sync_needed = True
+            return mapping, remapped
+
+    def reset_speaker_edits(self, old_names: Optional[dict[str, str]] = None
+                            ) -> tuple[dict[int, str], dict[str, str]]:
+        with self._cluster_lock:
+            mapping, remapped = self.clusterer.reset_speaker_edits(old_names=old_names)
+            if mapping:
+                self._sync_needed = True
+            return mapping, remapped
+
+    def set_max_speakers(self, max_speakers: int,
+                         old_names: Optional[dict[str, str]] = None
+                         ) -> tuple[dict[int, str], dict[str, str]]:
+        with self._cluster_lock:
+            mapping, remapped = self.clusterer.set_max_speakers(max_speakers, old_names=old_names)
+            if mapping:
+                self._sync_needed = True
+            return mapping, remapped
 
     def run(self) -> None:
         _lower_thread_priority()
@@ -864,28 +1213,33 @@ class Diarizer(threading.Thread):
 
     def _process_item(self, seg_id: int, start_sec: float, stamp: str,
                       samples: np.ndarray, text: str, words: list[dict]) -> None:
+        with self._cluster_lock:
+            known = self.clusterer.known_centroids()
         parts = split_segment_by_speaker(
-            samples, words, self._embed, known_speakers=self.clusterer.known_centroids(), text=text,
+            samples, words, self._embed, known_speakers=known, text=text,
         )
         if not parts:
-            fallback = self.clusterer.turns[-1]["speaker"] if self.clusterer.turns else "Speaker 1"
+            with self._cluster_lock:
+                fallback = self.clusterer.turns[-1]["speaker"] if self.clusterer.turns else "Speaker 1"
             self.state.apply_diarization(seg_id, [(seg_id, stamp, start_sec, text, fallback)], {})
             return
 
         if len(parts) == 1:
             sa, sb, ptxt, vec, vdur, subs = parts[0]
-            spk, mapping = self.clusterer.add_and_cluster(seg_id, start_sec, vdur, vec, subs)
+            with self._cluster_lock:
+                spk, mapping = self.clusterer.add_and_cluster(seg_id, start_sec, vdur, vec, subs)
             entries = [(seg_id, stamp, start_sec, ptxt or text, spk)]
         else:
             from .state import fmt_time
             entries = []
             mapping = {}
-            for idx, (sa, sb, ptxt, vec, vdur, subs) in enumerate(parts):
-                sub_start = start_sec + sa / SAMPLE_RATE
-                sub_stamp = stamp if idx == 0 else fmt_time(sub_start)
-                turn_id = seg_id if idx == 0 else self.state.alloc_turn_id()
-                spk, mapping = self.clusterer.add_and_cluster(turn_id, sub_start, vdur, vec, subs)
-                entries.append((turn_id, sub_stamp, sub_start, ptxt, spk))
+            with self._cluster_lock:
+                for idx, (sa, sb, ptxt, vec, vdur, subs) in enumerate(parts):
+                    sub_start = start_sec + sa / SAMPLE_RATE
+                    sub_stamp = stamp if idx == 0 else fmt_time(sub_start)
+                    turn_id = seg_id if idx == 0 else self.state.alloc_turn_id()
+                    spk, mapping = self.clusterer.add_and_cluster(turn_id, sub_start, vdur, vec, subs)
+                    entries.append((turn_id, sub_stamp, sub_start, ptxt, spk))
 
         self.state.apply_diarization(seg_id, entries, mapping)
         self._sync_needed = True

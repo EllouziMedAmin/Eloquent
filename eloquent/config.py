@@ -57,6 +57,7 @@ class Settings:
     speech_language: str = "parakeet"  # "parakeet" (25 European languages) | "arabic" (Cohere Arabic GGUF)
     threads: int = 0                  # 0 = auto
     diarize: bool = True              # background multi-speaker identification (Speaker 1, 2, ...)
+    max_speakers: int = 0             # 0 = Auto (unlimited), >= 2 caps active speakers to top K
     audio_source: str = "mic"         # "mic" | "system" | "both"
     device: Optional[int] = None      # None = system default microphone
     loopback_device: Optional[str] = None  # None = default Windows playback speakers
@@ -97,6 +98,11 @@ class Settings:
                 if k in names:
                     setattr(s, k, v)
             s.speech_language = normalize_speech_language(s.speech_language)
+            try:
+                ms = int(s.max_speakers or 0)
+            except (TypeError, ValueError):
+                ms = 0
+            s.max_speakers = ms if ms >= 2 else 0
         except FileNotFoundError:
             pass
         except Exception as e:  # corrupted file: keep defaults, do not crash

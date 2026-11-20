@@ -518,6 +518,30 @@ class SettingsDialog(QDialog):
         lay.addWidget(_label("Labels speakers on 1 background thread so live caption speed is unaffected.",
                              "hint", wrap=True))
 
+        self.max_speakers = QComboBox()
+        max_opts = [(0, "Auto (detect automatically)")] + [(k, f"{k} speakers") for k in (2, 3, 4, 5, 6, 8)]
+        cur_max = int(getattr(s, "max_speakers", 0) or 0)
+        if cur_max >= 2 and all(v != cur_max for v, _ in max_opts):
+            max_opts.append((cur_max, f"{cur_max} speakers"))
+            max_opts.sort(key=lambda kv: kv[0])
+        for val, lbl in max_opts:
+            self.max_speakers.addItem(lbl, val)
+        idx_max = self.max_speakers.findData(cur_max if cur_max >= 2 else 0)
+        self.max_speakers.setCurrentIndex(max(0, idx_max))
+        self.max_speakers.setEnabled(s.diarize)
+        self.diarize.toggled.connect(self.max_speakers.setEnabled)
+        ms_box = QWidget()
+        ms_col = QVBoxLayout(ms_box)
+        ms_col.setContentsMargins(0, 0, 0, 0)
+        ms_col.setSpacing(5)
+        ms_col.addWidget(_label("Maximum speakers"))
+        ms_col.addWidget(self.max_speakers)
+        ms_col.addWidget(_label(
+            "Leave on Auto for unknown groups, or pick a fixed limit (e.g. 3) to prevent extra phantom speakers during noisy debates. Applies live.",
+            "hint", wrap=True,
+        ))
+        lay.addWidget(ms_box)
+
         row = QHBoxLayout()
         self.folder = QLineEdit(str(s.resolved_sessions_dir()))
         browse = QPushButton("Browse…")
@@ -720,6 +744,7 @@ class SettingsDialog(QDialog):
         s.custom_vocabulary = self.vocabulary()
         s.save_audio = self.audio.isChecked()
         s.diarize = self.diarize.isChecked()
+        s.max_speakers = int(self.max_speakers.currentData() or 0)
         s.speech_language = normalize_speech_language(self.speech_lang.currentData())
         s.audio_source = self.source.currentData() or "mic"
         s.device = self.mic.currentData()

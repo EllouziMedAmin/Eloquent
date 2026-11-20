@@ -84,6 +84,7 @@ class Engine:
         self.vad_path = None
         self.extractor = None
         self.diarizer = None
+        self._last_clusterer = None
         self.provider = None
         self.dict_provider = None
         self.compose_provider = None
@@ -196,9 +197,10 @@ class Engine:
                 self.log(f"[diarize] Disabled ({type(e).__name__}: {e})", "warn")
 
     def sync_diarizer(self):
-        """Lazy-load speaker extractor in the background if diarization was toggled ON after startup."""
+        """Lazy-load speaker extractor if enabled and propagate live max_speakers changes."""
         if self.settings.diarize and self._loaded and self.extractor is None:
             threading.Thread(target=self._load_speaker_extractor, daemon=True, name="eloquent-diar-load").start()
+        self.set_max_speakers(getattr(self.settings, "max_speakers", 0))
 
     def clear_compose_history(self):
         self.compose_history.clear()
@@ -281,6 +283,7 @@ class Engine:
         self._paste_on_stop = paste_mode
 
         self.state.reset()
+        self._last_clusterer = None
         if paste_mode:
             self.session = None
         else:
@@ -292,6 +295,7 @@ class Engine:
         self.diarizer = Diarizer(
             self.extractor, self.state, self.session, log=self.log,
             arabic_mode=is_arabic_speech(s.resolved_speech_language()),
+            max_speakers=getattr(s, "max_speakers", 0),
         ) if (use_diar and self.extractor is not None) else None
         if self.diarizer is not None:
             self.diarizer.start()
@@ -650,6 +654,8 @@ class Engine:
             if self.diarizer is not None or self.state.snapshot().get("multi_speaker"):
                 self.session.sync_from_state(self.state)
             self.session.close()
+        if self.diarizer is not None:
+            self._last_clusterer = self.diarizer.clusterer
         self.diarizer = None
         d = str(self.session.dir) if self.session is not None else ""
         mode = self.session_mode
@@ -670,13 +676,191 @@ class Engine:
     # ------------------------------------------------------------------ #
     # speaker naming & post-session document generation
     # ------------------------------------------------------------------ #
-    def rename_speakers(self, names: dict[str, str]):
-        """Rename speakers in State and sync raw.txt / clean.txt on disk."""
-        self.state.rename_speakers(names)
+    def _sync_session_files(self):
         if self.session is not None and not self.session.raw_f.closed:
             self.session.sync_from_state(self.state)
         elif self.last_session_dir:
             write_session_files(Path(self.last_session_dir), self.state)
+
+    def rename_speakers(self, names: dict[str, str]):
+        """Rename speakers in State and sync raw.txt / clean.txt on disk."""
+        self.state.rename_speakers(names)
+        self._sync_session_files()
+
+    def can_dissolve_speaker(self, spk_cid: str) -> bool:
+        """Return True when *spk_cid* has voiceprints and at least 2 diarized speakers exist."""
+        if not spk_cid:
+            return False
+        diar = self.diarizer
+        if diar is not None:
+            return diar.has_speaker(spk_cid) and diar.speaker_count() >= 2
+        cl = self._last_clusterer
+        if cl is not None:
+            return cl.has_speaker(spk_cid) and cl.speaker_count() >= 2
+        return False
+
+    def merge_speakers(self, src_cid: str, dst_cid: str) -> bool:
+        """Merge *src_cid* into *dst_cid* (live voiceprint merge when available, else State merge)."""
+        if not src_cid or not dst_cid or src_cid == dst_cid:
+            return False
+        old_names = self.state.speaker_names_copy()
+        diar = self.diarizer
+        if diar is not None and diar.has_speaker(src_cid) and diar.has_speaker(dst_cid):
+            mapping, remapped = diar.merge_speakers(src_cid, dst_cid, old_names=old_names)
+            if mapping:
+                self.state.apply_cluster_remap(mapping, remapped)
+                self._sync_session_files()
+                return True
+        cl = self._last_clusterer
+        if diar is None and cl is not None and cl.has_speaker(src_cid) and cl.has_speaker(dst_cid):
+            mapping, remapped = cl.merge_speakers(src_cid, dst_cid, old_names=old_names)
+            if mapping:
+                self.state.apply_cluster_remap(mapping, remapped)
+                self._sync_session_files()
+                return True
+        if self.state.merge_speakers_fallback(src_cid, dst_cid):
+            self._sync_session_files()
+            return True
+        return False
+
+    def dissolve_speaker(self, src_cid: str) -> bool:
+        """Reassign a clash/overlap speaker's turns individually to the closest remaining speakers."""
+        if not src_cid:
+            return False
+        old_names = self.state.speaker_names_copy()
+        diar = self.diarizer
+        if diar is not None and diar.has_speaker(src_cid) and diar.speaker_count() >= 2:
+            mapping, remapped = diar.dissolve_speaker(src_cid, old_names=old_names)
+            if mapping:
+                self.state.apply_cluster_remap(mapping, remapped)
+                self._sync_session_files()
+                return True
+        cl = self._last_clusterer
+        if diar is None and cl is not None and cl.has_speaker(src_cid) and cl.speaker_count() >= 2:
+            mapping, remapped = cl.dissolve_speaker(src_cid, old_names=old_names)
+            if mapping:
+                self.state.apply_cluster_remap(mapping, remapped)
+                self._sync_session_files()
+                return True
+        return False
+
+    def speaker_edit_count(self) -> int:
+        """Number of reversible manual speaker merges / overlap reassignments in the active or last session."""
+        diar = self.diarizer
+        if diar is not None:
+            return diar.manual_edit_count()
+        cl = self._last_clusterer
+        if cl is not None:
+            return cl.manual_edit_count()
+        return 0
+
+    def undo_last_speaker_edit(self) -> bool:
+        """Undo the most recent manual speaker merge or overlap reassignment."""
+        old_names = self.state.speaker_names_copy()
+        diar = self.diarizer
+        if diar is not None and diar.manual_edit_count() > 0:
+            mapping, remapped = diar.undo_last_speaker_edit(old_names=old_names)
+            if mapping:
+                self.state.apply_cluster_remap(mapping, remapped)
+                self._sync_session_files()
+                return True
+            return False
+        cl = self._last_clusterer
+        if diar is None and cl is not None and cl.manual_edit_count() > 0:
+            mapping, remapped = cl.undo_last_speaker_edit(old_names=old_names)
+            if mapping:
+                self.state.apply_cluster_remap(mapping, remapped)
+                self._sync_session_files()
+                return True
+        return False
+
+    def reset_speaker_edits(self) -> bool:
+        """Reset all manual speaker merges and overlap reassignments back to automatic clustering."""
+        old_names = self.state.speaker_names_copy()
+        diar = self.diarizer
+        if diar is not None and diar.manual_edit_count() > 0:
+            mapping, remapped = diar.reset_speaker_edits(old_names=old_names)
+            if mapping:
+                self.state.apply_cluster_remap(mapping, remapped)
+                self._sync_session_files()
+                return True
+            return False
+        cl = self._last_clusterer
+        if diar is None and cl is not None and cl.manual_edit_count() > 0:
+            mapping, remapped = cl.reset_speaker_edits(old_names=old_names)
+            if mapping:
+                self.state.apply_cluster_remap(mapping, remapped)
+                self._sync_session_files()
+                return True
+        return False
+
+    def set_max_speakers(self, max_speakers: int) -> bool:
+        """Apply a new maximum speaker limit live (or to the just-finished session)."""
+        cap = int(max_speakers) if int(max_speakers or 0) >= 2 else 0
+        old_names = self.state.speaker_names_copy()
+        diar = self.diarizer
+        if diar is not None:
+            mapping, remapped = diar.set_max_speakers(cap, old_names=old_names)
+            if mapping:
+                self.state.apply_cluster_remap(mapping, remapped)
+                self._sync_session_files()
+                return True
+            return False
+        cl = self._last_clusterer
+        if cl is not None:
+            mapping, remapped = cl.set_max_speakers(cap, old_names=old_names)
+            if mapping:
+                self.state.apply_cluster_remap(mapping, remapped)
+                self._sync_session_files()
+                return True
+        return False
+
+    def apply_speaker_actions(self, renames: dict[str, str],
+                              merges: list[tuple[str, str]],
+                              dissolves: list[str]) -> None:
+        """Apply renames, merges, and overlap dissolves safely even when IDs renumber mid-batch."""
+        if renames:
+            self.rename_speakers(renames)
+        if not merges and not dissolves:
+            return
+        diar = self.diarizer
+        cl = diar.clusterer if diar is not None else self._last_clusterer
+        anchors: dict[str, list[int]] = {}
+        if cl is not None:
+            if diar is not None:
+                with diar._cluster_lock:
+                    anchors = cl._speaker_turn_ids()
+            else:
+                anchors = cl._speaker_turn_ids()
+
+        def _resolve_live(orig_cid: str, redirected: dict[str, str]) -> str:
+            if anchors.get(orig_cid) and cl is not None:
+                tids = set(anchors[orig_cid])
+                if diar is not None:
+                    with diar._cluster_lock:
+                        labels = [t.get("speaker", "") for t in cl.turns if t["id"] in tids and t.get("speaker")]
+                else:
+                    labels = [t.get("speaker", "") for t in cl.turns if t["id"] in tids and t.get("speaker")]
+                if labels:
+                    return max(set(labels), key=labels.count)
+            cur = orig_cid
+            seen = set()
+            while cur in redirected and cur not in seen:
+                seen.add(cur)
+                cur = redirected[cur]
+            return cur
+
+        redirected: dict[str, str] = {}
+        for src_orig, dst_orig in merges:
+            cur_src = _resolve_live(src_orig, redirected)
+            cur_dst = _resolve_live(dst_orig, redirected)
+            if cur_src and cur_dst and cur_src != cur_dst:
+                if self.merge_speakers(cur_src, cur_dst):
+                    redirected[src_orig] = dst_orig
+        for src_orig in dissolves:
+            cur_src = _resolve_live(src_orig, redirected)
+            if cur_src:
+                self.dissolve_speaker(cur_src)
 
     def apply_vocabulary_fix(self, wrong: str, right: str, remember: bool = True) -> int:
         """Fix a misheard word/phrase in State (+ session files) and save to custom vocabulary."""
