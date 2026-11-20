@@ -994,9 +994,12 @@ class EloquentWidget(QWidget):
 
     def _rename_one_speaker(self, spk_id: str, cur_name: str, src_anchors: list[int]):
         live_id = self.engine.resolve_speaker_from_anchors(spk_id, src_anchors)
+        if not src_anchors:
+            src_anchors = self.engine.speaker_anchor_ids(live_id)
         dlg = _RenameSpeakerDialog(live_id, self.engine.state.display_speaker(live_id) or cur_name, self)
         if dlg.exec():
-            self.engine.rename_speakers({live_id: dlg.value()})
+            target_id = self.engine.resolve_speaker_from_anchors(live_id, src_anchors)
+            self.engine.rename_speakers({target_id: dlg.value()})
             self._rebuild()
 
     def _merge_one_speaker(self, src_id: str, src_anchors: list[int], src_name: str,
@@ -1059,6 +1062,7 @@ class EloquentWidget(QWidget):
         edit_count = self.engine.speaker_edit_count()
         if not speakers and edit_count == 0:
             return
+        anchors = {cid: self.engine.speaker_anchor_ids(cid) for cid, _ in speakers}
         dlg = RenameSpeakersDialog(speakers, edit_count=edit_count, parent=self)
         if dlg.exec():
             special = dlg.special_action()
@@ -1067,7 +1071,12 @@ class EloquentWidget(QWidget):
             elif special == "reset_edits":
                 self._reset_speaker_edits()
             else:
-                self.engine.rename_speakers(dlg.values())
+                resolved = {}
+                for cid, val in dlg.values().items():
+                    target = self.engine.resolve_speaker_from_anchors(cid, anchors.get(cid, []))
+                    if target not in resolved or val:
+                        resolved[target] = val
+                self.engine.rename_speakers(resolved)
                 self._rebuild()
 
     def _show_view_context_menu(self, pos: QPoint):

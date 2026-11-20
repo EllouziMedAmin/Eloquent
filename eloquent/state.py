@@ -74,7 +74,9 @@ class State:
 
     # -- diarizer side ----------------------------------------------------
     def apply_diarization(self, seg_id: int, parts: list[tuple[int, str, float, str, str]],
-                          mapping: dict[int, str]):
+                          mapping: dict[int, str],
+                          old_by_spk: Optional[dict[str, list[int]]] = None,
+                          id_remap: Optional[dict[str, str]] = None):
         """Attach speaker labels (and any mid-chunk splits) and propagate converged cluster IDs."""
         import time
         now = time.time()
@@ -123,10 +125,53 @@ class State:
                             p["seg_ids"] = list(sids) + extra
                     break
 
-            if mapping or segs_dirty:
-                self._apply_mapping_locked(mapping)
+            if mapping or segs_dirty or id_remap:
+                self._apply_mapping_locked(mapping or {}, id_remap=id_remap)
+            if self.speaker_names and old_by_spk and mapping:
+                self._remap_speaker_names_locked(old_by_spk, mapping)
             self.rev += 1
         self.emit("speakers", seg_id)
+
+    @staticmethod
+    def _spk_sort_key(cid: str) -> tuple[int, int, str]:
+        if cid.startswith("Speaker "):
+            tail = cid[8:].strip()
+            if tail.isdigit():
+                return (0, int(tail), cid)
+        return (1, 0, cid)
+
+    def _remap_speaker_names_locked(self, old_by_spk: dict[str, list[int]], mapping: dict[int, str]):
+        """Keep custom display names aligned with their real clusters across live renumbering."""
+        if not self.speaker_names or not old_by_spk or not mapping:
+            return
+        new_names: dict[str, str] = {}
+        tracked = []
+        untracked = []
+        for old_cid, custom_name in sorted(self.speaker_names.items(), key=lambda kv: self._spk_sort_key(kv[0])):
+            if not custom_name:
+                continue
+            tids = old_by_spk.get(old_cid, ())
+            if tids:
+                tracked.append((old_cid, custom_name, tids))
+            else:
+                untracked.append((old_cid, custom_name))
+
+        for old_cid, custom_name, tids in tracked:
+            counts: dict[str, int] = {}
+            for tid in tids:
+                ncid = mapping.get(tid)
+                if ncid:
+                    counts[ncid] = counts.get(ncid, 0) + 1
+            if counts:
+                best_ncid = max(counts.items(), key=lambda kv: (kv[1], kv[0] == old_cid))[0]
+                if best_ncid not in new_names and custom_name != best_ncid:
+                    new_names[best_ncid] = custom_name
+
+        for old_cid, custom_name in untracked:
+            if old_cid not in new_names and custom_name != old_cid:
+                new_names[old_cid] = custom_name
+
+        self.speaker_names = new_names
 
     def _apply_mapping_locked(self, mapping: dict[int, str],
                               id_remap: Optional[dict[str, str]] = None):

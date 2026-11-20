@@ -630,7 +630,7 @@ class SpeakerClusterer:
                 if ncid:
                     counts[ncid] = counts.get(ncid, 0) + 1
             if counts:
-                best = max(counts.items(), key=lambda kv: kv[1])[0]
+                best = max(counts.items(), key=lambda kv: (kv[1], kv[0] == old_cid))[0]
                 if best != old_cid:
                     id_remap[old_cid] = best
         if merged is not None:
@@ -681,23 +681,31 @@ class SpeakerClusterer:
         if dissolved is not None:
             items = [(cid, nm) for cid, nm in items if cid != dissolved]
 
+        tracked = []
+        untracked = []
         for old_cid, custom_name in items:
             if not custom_name:
                 continue
             tids = old_by_spk.get(old_cid, [])
-            if not tids:
-                if old_cid not in new_names:
-                    new_names[old_cid] = custom_name
-                continue
+            if tids:
+                tracked.append((old_cid, custom_name, tids))
+            else:
+                untracked.append((old_cid, custom_name))
+
+        for old_cid, custom_name, tids in tracked:
             counts: dict[str, int] = {}
             for tid in tids:
                 ncid = new_mapping.get(tid)
                 if ncid:
                     counts[ncid] = counts.get(ncid, 0) + 1
             if counts:
-                best_ncid = max(counts.items(), key=lambda kv: kv[1])[0]
+                best_ncid = max(counts.items(), key=lambda kv: (kv[1], kv[0] == old_cid))[0]
                 if best_ncid not in new_names and custom_name != best_ncid:
                     new_names[best_ncid] = custom_name
+
+        for old_cid, custom_name in untracked:
+            if old_cid not in new_names and custom_name != old_cid:
+                new_names[old_cid] = custom_name
         return new_names
 
     def _vec_centroid_for_ids(self, turn_ids: set[int]) -> Optional[np.ndarray]:
@@ -1354,7 +1362,7 @@ class Diarizer(threading.Thread):
                 self.q.task_done()
 
     def _embed(self, seg: np.ndarray) -> Optional[np.ndarray]:
-        return compute_embedding(self.extractor, seg, min_rms=0.0008 if self.arabic_mode else 0.002)
+        return compute_embedding(self.extractor, seg, min_rms=0.0008)
 
     def _process_item(self, seg_id: int, start_sec: float, stamp: str,
                       samples: np.ndarray, text: str, words: list[dict]) -> None:
@@ -1372,21 +1380,27 @@ class Diarizer(threading.Thread):
         if len(parts) == 1:
             sa, sb, ptxt, vec, vdur, subs = parts[0]
             with self._cluster_lock:
+                old_by_spk = self.clusterer._speaker_turn_ids()
                 spk, mapping = self.clusterer.add_and_cluster(seg_id, start_sec, vdur, vec, subs)
+                id_remap = self.clusterer._compute_id_remap(old_by_spk, mapping)
             entries = [(seg_id, stamp, start_sec, ptxt or text, spk)]
         else:
             from .state import fmt_time
             entries = []
             mapping = {}
             with self._cluster_lock:
+                old_by_spk = self.clusterer._speaker_turn_ids()
                 for idx, (sa, sb, ptxt, vec, vdur, subs) in enumerate(parts):
                     sub_start = start_sec + sa / SAMPLE_RATE
                     sub_stamp = stamp if idx == 0 else fmt_time(sub_start)
                     turn_id = seg_id if idx == 0 else self.state.alloc_turn_id()
                     spk, mapping = self.clusterer.add_and_cluster(turn_id, sub_start, vdur, vec, subs)
                     entries.append((turn_id, sub_stamp, sub_start, ptxt, spk))
+                id_remap = self.clusterer._compute_id_remap(old_by_spk, mapping)
 
-        self.state.apply_diarization(seg_id, entries, mapping)
+        self.state.apply_diarization(
+            seg_id, entries, mapping, old_by_spk=old_by_spk, id_remap=id_remap,
+        )
         self._sync_needed = True
 
     def flush_and_wait(self, timeout: float = 30.0) -> None:
