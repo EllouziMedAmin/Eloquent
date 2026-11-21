@@ -415,7 +415,7 @@ def split_segment_by_speaker(samples: np.ndarray, words: list[dict],
                  else (" ".join(w["w"] for w in words).strip() if words else ""))
 
     analysis = None
-    if segmenter is not None and not synthesized and dur >= 1.2:
+    if segmenter is not None and dur >= 1.2:
         try:
             analysis = segmenter.analyze(samples)
         except Exception:
@@ -447,10 +447,16 @@ def split_segment_by_speaker(samples: np.ndarray, words: list[dict],
         voiced, vdur = _voiced_samples(samples, use_words)
         embed_in = voiced
         if analysis is not None:
-            vt_a, vt_b = _voiced_bounds(0, len(samples), use_words)
-            clean_audio, _, was_stripped = analysis.strip_overlap(voiced, vt_a, vt_b)
-            if was_stripped:
-                embed_in = clean_audio
+            if use_words:
+                vt_a, vt_b = _voiced_bounds(0, len(samples), use_words)
+                clean_audio, _, was_stripped = analysis.strip_overlap(voiced, vt_a, vt_b)
+                if was_stripped:
+                    embed_in = clean_audio
+            else:
+                # Without word spans, voiced has internal silences removed; strip overlap on raw samples first
+                clean_audio, _, was_stripped = analysis.strip_overlap(samples, 0.0, dur)
+                if was_stripped:
+                    embed_in, _, _ = _detect_voiced_islands(clean_audio)
         vec = embed_fn(embed_in)
         if vec is None and embed_in is not voiced:
             vec = embed_fn(voiced)
@@ -1764,7 +1770,7 @@ class Diarizer(threading.Thread):
         self.session = session
         self.log = log
         self.arabic_mode = bool(arabic_mode)
-        self.segmenter = None if self.arabic_mode else segmenter
+        self.segmenter = segmenter
         self.clusterer = SpeakerClusterer(arabic_mode=arabic_mode, max_speakers=max_speakers)
         self._cluster_lock = threading.Lock()
         self.q: "queue.Queue[Optional[tuple]]" = queue.Queue()
@@ -1885,7 +1891,7 @@ class Diarizer(threading.Thread):
         meta_list: list[dict] = []
         parts = split_segment_by_speaker(
             samples, words, self._embed, known_speakers=known, text=text,
-            segmenter=(None if self.arabic_mode else self.segmenter),
+            segmenter=self.segmenter,
             out_meta=meta_list,
         )
         if not parts:

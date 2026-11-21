@@ -198,7 +198,7 @@ class Engine:
                 except Exception as e:
                     self.log(f"[diarize] Disabled ({type(e).__name__}: {e})", "warn")
                     return
-            if not self._segmenter_tried and not is_arabic_speech(self.settings.resolved_speech_language()):
+            if not self._segmenter_tried:
                 self._segmenter_tried = True
                 self.segmenter = build_overlap_segmenter(mdir, threads=1, log=self.log)
                 if self.segmenter is not None:
@@ -299,13 +299,13 @@ class Engine:
             self.last_session_dir = self.session.dir
         use_diar = (not paste_mode) and s.diarize
         arabic = is_arabic_speech(s.resolved_speech_language())
-        if use_diar and (self.extractor is None or (not arabic and not self._segmenter_tried)):
+        if use_diar and (self.extractor is None or not self._segmenter_tried):
             self._load_speaker_extractor()
         self.diarizer = Diarizer(
             self.extractor, self.state, self.session, log=self.log,
             arabic_mode=arabic,
             max_speakers=getattr(s, "max_speakers", 0),
-            segmenter=(None if arabic else self.segmenter),
+            segmenter=self.segmenter,
         ) if (use_diar and self.extractor is not None) else None
         if self.diarizer is not None:
             self.diarizer.start()

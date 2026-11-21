@@ -1,7 +1,7 @@
 """Lightweight frame-level speaker overlap and turn-boundary detection via pyannote-segmentation-3.0.
 
 Runs the 5.9 MB FP32 ONNX powerset segmentation model (~17 ms frame resolution, ~60 ms per 10s
-chunk on 1 CPU thread) strictly on the low-priority background diarizer thread for Parakeet mode:
+chunk on 1 CPU thread) strictly on the low-priority background diarizer thread:
 
 1. Detects simultaneous 2-speaker overlap intervals (`overlap` badges in UI & saved transcripts).
 2. Masks overlapping frames out of TitaNet voiceprint embeddings so crosstalk never blurs speaker
