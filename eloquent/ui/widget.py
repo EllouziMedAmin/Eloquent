@@ -1,16 +1,22 @@
-"""Floating widget UI (PySide6).
+"""Apple Dynamic Island floating widget UI (PySide6).
 
-Compact pill (always on top, draggable):  ● level   live caption   ▶/■   ⤢   ⋯
-Expanded panel: polished transcript (fixes highlighted), show raw, copy, open folder.
-Tray icon, optional global hotkey (Win32 RegisterHotKey) to start/stop.
+Morphing top-center obsidian pill (always on top, draggable, magnetic top-center snap):
+- Idle island:      ●  Eloquent  EN/AR
+- Hover bloom:      ●  Eloquent  EN/AR   ▶  ⤢  ⋯  ✕
+- Dictate / Ask AI: ✦/● [mode]  live words  ▁▃▆█▅▂  ■   ->  ✓ Pasted!
+- Live meeting:     ● [speaker] live caption  ▁▄█▆▃  ■  ⤢  ⋯
+- Expanded card:    polished transcript (speaker pills + overlap badges), show raw, generate, copy, folder.
+Tray icon and Windows global hotkeys (RegisterHotKey) without stealing foreground focus.
 """
 
 import ctypes
 import html
+import math
 import os
 import signal
 import sys
 import threading
+import time
 import urllib.parse
 from ctypes import wintypes
 from pathlib import Path
@@ -28,16 +34,18 @@ if sys.platform == "win32":
                 pass
     os.environ.setdefault("QT_LOGGING_RULES", "qt.gui.icc.warning=false")
 
-from PySide6.QtCore import QObject, QPoint, Qt, QTimer, QUrl, Signal
-from PySide6.QtGui import QAction, QActionGroup, QColor, QCursor, QDesktopServices, QFont, QGuiApplication, QIcon, QPainter, QPixmap
+from PySide6.QtCore import QEasingCurve, QObject, QPoint, QRect, QRectF, Qt, QTimer, QUrl, QVariantAnimation, Signal
+from PySide6.QtGui import (QAction, QActionGroup, QColor, QCursor, QDesktopServices, QFont, QGuiApplication, QIcon,
+                           QLinearGradient, QPainter, QPainterPath, QPen, QPixmap, QRadialGradient)
 from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
-                               QFormLayout, QFrame, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QMenu,
+                               QFormLayout, QFrame, QHBoxLayout, QLabel, QLineEdit, QMenu,
                                QMessageBox, QPushButton, QSizeGrip, QSizePolicy, QSystemTrayIcon, QTextBrowser,
                                QToolButton, QVBoxLayout, QWidget)
 
 from .. import APP_NAME, __version__
 from ..audio import AUDIO_SOURCES, AUDIO_SOURCE_LABELS
-from ..config import ROOT, SETTINGS_FILE, config_dir, is_arabic_speech, normalize_speech_language
+from ..config import (ISLAND_SIZES, ROOT, SETTINGS_FILE, config_dir, is_arabic_speech,
+                      normalize_island_size, normalize_speech_language)
 from ..llm.prompts import REPORT_FORMATS
 from ..paste import capture_selection_copy, get_external_foreground, play_cue, send_paste
 from ..textutil import parse_custom_vocabulary
@@ -47,46 +55,91 @@ HOTKEY_ID = 1
 HOTKEY_DICTATE_ID = 2
 HOTKEY_COMPOSE_ID = 3
 HOTKEY_SWITCH_MODEL_ID = 4
-COMPACT_WIDTH = 660
-PANEL_HEIGHT = 380
+
+# Dynamic Island shadow margins & user-selectable steady size presets
+SHADOW_PAD_X = 8
+SHADOW_PAD_TOP = 4
+SHADOW_PAD_BOT = 10
+ISLAND_IDLE_H = 30
+ISLAND_TOAST_MIN_W, ISLAND_TOAST_MAX_W, ISLAND_TOAST_H = 92, 380, 32
+COMPACT_WIDTH = 520
+PANEL_HEIGHT = 350
+MIN_EXPANDED_W, MIN_EXPANDED_H = 340, 210
+
+ISLAND_PRESETS = {
+    "small": {
+        "idle_h": 28, "hover_w": 236, "hover_h": 32,
+        "compact_w": 280, "compact_h": 34,
+        "meeting_w": 360, "meeting_h": 34,
+        "expanded_w": 460, "expanded_h": 310,
+    },
+    "medium": {
+        "idle_h": 30, "hover_w": 248, "hover_h": 34,
+        "compact_w": 340, "compact_h": 36,
+        "meeting_w": 430, "meeting_h": 36,
+        "expanded_w": 520, "expanded_h": 350,
+    },
+    "large": {
+        "idle_h": 32, "hover_w": 260, "hover_h": 36,
+        "compact_w": 420, "compact_h": 38,
+        "meeting_w": 540, "meeting_h": 38,
+        "expanded_w": 620, "expanded_h": 400,
+    },
+}
 
 STATUS_COLORS = {
-    "idle": "#8a8a8a",
-    "loading": "#4aa3df",
-    "listening": "#34c759",
-    "dictating": "#8f8cff",
-    "composing": "#38bdf8",
-    "stopping": "#e0a526",
+    "idle": "#636366",
+    "loading": "#a1a1aa",
+    "listening": "#f5f5f7",
+    "dictating": "#f5f5f7",
+    "composing": "#f5f5f7",
+    "stopping": "#a1a1aa",
+    "success": "#f5f5f7",
+    "error": "#ff6961",
+    "overlap": "#e4e4e7",
 }
 
 STYLE = """
-#card { background: rgba(24, 24, 27, 240); border: 1px solid rgba(255,255,255,28); border-radius: 16px; }
-QLabel { color: #ececec; font: 11pt "Segoe UI"; }
-#caption[kind="partial"] { color: #9a9a9a; font-style: italic; }
-#caption[kind="hint"] { color: #9a9a9a; }
+#card { background: transparent; border: none; }
+QLabel { color: #f5f5f7; font: 9.5pt "Segoe UI"; }
+#brand { color: #f5f5f7; font: 600 9pt "Segoe UI"; }
+#langPill { color: #a1a1aa; background: rgba(255,255,255,16); border-radius: 6px;
+            padding: 1px 5px; font: 700 7.5pt "Segoe UI"; }
+#modePill { color: #e4e4e7; background: rgba(255,255,255,18); border-radius: 7px;
+            padding: 1px 7px; font: 600 8pt "Segoe UI"; }
+#caption { color: #f5f5f7; font: 9.5pt "Segoe UI"; }
+#caption[kind="partial"] { color: #a1a1aa; font-style: italic; }
+#caption[kind="hint"] { color: #a1a1aa; }
+#caption[kind="success"] { color: #f5f5f7; font-weight: 600; }
 #caption[kind="error"] { color: #ff8a80; }
-#llm { color: #8f8f8f; font-size: 9pt; }
-QToolButton { color: #ececec; background: transparent; border: none; border-radius: 8px;
-              padding: 3px 7px; font: 11pt "Segoe UI Symbol"; }
-QToolButton:hover { background: rgba(255,255,255,26); }
-QToolButton:disabled { color: #555; }
-#toggle { background: #2e9e5b; color: white; min-width: 30px; }
-#toggle:hover { background: #36b368; }
-#toggle[on="true"] { background: #d64545; }
-#toggle[on="true"]:hover { background: #e85a5a; }
-#toggle:disabled { background: #444; color: #888; }
-QTextBrowser { background: transparent; border: none; color: #ececec; font: 11pt "Segoe UI";
-               selection-background-color: #2b6cb0; }
-QPushButton { color: #ececec; background: rgba(255,255,255,18); border: 1px solid rgba(255,255,255,30);
-              border-radius: 7px; padding: 3px 10px; font: 9pt "Segoe UI"; }
-QPushButton:hover { background: rgba(255,255,255,32); }
-QCheckBox { color: #a8a8a8; font: 9pt "Segoe UI"; }
-QMenu { background: #232326; color: #ececec; border: 1px solid #3a3a3e; padding: 4px; font: 10pt "Segoe UI"; }
-QMenu::item { padding: 5px 22px 5px 22px; border-radius: 5px; }
-QMenu::item:selected { background: #3a3a40; }
-QMenu::separator { height: 1px; background: #3a3a3e; margin: 4px 8px; }
-QScrollBar:vertical { background: transparent; width: 8px; }
-QScrollBar::handle:vertical { background: rgba(255,255,255,40); border-radius: 4px; min-height: 30px; }
+#llm { color: #8e8e93; font-size: 8.5pt; }
+QToolButton { color: #d4d4d8; background: rgba(255,255,255,10); border: none; border-radius: 11px;
+              min-width: 22px; max-width: 22px; min-height: 22px; max-height: 22px;
+              padding: 0; font: 8.5pt "Segoe UI Symbol"; }
+QToolButton:hover { background: rgba(255,255,255,26); color: #ffffff; }
+QToolButton:disabled { color: #52525b; background: rgba(255,255,255,6); }
+#toggle { background: rgba(255,255,255,22); color: #ffffff; font-weight: 700; padding-left: 1px; }
+#toggle:hover { background: rgba(255,255,255,40); }
+#toggle[on="true"] { background: rgba(255,255,255,28); color: #ffffff; padding-left: 0px; }
+#toggle[on="true"]:hover { background: rgba(255,255,255,46); color: #ffffff; }
+#toggle:disabled { background: #1c1c1e; color: #52525b; }
+#closeBtn { background: transparent; color: #71717a; }
+#closeBtn:hover { background: rgba(255,255,255,18); color: #f5f5f7; }
+QTextBrowser { background: transparent; border: none; color: #f2f2f7; font: 10pt "Segoe UI";
+               selection-background-color: #3f3f46; }
+QPushButton { color: #e4e4e7; background: rgba(255,255,255,12); border: 1px solid rgba(255,255,255,18);
+              border-radius: 8px; padding: 3px 8px; font: 8.5pt "Segoe UI"; }
+QPushButton:hover { background: rgba(255,255,255,24); color: #ffffff; }
+QCheckBox { color: #a1a1aa; font: 8.5pt "Segoe UI"; spacing: 5px; }
+QMenu { background: #121215; color: #f5f5f7; border: 1px solid rgba(255,255,255,20);
+        border-radius: 10px; padding: 5px; font: 9pt "Segoe UI"; }
+QMenu::item { padding: 5px 18px 5px 12px; border-radius: 6px; }
+QMenu::item:selected { background: rgba(255,255,255,18); color: #ffffff; }
+QMenu::item:disabled { color: #52525b; }
+QMenu::separator { height: 1px; background: rgba(255,255,255,14); margin: 4px 8px; }
+QScrollBar:vertical { background: transparent; width: 6px; }
+QScrollBar::handle:vertical { background: rgba(255,255,255,30); border-radius: 3px; min-height: 24px; }
+QScrollBar::handle:vertical:hover { background: rgba(255,255,255,52); }
 QScrollBar::add-line, QScrollBar::sub-line { height: 0; }
 """
 
@@ -179,7 +232,7 @@ def transcript_html(snap: dict, show_raw: bool, rtl: bool = False) -> str:
         t_html = f'<span dir="ltr" style="color:#7d7d7d;font-size:11px">{esc(p["time"])}</span>'
         head = f'{badge}{ov}{t_html}'
         if p["status"] == "cleaning":
-            head += '<span dir="ltr" style="color:#7db4ff;font-size:11px"> · polishing…</span>'
+            head += '<span dir="ltr" style="color:#a1a1aa;font-size:11px"> · polishing…</span>'
             body = f'<span style="color:#9a9a9a"><i>{esc(p["raw"])}</i></span>'
         elif p["tokens"] and not show_raw:
             body = " ".join(
@@ -207,20 +260,73 @@ def transcript_html(snap: dict, show_raw: bool, rtl: bool = False) -> str:
 
 
 DARK_DIALOG_STYLE = """
-QDialog { background: #1e1e22; color: #ececec; font: 10pt "Segoe UI"; }
-QLabel { color: #ececec; font: 10pt "Segoe UI"; }
-QLabel#hint { color: #9a9aa2; font: 9pt "Segoe UI"; }
-QLineEdit { background: #2a2a30; color: #f2f2f2; border: 1px solid #3f3f46; border-radius: 7px;
-            padding: 6px 9px; font: 10pt "Segoe UI"; selection-background-color: #2b6cb0; }
-QLineEdit:focus { border-color: #7db4ff; }
-QPushButton { background: #2d2d34; color: #ececec; border: 1px solid #44444d; border-radius: 7px;
-              padding: 5px 14px; font: 9.5pt "Segoe UI"; }
-QPushButton:hover { background: #3a3a44; }
-QPushButton#primary { background: #2e9e5b; border-color: #2e9e5b; color: white; font-weight: 600; }
-QPushButton#primary:hover { background: #36b368; }
-QPushButton#subtle { background: transparent; border: none; color: #9a9aa2; padding: 5px 8px; }
-QPushButton#subtle:hover { color: #ececec; background: rgba(255,255,255,14); }
+QDialog { background: #0d0d10; color: #f5f5f7; font: 9.5pt "Segoe UI"; }
+QLabel { color: #f5f5f7; font: 9.5pt "Segoe UI"; }
+QLabel#hint { color: #8e8e93; font: 8.5pt "Segoe UI"; }
+QLineEdit { background: #1b1b1f; color: #f5f5f7; border: 1px solid rgba(255,255,255,18); border-radius: 8px;
+            padding: 6px 10px; font: 9.5pt "Segoe UI"; selection-background-color: #3f3f46; }
+QLineEdit:focus { border: 1px solid rgba(255,255,255,72); background: #1f1f24; }
+QPushButton { background: rgba(255,255,255,10); color: #e4e4e7; border: 1px solid rgba(255,255,255,16);
+              border-radius: 8px; padding: 6px 14px; font: 9.5pt "Segoe UI"; }
+QPushButton:hover { background: rgba(255,255,255,22); color: #ffffff; }
+QPushButton#primary { background: #f5f5f7; border-color: #f5f5f7; color: #09090b; font-weight: 600; }
+QPushButton#primary:hover { background: #ffffff; border-color: #ffffff; color: #000000; }
+QPushButton#subtle { background: transparent; border: none; color: #8e8e93; padding: 5px 8px; }
+QPushButton#subtle:hover { color: #f5f5f7; background: rgba(255,255,255,14); }
 """
+
+
+class _TextPromptDialog(QDialog):
+    """Minimalist dark obsidian single-line prompt dialog (replaces legacy white QInputDialog)."""
+
+    def __init__(self, title: str, label: str, initial: str = "", ok_label: str = "Save",
+                 placeholder: str = "", parent=None):
+        super().__init__(parent)
+        self._styled_chrome = False
+        self.setWindowTitle(title)
+        self.setMinimumWidth(380)
+        self.setStyleSheet(DARK_DIALOG_STYLE)
+        self.setWindowFlag(Qt.WindowStaysOnTopHint, True)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(18, 14, 18, 14)
+        layout.setSpacing(10)
+
+        lbl = QLabel(label)
+        lbl.setWordWrap(True)
+        layout.addWidget(lbl)
+
+        self.edit = QLineEdit(initial)
+        if placeholder:
+            self.edit.setPlaceholderText(placeholder)
+        self.edit.returnPressed.connect(self.accept)
+        layout.addWidget(self.edit)
+
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        row.addStretch(1)
+        btn_cancel = QPushButton("Cancel")
+        btn_cancel.setAutoDefault(False)
+        btn_cancel.clicked.connect(self.reject)
+        btn_ok = QPushButton(ok_label)
+        btn_ok.setObjectName("primary")
+        btn_ok.setDefault(True)
+        btn_ok.clicked.connect(self.accept)
+        row.addWidget(btn_cancel)
+        row.addWidget(btn_ok)
+        layout.addLayout(row)
+
+        self.edit.setFocus()
+        self.edit.selectAll()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if not self._styled_chrome:
+            self._styled_chrome = True
+            apply_dark_titlebar(self)
+
+    def value(self) -> str:
+        return self.edit.text().strip()
 
 
 class _RenameSpeakerDialog(QDialog):
@@ -228,13 +334,14 @@ class _RenameSpeakerDialog(QDialog):
 
     def __init__(self, spk_id: str, current_name: str, parent=None):
         super().__init__(parent)
+        self._styled_chrome = False
         self.setWindowTitle(f"Rename {spk_id}")
         self.setMinimumWidth(320)
         self.setStyleSheet(DARK_DIALOG_STYLE)
         self.setWindowFlag(Qt.WindowStaysOnTopHint, True)
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setContentsMargins(18, 14, 18, 14)
         layout.setSpacing(10)
 
         lbl = QLabel(f'<b style="color:{_speaker_color(spk_id)}">{html.escape(spk_id)}</b>')
@@ -246,6 +353,7 @@ class _RenameSpeakerDialog(QDialog):
         layout.addWidget(self.edit)
 
         row = QHBoxLayout()
+        row.setSpacing(8)
         row.addStretch(1)
         btn_cancel = QPushButton("Cancel")
         btn_cancel.setAutoDefault(False)
@@ -261,6 +369,12 @@ class _RenameSpeakerDialog(QDialog):
         self.edit.setFocus()
         self.edit.selectAll()
 
+    def showEvent(self, event):
+        super().showEvent(event)
+        if not self._styled_chrome:
+            self._styled_chrome = True
+            apply_dark_titlebar(self)
+
     def value(self) -> str:
         return self.edit.text().strip()
 
@@ -270,6 +384,7 @@ class RenameSpeakersDialog(QDialog):
 
     def __init__(self, speakers: list[tuple[str, str]], edit_count: int = 0, parent=None):
         super().__init__(parent)
+        self._styled_chrome = False
         self._special_action = ""  # "", "undo", "reset_edits"
         self.setWindowTitle(f"{APP_NAME} - Rename Speakers")
         self.setMinimumWidth(360)
@@ -277,7 +392,7 @@ class RenameSpeakersDialog(QDialog):
         self.setWindowFlag(Qt.WindowStaysOnTopHint, True)
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setContentsMargins(18, 14, 18, 14)
         layout.setSpacing(10)
 
         hint = QLabel("Assign names to speakers. Click any speaker badge in the transcript to merge or reassign.")
@@ -323,6 +438,12 @@ class RenameSpeakersDialog(QDialog):
         btn_row.addWidget(btn_save)
         layout.addLayout(btn_row)
 
+    def showEvent(self, event):
+        super().showEvent(event)
+        if not self._styled_chrome:
+            self._styled_chrome = True
+            apply_dark_titlebar(self)
+
     def _trigger_special(self, kind: str):
         self._special_action = kind
         self.accept()
@@ -354,34 +475,156 @@ class _CaptionLabel(QLabel):
             self._on_resize()
 
 
-class LevelDot(QWidget):
+class StatusOrb(QWidget):
+    """Minimalist Apple Dynamic Island monochrome left indicator (orb, sparkle, checkmark, or spinner)."""
+
     def __init__(self):
         super().__init__()
-        self.setFixedSize(22, 22)
+        self.setFixedSize(16, 16)
+        self.status = "idle"
         self.color = QColor(STATUS_COLORS["idle"])
         self.level = 0.0
+        self._phase = 0.0
 
     def set_state(self, status: str, level: float = 0.0):
-        self.color = QColor(STATUS_COLORS.get(status, "#8a8a8a"))
-        self.level = level
+        self.status = status
+        self.color = QColor(STATUS_COLORS.get(status, "#636366"))
+        self.level = float(level)
+        self.update()
+
+    def advance(self, dt: float = 0.033):
+        self._phase = (self._phase + dt * 4.5) % (2 * math.pi)
+        self.update()
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        cx = self.width() / 2.0
+        cy = self.height() / 2.0
+
+        if self.status == "success":
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor("#f5f5f7"))
+            p.drawEllipse(QRectF(cx - 6.5, cy - 6.5, 13, 13))
+            pen = QPen(QColor("#09090b"), 1.8, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
+            p.setPen(pen)
+            path = QPainterPath()
+            path.moveTo(cx - 3.0, cy + 0.1)
+            path.lineTo(cx - 0.7, cy + 2.4)
+            path.lineTo(cx + 3.4, cy - 2.3)
+            p.drawPath(path)
+            return
+
+        if self.status == "composing":
+            p.setPen(Qt.NoPen)
+            pulse = 1.0 + 0.10 * math.sin(self._phase * 1.4) + min(0.20, self.level * 2.5)
+            r_out = 5.2 * pulse
+            r_in = 1.5 * pulse
+            star = QPainterPath()
+            for i in range(8):
+                ang = i * (math.pi / 4.0) - math.pi / 2.0
+                r = r_out if i % 2 == 0 else r_in
+                if i == 0:
+                    star.moveTo(cx + r * math.cos(ang), cy + r * math.sin(ang))
+                else:
+                    star.lineTo(cx + r * math.cos(ang), cy + r * math.sin(ang))
+            star.closeSubpath()
+            p.setBrush(QColor("#f5f5f7"))
+            p.drawPath(star)
+            return
+
+        if self.status in ("loading", "stopping"):
+            ring_bg = QPen(QColor(255, 255, 255, 28), 1.8, Qt.SolidLine, Qt.RoundCap)
+            p.setPen(ring_bg)
+            p.setBrush(Qt.NoBrush)
+            rect = QRectF(cx - 5.2, cy - 5.2, 10.4, 10.4)
+            p.drawEllipse(rect)
+            arc_pen = QPen(QColor("#e4e4e7"), 1.9, Qt.SolidLine, Qt.RoundCap)
+            p.setPen(arc_pen)
+            start_deg = int((-self._phase * 180.0 / math.pi) * 16)
+            p.drawArc(rect, start_deg, 115 * 16)
+            return
+
+        # Subtle monochrome orb (with gentle white pulse while recording)
+        p.setPen(Qt.NoPen)
+        if self.status in ("listening", "dictating", "error"):
+            r_halo = 4.2 + min(3.2, self.level * 42.0) + 0.4 * math.sin(self._phase)
+            grad = QRadialGradient(cx, cy, r_halo)
+            c0 = QColor(self.color)
+            c0.setAlpha(75)
+            grad.setColorAt(0.0, c0)
+            grad.setColorAt(1.0, QColor(self.color.red(), self.color.green(), self.color.blue(), 0))
+            p.setBrush(grad)
+            p.drawEllipse(QRectF(cx - r_halo, cy - r_halo, r_halo * 2, r_halo * 2))
+
+        r_core = 3.2 if self.status == "idle" else 3.6
+        p.setBrush(self.color)
+        p.drawEllipse(QRectF(cx - r_core, cy - r_core, r_core * 2, r_core * 2))
+
+
+LevelDot = StatusOrb
+
+
+class AudioWaveform(QWidget):
+    """Minimalist 5-bar monochrome Apple Dynamic Island audio visualizer."""
+
+    N_BARS = 5
+
+    def __init__(self):
+        super().__init__()
+        self.setFixedSize(28, 18)
+        self.color = QColor("#f5f5f7")
+        self._bars = [0.20] * self.N_BARS
+        self._phase = 0.0
+        self._mode = "idle"
+        self._level = 0.0
+
+    def set_state(self, status: str, level: float = 0.0, overlap_glow: bool = False):
+        self._mode = status
+        self._level = float(level)
+        self.color = QColor("#ffffff" if overlap_glow else "#e4e4e7")
+
+    def tick(self, dt: float = 0.033):
+        self._phase += dt * 7.5
+        mid = (self.N_BARS - 1) / 2.0
+        amp = min(1.0, (self._level * 18.0) ** 0.72) if self._level > 0.0005 else 0.0
+        for i in range(self.N_BARS):
+            dist = abs(i - mid) / max(1.0, mid)
+            envelope = 1.0 - 0.48 * (dist * dist)
+            if self._mode in ("loading", "stopping"):
+                target = 0.22 + 0.34 * (0.5 + 0.5 * math.sin(self._phase * 0.75 - i * 0.75)) * envelope
+            elif self._mode in ("listening", "dictating", "composing"):
+                w1 = 0.55 + 0.45 * math.sin(self._phase * (1.15 + 0.14 * i) + i * 1.3)
+                w2 = 0.50 + 0.50 * math.cos(self._phase * 0.7 - i * 0.9)
+                floor_h = 0.18 + 0.08 * math.sin(self._phase * 0.4 + i)
+                target = floor_h + amp * (0.35 + 0.65 * w1 * w2) * envelope
+            else:
+                target = 0.18
+            target = max(0.16, min(1.0, target))
+            alpha = 0.48 if target > self._bars[i] else 0.24
+            self._bars[i] += (target - self._bars[i]) * alpha
         self.update()
 
     def paintEvent(self, _):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
         p.setPen(Qt.NoPen)
-        c = self.rect().center()
-        if self.level > 0:
-            halo = QColor(self.color)
-            halo.setAlpha(70)
-            r = 5 + min(1.0, self.level * 14) * 6
-            p.setBrush(halo)
-            p.drawEllipse(c, r, r)
-        p.setBrush(self.color)
-        p.drawEllipse(c, 5, 5)
+        bar_w = 2.6
+        gap = 2.4
+        total_w = self.N_BARS * bar_w + (self.N_BARS - 1) * gap
+        x0 = (self.width() - total_w) / 2.0
+        cy = self.height() / 2.0
+        max_h = self.height() - 3.0
+        for i, v in enumerate(self._bars):
+            bh = max(2.8, v * max_h)
+            x = x0 + i * (bar_w + gap)
+            c = QColor(self.color)
+            c.setAlpha(int(130 + 125 * v))
+            p.setBrush(c)
+            p.drawRoundedRect(QRectF(x, cy - bh / 2.0, bar_w, bh), bar_w / 2.0, bar_w / 2.0)
 
 
-from .settings_dialog import SettingsDialog, VocabularyDialog  # noqa: E402
+from .settings_dialog import SettingsDialog, VocabularyDialog, apply_dark_titlebar  # noqa: E402
 
 
 # --------------------------------------------------------------------------- #
@@ -395,6 +638,8 @@ class EloquentWidget(QWidget):
         self.view_mode = "transcript"
         self.dirty = True
         self.drag_offset = None
+        self._press_global = None
+        self._drag_moved = False
         self.quitting = False
         self.hotkey_ok = False
         self.dictate_hotkey_ok = False
@@ -405,6 +650,27 @@ class EloquentWidget(QWidget):
         self.caption_text, self.caption_kind = "Starting…", "hint"
         self.last_final = ""
 
+        # Dynamic Island state
+        self._island_mode = "idle"
+        self._hovered = False
+        self._menu_open = False
+        self._toast_active = False
+        self._active_speaker = ""
+        self._active_speaker_id = ""
+        self._overlap_flash_until = 0.0
+        self._last_overlap_seen = False
+        _preset = self._island_preset()
+        self._expanded_w = _preset["expanded_w"]
+        self._expanded_h = _preset["expanded_h"]
+        self._anchor_cx = 0
+        self._anchor_y = 8
+        self._anim_rect_from = None
+        self._anim_rect_to = None
+        self._morph_anim = QVariantAnimation(self)
+        self._morph_anim.setDuration(240)
+        self._morph_anim.valueChanged.connect(self._on_morph_step)
+        self._morph_anim.finished.connect(self._on_morph_done)
+
         self.setWindowTitle(APP_NAME)
         self.setWindowIcon(make_icon())
         flags = Qt.FramelessWindowHint | Qt.Window
@@ -412,6 +678,8 @@ class EloquentWidget(QWidget):
             flags |= Qt.WindowStaysOnTopHint
         self.setWindowFlags(flags)
         self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setAttribute(Qt.WA_ShowWithoutActivating, True)
+        self.setMouseTracking(True)
         self.setStyleSheet(STYLE)
         self._build()
 
@@ -419,61 +687,86 @@ class EloquentWidget(QWidget):
         self.bridge.event.connect(self._on_event)
         engine.subscribe(lambda k, d: self.bridge.event.emit(k, d))
 
-        self.level_timer = QTimer(self, interval=60, timeout=self._tick_level)
+        self.level_timer = QTimer(self, interval=33, timeout=self._tick_level)
         self.rebuild_timer = QTimer(self, singleShot=True, interval=80, timeout=self._rebuild)
-        self.caption_reset = QTimer(self, singleShot=True, interval=6000, timeout=self._idle_caption)
+        self.caption_reset = QTimer(self, singleShot=True, interval=4500, timeout=self._idle_caption)
+        self._leave_timer = QTimer(self, singleShot=True, interval=450, timeout=self._on_leave_timeout)
 
         self._place()
         self._tray()
+        self._update_lang_pill()
         self._update_controls()
+        self._sync_island(animate=False)
 
     # -- layout -------------------------------------------------------------
     def _build(self):
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setContentsMargins(SHADOW_PAD_X, SHADOW_PAD_TOP, SHADOW_PAD_X, SHADOW_PAD_BOT)
+        outer.setSpacing(0)
         self.card = QFrame(objectName="card")
         self.card.setLayoutDirection(Qt.LeftToRight)
         outer.addWidget(self.card)
-        v = QVBoxLayout(self.card)
-        v.setContentsMargins(12, 8, 10, 8)
-        v.setSpacing(6)
+        self._card_layout = QVBoxLayout(self.card)
+        self._card_layout.setContentsMargins(12, 5, 10, 5)
+        self._card_layout.setSpacing(6)
 
-        top = QHBoxLayout()
+        self.top_bar = QWidget()
+        top = QHBoxLayout(self.top_bar)
+        top.setContentsMargins(0, 0, 0, 0)
         top.setSpacing(6)
-        self.dot = LevelDot()
+        self.dot = StatusOrb()
+        self.brand_lbl = QLabel(APP_NAME, objectName="brand")
+        self.lang_pill = QLabel("EN", objectName="langPill")
+        self.lang_pill.setAlignment(Qt.AlignCenter)
+        self.mode_pill = QLabel("", objectName="modePill")
+        self.mode_pill.setAlignment(Qt.AlignCenter)
+        self.mode_pill.hide()
         self.caption = _CaptionLabel(on_resize=self._render_caption, objectName="caption")
+        self.waveform = AudioWaveform()
+        self.waveform.hide()
         self.btn_toggle = QToolButton(objectName="toggle", text="▶")
         self.btn_toggle.clicked.connect(self._toggle_meeting)
         self.btn_expand = QToolButton(text="⤢", toolTip="Show transcript")
         self.btn_expand.clicked.connect(self.toggle_panel)
         self.btn_menu = QToolButton(text="⋯", toolTip="Menu")
         self.btn_menu.clicked.connect(self._show_menu)
-        self.btn_close = QToolButton(text="✕", toolTip=f"Quit {APP_NAME}")
+        self.btn_close = QToolButton(objectName="closeBtn", text="✕", toolTip=f"Quit {APP_NAME}")
         self.btn_close.clicked.connect(self.quit)
-        top.addWidget(self.dot)
-        top.addWidget(self.caption, 1)
-        top.addWidget(self.btn_toggle)
-        top.addWidget(self.btn_expand)
-        top.addWidget(self.btn_menu)
-        top.addWidget(self.btn_close)
-        v.addLayout(top)
+
+        top.addWidget(self.dot, 0, Qt.AlignVCenter)
+        top.addWidget(self.brand_lbl, 0, Qt.AlignVCenter)
+        top.addWidget(self.lang_pill, 0, Qt.AlignVCenter)
+        top.addWidget(self.mode_pill, 0, Qt.AlignVCenter)
+        top.addWidget(self.caption, 1, Qt.AlignVCenter)
+        self._idle_spacer = QWidget()
+        self._idle_spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Ignored)
+        self._idle_spacer.hide()
+        top.addWidget(self._idle_spacer)
+        top.addWidget(self.waveform, 0, Qt.AlignVCenter)
+        top.addWidget(self.btn_toggle, 0, Qt.AlignVCenter)
+        top.addWidget(self.btn_expand, 0, Qt.AlignVCenter)
+        top.addWidget(self.btn_menu, 0, Qt.AlignVCenter)
+        top.addWidget(self.btn_close, 0, Qt.AlignVCenter)
+        self._card_layout.addWidget(self.top_bar)
 
         self.panel = QWidget()
         pv = QVBoxLayout(self.panel)
-        pv.setContentsMargins(0, 4, 0, 0)
+        pv.setContentsMargins(2, 4, 2, 4)
+        pv.setSpacing(6)
         line = QFrame()
         line.setFixedHeight(1)
-        line.setStyleSheet("background: rgba(255,255,255,25);")
+        line.setStyleSheet("background: rgba(255,255,255,22);")
         pv.addWidget(line)
         self.view = QTextBrowser()
         self.view.setOpenLinks(False)
         self.view.anchorClicked.connect(self._on_anchor)
         self.view.setContextMenuPolicy(Qt.CustomContextMenu)
         self.view.customContextMenuRequested.connect(self._show_view_context_menu)
-        self.view.setMinimumHeight(PANEL_HEIGHT - 60)
+        self.view.setMinimumHeight(96)
         self._sync_view_direction()
         pv.addWidget(self.view, 1)
         bottom = QHBoxLayout()
+        bottom.setSpacing(5)
         self.chk_raw = QCheckBox("show raw")
         self.chk_raw.toggled.connect(self._set_raw)
         self.btn_back = QPushButton("← Transcript")
@@ -486,7 +779,8 @@ class EloquentWidget(QWidget):
         self.btn_gen.clicked.connect(self._show_gen_menu)
         btn_copy = QPushButton("Copy")
         btn_copy.clicked.connect(self._copy)
-        btn_folder = QPushButton("Open folder")
+        btn_folder = QPushButton("Folder")
+        btn_folder.setToolTip("Open session folder")
         btn_folder.clicked.connect(self._open_folder)
         bottom.addWidget(self.chk_raw)
         bottom.addWidget(self.btn_back)
@@ -497,7 +791,7 @@ class EloquentWidget(QWidget):
         bottom.addWidget(QSizeGrip(self), 0, Qt.AlignBottom | Qt.AlignRight)
         pv.addLayout(bottom)
         self.panel.hide()
-        v.addWidget(self.panel, 1)
+        self._card_layout.addWidget(self.panel, 1)
 
         self.gen_menu = QMenu(self)
         self.act_rename = self.gen_menu.addAction("Rename speakers…", self.rename_speakers)
@@ -507,10 +801,7 @@ class EloquentWidget(QWidget):
         self.gen_menu.addSeparator()
         self.gen_menu.addAction("Custom Prompt…", self._trigger_custom_gen)
 
-        self.setMinimumWidth(380)
-        self.compact_height = self.sizeHint().height()
-        self.setFixedHeight(self.compact_height)
-        self.resize(COMPACT_WIDTH, self.compact_height)
+        self.compact_height = ISLAND_IDLE_H + SHADOW_PAD_TOP + SHADOW_PAD_BOT
 
         self.menu = QMenu(self)
         self.act_settings = self.menu.addAction("Settings…", self.open_settings)
@@ -537,6 +828,15 @@ class EloquentWidget(QWidget):
         self.act_audio = self.menu.addAction("Save audio recording")
         self.act_audio.setCheckable(True)
         self.act_audio.toggled.connect(self._set_audio)
+        self.size_menu = self.menu.addMenu("Island size")
+        self.size_group = QActionGroup(self)
+        self.size_actions: dict[str, QAction] = {}
+        for sz_key, sz_label in ISLAND_SIZES:
+            act = self.size_menu.addAction(sz_label)
+            act.setCheckable(True)
+            act.triggered.connect(lambda _chk=False, k=sz_key: self._set_island_size(k))
+            self.size_group.addAction(act)
+            self.size_actions[sz_key] = act
         self.act_top = self.menu.addAction("Always on top")
         self.act_top.setCheckable(True)
         self.act_top.toggled.connect(self._set_on_top)
@@ -544,17 +844,283 @@ class EloquentWidget(QWidget):
         self.menu.addAction("Open sessions folder", lambda: self._open(self.s.resolved_sessions_dir()))
         self.menu.addAction("Clear Ask AI memory", self._clear_compose_history)
         self.menu.addAction("Create shortcuts + launch hotkey", self._make_shortcut)
+        self.menu.addAction("Reset island position", self._reset_island_pos)
         self.menu.addAction("Minimize", self.showMinimized)
         self.menu.addSeparator()
         self.menu.addAction(f"Quit {APP_NAME}", self.quit)
 
+    # -- Dynamic Island geometry, morphing & painting -----------------------
+    def _screen_geo(self) -> QRect:
+        scr = QGuiApplication.screenAt(QPoint(int(self._anchor_cx), max(0, int(self._anchor_y + 20))))
+        if scr is None:
+            scr = self.screen() or QGuiApplication.primaryScreen()
+        return scr.availableGeometry()
+
     def _place(self):
+        geo = QGuiApplication.primaryScreen().availableGeometry()
         pos = self.s.widget_pos
-        if pos and QGuiApplication.screenAt(QPoint(pos[0] + 40, pos[1] + 20)) is not None:
-            self.move(pos[0], pos[1])
+        if (isinstance(pos, (list, tuple)) and len(pos) >= 3 and pos[2] == "island"
+                and QGuiApplication.screenAt(QPoint(int(pos[0]), int(pos[1]) + 20)) is not None):
+            self._anchor_cx = int(pos[0])
+            self._anchor_y = int(pos[1])
         else:
-            geo = QGuiApplication.primaryScreen().availableGeometry()
-            self.move(geo.center().x() - self.width() // 2, geo.top() + 40)
+            # Dock cleanly at top-center like Apple Dynamic Island
+            self._anchor_cx = geo.center().x()
+            self._anchor_y = geo.top() + 8
+
+    def _reset_island_pos(self):
+        scr = self.screen() or QGuiApplication.primaryScreen()
+        geo = scr.availableGeometry()
+        self._anchor_cx = geo.center().x()
+        self._anchor_y = geo.top() + 8
+        self._save_island_pos()
+        self._sync_island(animate=True)
+
+    def _target_window_rect(self, card_w: int, card_h: int) -> QRect:
+        win_w = int(card_w) + 2 * SHADOW_PAD_X
+        win_h = int(card_h) + SHADOW_PAD_TOP + SHADOW_PAD_BOT
+        geo = self._screen_geo()
+        x = int(round(self._anchor_cx - win_w / 2.0))
+        y = int(round(self._anchor_y - SHADOW_PAD_TOP))
+        min_x = geo.left() - SHADOW_PAD_X + 6
+        max_x = geo.right() - win_w + SHADOW_PAD_X - 6
+        min_y = geo.top() - SHADOW_PAD_TOP + 2
+        max_y = geo.bottom() - win_h + SHADOW_PAD_BOT - 6
+        x = max(min_x, min(max_x, x)) if max_x >= min_x else min_x
+        y = max(min_y, min(max_y, y)) if max_y >= min_y else min_y
+        return QRect(x, y, win_w, win_h)
+
+    def _update_lang_pill(self):
+        parts = ["AR" if self._is_rtl_language() else "EN"]
+        if self.s.audio_source == "system":
+            parts.append("SYS")
+        elif self.s.audio_source == "both":
+            parts.append("BOTH")
+        self.lang_pill.setText(" · ".join(parts))
+
+    def _update_mode_pill(self):
+        st = self.engine.status
+        mode = self.engine.session_mode
+        mono_pill = (
+            "color:#e4e4e7;background:rgba(255,255,255,18);border-radius:7px;"
+            "padding:1px 7px;font:600 8pt 'Segoe UI';"
+        )
+        if st in ("listening", "stopping"):
+            if mode == "compose":
+                self.mode_pill.setText("Ask AI")
+                self.mode_pill.setStyleSheet(mono_pill)
+                return True
+            if mode == "dictation":
+                self.mode_pill.setText("Dictate")
+                self.mode_pill.setStyleSheet(mono_pill)
+                return True
+            if time.monotonic() < self._overlap_flash_until:
+                self.mode_pill.setText("overlap")
+                self.mode_pill.setStyleSheet(
+                    "color:#f5f5f7;background:rgba(255,255,255,28);border-radius:7px;"
+                    "padding:1px 7px;font:600 8pt 'Segoe UI';"
+                )
+                return True
+            if self._active_speaker:
+                lbl = self._active_speaker if len(self._active_speaker) <= 14 else self._active_speaker[:12] + "…"
+                self.mode_pill.setText(lbl)
+                self.mode_pill.setStyleSheet(mono_pill)
+                return True
+        return False
+
+    def _island_preset(self) -> dict:
+        key = normalize_island_size(getattr(self.s, "island_size", "medium"))
+        return ISLAND_PRESETS[key]
+
+    def _desired_island_spec(self) -> tuple[str, int, int]:
+        geo = self._screen_geo()
+        scr_w, scr_h = max(800, geo.width()), max(600, geo.height())
+        preset = self._island_preset()
+        if self.panel.isVisible():
+            ew = max(MIN_EXPANDED_W, min(self._expanded_w, int(scr_w * 0.86)))
+            eh = max(MIN_EXPANDED_H, min(self._expanded_h, int(scr_h * 0.80)))
+            return "expanded", ew, eh
+        st = self.engine.status
+        mode = self.engine.session_mode
+        if st == "loading":
+            return "toast", min(preset["compact_w"], int(scr_w * 0.44)), ISLAND_TOAST_H
+        if st in ("listening", "stopping"):
+            if mode in ("dictation", "compose"):
+                return "active_compact", min(preset["compact_w"], int(scr_w * 0.50)), preset["compact_h"]
+            return "active_meeting", min(preset["meeting_w"], int(scr_w * 0.62)), preset["meeting_h"]
+        if self._toast_active:
+            fm = self.caption.fontMetrics()
+            txt_w = fm.horizontalAdvance(self.caption_text or "")
+            max_w = min(ISLAND_TOAST_MAX_W, int(scr_w * 0.38))
+            return "toast", max(ISLAND_TOAST_MIN_W, min(max_w, txt_w + 46)), ISLAND_TOAST_H
+        if self._hovered or self._menu_open:
+            lang_w = self.lang_pill.sizeHint().width()
+            brand_w = self.brand_lbl.sizeHint().width()
+            hov_w = max(preset["hover_w"], 16 + brand_w + lang_w + 156)
+            return "hover", min(hov_w, int(scr_w * 0.36)), preset["hover_h"]
+        lang_w = self.lang_pill.sizeHint().width()
+        brand_w = self.brand_lbl.sizeHint().width()
+        idle_w = max(122, min(192, 16 + brand_w + lang_w + 38))
+        return "idle", idle_w, preset["idle_h"]
+
+    def _sync_island(self, animate: bool = True):
+        mode, card_w, card_h = self._desired_island_spec()
+        prev_mode = self._island_mode
+        self._island_mode = mode
+        self._update_lang_pill()
+        has_mode_pill = self._update_mode_pill()
+
+        is_exp = (mode == "expanded")
+        is_idle = (mode == "idle")
+        is_hover = (mode == "hover")
+        is_toast = (mode == "toast")
+        is_compact = (mode == "active_compact")
+        is_meeting = (mode == "active_meeting")
+        is_busy = self.engine.status in ("listening", "stopping", "loading")
+
+        # Configure clean tight inner padding for pill vs expanded card
+        if is_exp:
+            self._card_layout.setContentsMargins(12, 8, 12, 8)
+        elif is_idle:
+            self._card_layout.setContentsMargins(10, 3, 10, 3)
+        elif is_toast:
+            self._card_layout.setContentsMargins(10, 4, 12, 4)
+        else:
+            self._card_layout.setContentsMargins(11, 4, 8, 4)
+
+        self.brand_lbl.setVisible(is_idle or is_hover)
+        self.lang_pill.setVisible(is_idle or is_hover or (is_exp and not has_mode_pill))
+        self.mode_pill.setVisible(has_mode_pill and (is_compact or is_meeting or is_exp))
+        self.caption.setVisible(is_toast or is_compact or is_meeting or is_exp)
+        self._idle_spacer.setVisible(is_idle or is_hover)
+        self.waveform.setVisible(is_busy and (is_compact or is_meeting or is_exp or self.engine.status == "loading"))
+        self.btn_toggle.setVisible(is_hover or is_compact or is_meeting or is_exp)
+        self.btn_expand.setVisible(is_hover or is_meeting or is_exp)
+        self.btn_menu.setVisible(is_hover or is_meeting or is_exp)
+        self.btn_close.setVisible(is_hover or is_exp)
+        self.btn_expand.setText("⤡" if is_exp else "⤢")
+
+        target = self._target_window_rect(card_w, card_h)
+        cur = self.geometry()
+        if not animate or not self.isVisible() or cur == target:
+            self._morph_anim.stop()
+            self._apply_size_constraints(is_exp, target)
+            self.setGeometry(target)
+            self._render_caption()
+            self.update()
+            return
+
+        # Smooth Apple Dynamic Island spring morph centered around anchor_cx
+        self._morph_anim.stop()
+        self.setMinimumSize(0, 0)
+        self.setMaximumSize(16777215, 16777215)
+        self._anim_rect_from = cur
+        self._anim_rect_to = target
+        growing = (target.width() > cur.width() and not is_exp and prev_mode != "expanded")
+        curve = QEasingCurve(QEasingCurve.OutBack if growing else QEasingCurve.OutCubic)
+        if growing:
+            curve.setOvershoot(0.72)
+        self._morph_anim.setEasingCurve(curve)
+        self._morph_anim.setDuration(250 if (is_exp or prev_mode == "expanded") else 220)
+        self._morph_anim.setStartValue(0.0)
+        self._morph_anim.setEndValue(1.0)
+        self._morph_anim.start()
+        self._render_caption()
+
+    def _apply_size_constraints(self, is_expanded: bool, target: QRect):
+        if is_expanded:
+            self.setMinimumSize(MIN_EXPANDED_W + 2 * SHADOW_PAD_X, MIN_EXPANDED_H + SHADOW_PAD_TOP + SHADOW_PAD_BOT)
+            self.setMaximumSize(16777215, 16777215)
+        else:
+            self.setFixedSize(target.width(), target.height())
+
+    def _on_morph_step(self, t: float):
+        if self._anim_rect_from is None or self._anim_rect_to is None:
+            return
+        r0, r1 = self._anim_rect_from, self._anim_rect_to
+        w = max(92, int(round(r0.width() + (r1.width() - r0.width()) * t)))
+        h = max(36, int(round(r0.height() + (r1.height() - r0.height()) * t)))
+        x = int(round(self._anchor_cx - w / 2.0))
+        y = int(round(r0.y() + (r1.y() - r0.y()) * t))
+        geo = self._screen_geo()
+        min_x = geo.left() - SHADOW_PAD_X + 6
+        max_x = geo.right() - w + SHADOW_PAD_X - 6
+        if max_x >= min_x:
+            x = max(min_x, min(max_x, x))
+        self.setGeometry(x, y, w, h)
+        self.update()
+
+    def _on_morph_done(self):
+        if self._anim_rect_to is not None:
+            self._apply_size_constraints(self.panel.isVisible(), self._anim_rect_to)
+            self.setGeometry(self._anim_rect_to)
+            self._render_caption()
+            self.update()
+
+    def _rim_accent_color(self) -> QColor:
+        # Pure minimalist monochrome Apple Dynamic Island rim (never colorful neon borders)
+        if self._hovered or time.monotonic() < self._overlap_flash_until:
+            return QColor(255, 255, 255, 38)
+        if self.engine.status in ("listening", "stopping", "loading"):
+            return QColor(255, 255, 255, 30)
+        return QColor(255, 255, 255, 20)
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        card = QRectF(
+            SHADOW_PAD_X,
+            SHADOW_PAD_TOP,
+            max(10.0, self.width() - 2 * SHADOW_PAD_X),
+            max(10.0, self.height() - SHADOW_PAD_TOP - SHADOW_PAD_BOT),
+        )
+        radius = min(20.0, card.height() / 2.0)
+
+        # Compact subtle Apple floating shadow
+        p.setPen(Qt.NoPen)
+        for dy, expand, alpha in ((4.0, 2.5, 18), (2.5, 1.0, 30), (1.2, 0.2, 42)):
+            srect = card.adjusted(-expand, dy - expand * 0.3, expand, dy + expand * 0.5)
+            sr = min(radius + expand * 0.4, srect.height() / 2.0)
+            p.setBrush(QColor(0, 0, 0, alpha))
+            p.drawRoundedRect(srect, sr, sr)
+
+        # Pure obsidian Dynamic Island body
+        path = QPainterPath()
+        path.addRoundedRect(card, radius, radius)
+        p.fillPath(path, QColor(8, 8, 10, 248))
+
+        # Ultra-subtle neutral top sheen
+        sheen = QLinearGradient(card.left(), card.top(), card.left(), card.top() + min(20.0, card.height() * 0.45))
+        sheen.setColorAt(0.0, QColor(255, 255, 255, 11))
+        sheen.setColorAt(1.0, QColor(255, 255, 255, 0))
+        p.fillPath(path, sheen)
+
+        # Clean minimalist 1px monochrome hairline
+        p.setPen(QPen(self._rim_accent_color(), 1.0))
+        p.drawRoundedRect(card.adjusted(0.5, 0.5, -0.5, -0.5), max(1.0, radius - 0.5), max(1.0, radius - 0.5))
+
+    def _refresh_active_speaker(self):
+        snap = self.engine.state.snapshot()
+        latest_spk, latest_id, latest_ov = "", "", False
+        items = list(snap["paragraphs"]) + list(snap["loose"])
+        if items:
+            latest_ov = bool(items[-1].get("overlap", False))
+            for item in reversed(items):
+                if item.get("speaker"):
+                    latest_spk = item["speaker"]
+                    latest_id = item.get("speaker_id", "")
+                    if not latest_ov:
+                        latest_ov = bool(item.get("overlap", False))
+                    break
+        changed = (latest_spk != self._active_speaker or latest_id != self._active_speaker_id)
+        self._active_speaker = latest_spk
+        self._active_speaker_id = latest_id
+        if latest_ov and not self._last_overlap_seen:
+            self._overlap_flash_until = time.monotonic() + 2.6
+            changed = True
+        self._last_overlap_seen = latest_ov
+        if changed and self.engine.status == "listening" and self.engine.session_mode == "meeting":
+            self._sync_island(animate=False)
 
     def _tray(self):
         self.tray = None
@@ -588,11 +1154,18 @@ class EloquentWidget(QWidget):
         elif kind == "segment":
             self.last_final = data["text"]
             self._caption(data["text"], "")
+            self._refresh_active_speaker()
             self._mark_dirty()
         elif kind in ("paragraph", "reset", "speakers"):
             if kind == "reset":
                 self.last_final = ""
+                self._active_speaker = ""
+                self._active_speaker_id = ""
+                self._overlap_flash_until = 0.0
+                self._last_overlap_seen = False
                 self.view_mode = "transcript"
+            else:
+                self._refresh_active_speaker()
             self._mark_dirty()
         elif kind == "report":
             if data and data.get("status") in ("generating", "done", "error"):
@@ -764,12 +1337,13 @@ class EloquentWidget(QWidget):
                 QTimer.singleShot(380, lambda pt=pasted_text, prev=prev_text: self._restore_clipboard(pt, prev))
             if self.s.dictation_sound:
                 play_cue("done")
-            self._caption("Pasted!", "hint")
+            self._caption("Pasted!", "success")
+            self.caption_reset.start(2200)
         else:
             if self.s.dictation_sound:
                 play_cue("error")
             self._caption("Copied to clipboard (press Ctrl+V)", "hint")
-        self.caption_reset.start()
+            self.caption_reset.start(4500)
 
     @staticmethod
     def _restore_clipboard(pasted_text: str, prev_text: str):
@@ -777,14 +1351,25 @@ class EloquentWidget(QWidget):
         if clip.text() == pasted_text:
             clip.setText(prev_text)
 
-    def _caption(self, text: str, kind: str):
+    def _caption(self, text: str, kind: str, _from_idle: bool = False):
         self.caption_text = text
         if kind != self.caption_kind:
             self.caption_kind = kind
             self.caption.setProperty("kind", kind)
             self.caption.style().unpolish(self.caption)
             self.caption.style().polish(self.caption)
+        if _from_idle:
+            self._toast_active = False
+        elif self.engine.status == "idle" and text:
+            self._toast_active = True
+            self.dot.set_state(kind if kind in ("success", "error") else "idle")
         self._render_caption()
+        if not _from_idle and (self.engine.status == "idle" or self._toast_active):
+            self._sync_island(animate=True)
+
+    @staticmethod
+    def _has_arabic(text: str) -> bool:
+        return any("\u0600" <= ch <= "\u06ff" or "\u0750" <= ch <= "\u077f" or "\u08a0" <= ch <= "\u08ff" for ch in (text or ""))
 
     def _is_rtl_language(self) -> bool:
         return hasattr(self.s, "resolved_speech_language") and is_arabic_speech(self.s.resolved_speech_language())
@@ -794,9 +1379,15 @@ class EloquentWidget(QWidget):
         self.view.setLayoutDirection(Qt.RightToLeft if rtl else Qt.LeftToRight)
 
     def _render_caption(self):
-        rtl_speech = self._is_rtl_language() and self.caption_kind in ("", "partial")
+        rtl_speech = (self._is_rtl_language() or self._has_arabic(self.caption_text)) and self.caption_kind in ("", "partial")
         self.caption.setLayoutDirection(Qt.RightToLeft if rtl_speech else Qt.LeftToRight)
-        self.caption.setAlignment((Qt.AlignRight if rtl_speech else Qt.AlignLeft) | Qt.AlignVCenter)
+        # Qt.AlignAbsolute prevents Qt from double-flipping AlignRight to visual-left under RightToLeft
+        self.caption.setAlignment((Qt.AlignRight if rtl_speech else Qt.AlignLeft) | Qt.AlignAbsolute | Qt.AlignVCenter)
+        if not self.caption.isVisible():
+            txt = ("\u200F" + self.caption_text) if (rtl_speech and self.caption_text) else self.caption_text
+            self.caption.setText(txt)
+            self.caption.setToolTip(self.caption_text if len(self.caption_text) > 60 else "")
+            return
         fm = self.caption.fontMetrics()
         elide = Qt.ElideLeft if self.caption_kind in ("", "partial") else Qt.ElideRight
         avail = max(16, self.caption.contentsRect().width() - 4)
@@ -810,6 +1401,11 @@ class EloquentWidget(QWidget):
                 return "composing"
             if self.engine.session_mode == "dictation":
                 return "dictating"
+        if self.engine.status == "idle" and self._toast_active:
+            if self.caption_kind == "success":
+                return "success"
+            if self.caption_kind == "error":
+                return "error"
         return self.engine.status
 
     def _idle_caption(self):
@@ -832,7 +1428,13 @@ class EloquentWidget(QWidget):
             parts.append(f"Ask AI: {self.s.compose_hotkey}")
         if e.llm["state"] == "off" and self.s.cleanup:
             parts.append("no Gemini key, raw text only")
-        self._caption(" · ".join(parts) if parts else "Ready. Press ▶", "hint")
+        idle_str = " · ".join(parts) if parts else "Ready. Press ▶"
+        self.brand_lbl.setToolTip(idle_str)
+        self.lang_pill.setToolTip(idle_str)
+        self._caption(idle_str, "hint", _from_idle=True)
+        self.caption_reset.setInterval(4500)
+        self.dot.set_state("idle")
+        self._sync_island(animate=True)
 
     def _update_controls(self):
         st = self.engine.status
@@ -841,6 +1443,8 @@ class EloquentWidget(QWidget):
         mode = self.engine.session_mode
         dictating = (mode == "dictation")
         composing = (mode == "compose")
+        if st != "idle":
+            self._toast_active = False
         self.btn_toggle.setText("■" if on else "▶")
         self.btn_toggle.setEnabled(st in ("idle", "listening"))
         self.btn_toggle.setProperty("on", "true" if on else "false")
@@ -857,11 +1461,12 @@ class EloquentWidget(QWidget):
             self.tray_toggle.setText("Stop" if on else "Start")
             self.tray_toggle.setEnabled(st in ("idle", "listening"))
             self.tray.setToolTip(f"{APP_NAME} - {dot_st}")
-        if on:
+        if st in ("listening", "stopping", "loading"):
             self.level_timer.start()
         else:
             self.level_timer.stop()
             self.dot.set_state(dot_st)
+            self.waveform.set_state("idle", 0.0)
         if st == "stopping":
             if composing:
                 msg = "Generating & pasting…"
@@ -870,9 +1475,19 @@ class EloquentWidget(QWidget):
             else:
                 msg = "Finishing the last sentence…"
             self._caption(msg, "hint")
+        self._sync_island(animate=True)
 
     def _tick_level(self):
-        self.dot.set_state(self._dot_status(), self.engine.level)
+        dot_st = self._dot_status()
+        ov_active = time.monotonic() < self._overlap_flash_until
+        self.dot.set_state(dot_st, self.engine.level)
+        self.dot.advance(0.033)
+        self.waveform.set_state(dot_st, self.engine.level, overlap_glow=ov_active)
+        self.waveform.tick(0.033)
+        if ov_active != getattr(self, "_was_ov_active", False):
+            self._was_ov_active = ov_active
+            self._update_mode_pill()
+            self.update()
 
     def _update_llm_label(self):
         llm, err = self.engine.llm, self.engine.state.error
@@ -901,7 +1516,7 @@ class EloquentWidget(QWidget):
             st = rep["status"]
             if st == "generating":
                 self.view.setHtml(
-                    f'<p dir="ltr" align="left" style="color:#7db4ff"><i>Generating {html.escape(rep["label"])}…</i></p>')
+                    f'<p dir="ltr" align="left" style="color:#a1a1aa"><i>Generating {html.escape(rep["label"])}…</i></p>')
             elif st == "error":
                 self.view.setHtml(
                     f'<p dir="ltr" align="left" style="color:#ff8a80"><b>{html.escape(rep["label"])}</b><br>'
@@ -939,7 +1554,12 @@ class EloquentWidget(QWidget):
         multi = bool(self.engine.state.snapshot().get("multi_speaker")) or self.engine.speaker_edit_count() > 0
         self.act_rename.setVisible(multi)
         self.act_rename_sep.setVisible(multi)
-        self.gen_menu.exec(self.btn_gen.mapToGlobal(QPoint(0, self.btn_gen.height())))
+        self._menu_open = True
+        try:
+            self.gen_menu.exec(self.btn_gen.mapToGlobal(QPoint(0, self.btn_gen.height())))
+        finally:
+            self._menu_open = False
+            self._sync_island(animate=True)
 
     def _build_speaker_menu(self, spk_id: str, item_kind: str = "", item_id: int = None) -> QMenu:
         """Build the 1-click dark popover menu shown when clicking a speaker badge."""
@@ -1108,15 +1728,16 @@ class EloquentWidget(QWidget):
         menu.exec(self.view.viewport().mapToGlobal(pos))
 
     def _fix_and_remember_selection(self, selected: str):
-        dlg = QInputDialog(self)
-        dlg.setWindowTitle(f"{APP_NAME} - Correct Word")
-        dlg.setLabelText(f'Correct "{selected}" to (also remembered for future transcripts):')
-        dlg.setTextValue(selected)
-        dlg.setWindowFlag(Qt.WindowStaysOnTopHint, True)
-        dlg.setStyleSheet("")
+        dlg = _TextPromptDialog(
+            f"{APP_NAME} - Correct Word",
+            f'Correct "{selected}" to (also remembered for future transcripts):',
+            initial=selected,
+            ok_label="Save",
+            parent=self,
+        )
         if not dlg.exec():
             return
-        replacement = dlg.textValue().strip()
+        replacement = dlg.value()
         if not replacement or replacement == selected:
             return
         count = self.engine.apply_vocabulary_fix(selected, replacement, remember=True)
@@ -1130,32 +1751,23 @@ class EloquentWidget(QWidget):
         self.engine.generate_report(format_id, custom_prompt)
 
     def _trigger_custom_gen(self):
-        dlg = QInputDialog(self)
-        dlg.setWindowTitle(f"{APP_NAME} - Custom Prompt")
-        dlg.setLabelText("How should the LLM format or analyze this transcript?")
-        dlg.setTextValue("Summarize the key points and list any action items.")
-        dlg.setWindowFlag(Qt.WindowStaysOnTopHint, True)
-        dlg.setStyleSheet("")
-        if dlg.exec() and dlg.textValue().strip():
-            self._trigger_gen("custom", dlg.textValue().strip())
+        dlg = _TextPromptDialog(
+            f"{APP_NAME} - Custom Prompt",
+            "How should the LLM format or analyze this transcript?",
+            initial="Summarize the key points and list any action items.",
+            ok_label="Generate",
+            parent=self,
+        )
+        if dlg.exec() and dlg.value():
+            self._trigger_gen("custom", dlg.value())
 
     def toggle_panel(self):
         show = not self.panel.isVisible()
         self.panel.setVisible(show)
         self.btn_expand.setToolTip("Hide transcript" if show else "Show transcript")
-        self.layout().activate()
-        self.card.layout().activate()
         if show:
-            self.setMinimumHeight(200)
-            self.setMaximumHeight(16777215)
-            self.resize(self.width(), PANEL_HEIGHT)
             self._rebuild()
-            geo = self.screen().availableGeometry()
-            if self.frameGeometry().bottom() > geo.bottom():
-                self.move(self.x(), max(geo.top(), geo.bottom() - self.height()))
-        else:
-            self.setFixedHeight(self.compact_height)
-            self.resize(self.width(), self.compact_height)
+        self._sync_island(animate=True)
 
     def _set_raw(self, on):
         self.show_raw = on
@@ -1211,10 +1823,20 @@ class EloquentWidget(QWidget):
         self.act_audio.blockSignals(True)
         self.act_audio.setChecked(self.s.save_audio)
         self.act_audio.blockSignals(False)
+        cur_sz = normalize_island_size(getattr(self.s, "island_size", "medium"))
+        for k, act in self.size_actions.items():
+            act.blockSignals(True)
+            act.setChecked(k == cur_sz)
+            act.blockSignals(False)
         self.act_top.blockSignals(True)
         self.act_top.setChecked(self.s.always_on_top)
         self.act_top.blockSignals(False)
-        self.menu.exec(self.btn_menu.mapToGlobal(QPoint(0, self.btn_menu.height())))
+        self._menu_open = True
+        try:
+            self.menu.exec(self.btn_menu.mapToGlobal(QPoint(0, self.btn_menu.height())))
+        finally:
+            self._menu_open = False
+            self._leave_timer.start()
 
     def _set_audio_source(self, src: str):
         self.s.audio_source = src
@@ -1234,6 +1856,15 @@ class EloquentWidget(QWidget):
         lbl = "Auto" if cap == 0 else f"{cap} speakers"
         self._caption(f"Max speakers set to {lbl}", "hint")
         self.caption_reset.start()
+
+    def _set_island_size(self, size_key: str):
+        sz = normalize_island_size(size_key)
+        self.s.island_size = sz
+        self.s.save()
+        preset = self._island_preset()
+        self._expanded_w = preset["expanded_w"]
+        self._expanded_h = preset["expanded_h"]
+        self._sync_island(animate=True)
 
     def _set_audio(self, on):
         self.s.save_audio = on
@@ -1272,12 +1903,17 @@ class EloquentWidget(QWidget):
     def open_settings(self, first_run=False):
         old_active = self.s.resolved_speech_language() if hasattr(self.s, "resolved_speech_language") else "parakeet"
         old_saved = normalize_speech_language(getattr(self.s, "speech_language", "parakeet"))
+        old_size = normalize_island_size(getattr(self.s, "island_size", "medium"))
         dlg = SettingsDialog(self.s, self, first_run=first_run,
                              speech_busy=(self.engine.busy or self.engine.status == "loading"))
         dlg.setWindowFlag(Qt.WindowStaysOnTopHint, True)
         if dlg.exec():
             if normalize_speech_language(self.s.speech_language) != old_saved and hasattr(self.s, "set_active_speech_language"):
                 self.s.set_active_speech_language(None)
+            if normalize_island_size(getattr(self.s, "island_size", "medium")) != old_size:
+                preset = self._island_preset()
+                self._expanded_w = preset["expanded_w"]
+                self._expanded_h = preset["expanded_h"]
             new_active = self.s.resolved_speech_language() if hasattr(self.s, "resolved_speech_language") else "parakeet"
             hk_ok = self.register_hotkey()
             self.engine.refresh_provider()
@@ -1376,26 +2012,80 @@ class EloquentWidget(QWidget):
         return super().nativeEvent(eventType, message)
 
     # -- window behaviour ---------------------------------------------------------
+    def enterEvent(self, e):
+        super().enterEvent(e)
+        self._leave_timer.stop()
+        if not self._hovered:
+            self._hovered = True
+            self._sync_island(animate=True)
+
+    def leaveEvent(self, e):
+        super().leaveEvent(e)
+        if not self._menu_open:
+            self._leave_timer.start()
+
+    def _on_leave_timeout(self):
+        if self._menu_open or self.drag_offset is not None:
+            return
+        if self.rect().contains(self.mapFromGlobal(QCursor.pos())):
+            return
+        if self._hovered:
+            self._hovered = False
+            self._sync_island(animate=True)
+
     def resizeEvent(self, e):
         super().resizeEvent(e)
+        if self.panel.isVisible() and self._morph_anim.state() != QVariantAnimation.Running:
+            self._expanded_w = max(MIN_EXPANDED_W, self.width() - 2 * SHADOW_PAD_X)
+            self._expanded_h = max(MIN_EXPANDED_H, self.height() - SHADOW_PAD_TOP - SHADOW_PAD_BOT)
         self._render_caption()
+
+    def _save_island_pos(self):
+        self.s.widget_pos = [int(self._anchor_cx), int(self._anchor_y), "island"]
+        self.s.save()
 
     def mousePressEvent(self, e):
         if e.button() == Qt.LeftButton:
-            self.drag_offset = e.globalPosition().toPoint() - self.frameGeometry().topLeft()
+            self._press_global = e.globalPosition().toPoint()
+            self._drag_moved = False
+            self.drag_offset = self._press_global - self.frameGeometry().topLeft()
 
     def mouseMoveEvent(self, e):
         if self.drag_offset is not None and e.buttons() & Qt.LeftButton:
-            self.move(e.globalPosition().toPoint() - self.drag_offset)
+            gpos = e.globalPosition().toPoint()
+            if self._press_global is not None and (gpos - self._press_global).manhattanLength() >= 5:
+                self._drag_moved = True
+            nx, ny = gpos.x() - self.drag_offset.x(), gpos.y() - self.drag_offset.y()
+            # Magnetic snap back to top-center Apple Dynamic Island home
+            scr = QGuiApplication.screenAt(gpos) or self.screen() or QGuiApplication.primaryScreen()
+            geo = scr.availableGeometry()
+            cx = nx + self.width() // 2
+            top_y = ny + SHADOW_PAD_TOP
+            if abs(cx - geo.center().x()) <= 36 and top_y <= geo.top() + 36:
+                cx = geo.center().x()
+                top_y = geo.top() + 8
+                nx = int(round(cx - self.width() / 2.0))
+                ny = top_y - SHADOW_PAD_TOP
+            self.move(nx, ny)
+            self._anchor_cx = cx
+            self._anchor_y = top_y
 
     def mouseReleaseEvent(self, e):
         if self.drag_offset is not None:
+            moved = self._drag_moved
             self.drag_offset = None
-            self.s.widget_pos = [self.x(), self.y()]
-            self.s.save()
+            self._press_global = None
+            self._drag_moved = False
+            if moved:
+                self._save_island_pos()
+            elif e.button() == Qt.LeftButton:
+                # Single-click on the pill header smoothly expands/collapses the Dynamic Island
+                local_y = e.position().y()
+                if not self.panel.isVisible() or local_y <= (SHADOW_PAD_TOP + 54):
+                    self.toggle_panel()
 
     def mouseDoubleClickEvent(self, e):
-        self.toggle_panel()
+        pass
 
     def closeEvent(self, e):
         if not self.quitting:
@@ -1408,8 +2098,7 @@ class EloquentWidget(QWidget):
         if self.quitting:
             return
         self.quitting = True
-        self.s.widget_pos = [self.x(), self.y()]
-        self.s.save()
+        self._save_island_pos()
         self.unregister_hotkey()
         if self.engine.busy:
             self.show()
