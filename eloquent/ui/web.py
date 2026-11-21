@@ -51,7 +51,8 @@ main{max-width:860px;margin:0 auto;padding:20px 20px 120px}
 .report-body.rtl blockquote{border-left:none;border-right:3px solid var(--acc)}
 .spk{display:inline-block;font-size:11px;font-weight:600;padding:0 6px;border-radius:4px;margin-right:8px;background:rgba(128,128,128,.15);cursor:pointer}
 .spk0{color:#2b6cb0}.spk1{color:#1f7a4c}.spk2{color:#a15c00}.spk3{color:#9d2d6b}.spk4{color:#6b46c1}.spk5{color:#c05621}
-@media (prefers-color-scheme: dark){.spk0{color:#7db4ff}.spk1{color:#6ee7b7}.spk2{color:#fbbf24}.spk3{color:#f472b6}.spk4{color:#c084fc}.spk5{color:#fb923c}}
+.ov{display:inline-block;font-size:11px;font-weight:600;padding:0 6px;border-radius:4px;margin-right:8px;color:#b45309;background:rgba(245,158,11,.16)}
+@media (prefers-color-scheme: dark){.spk0{color:#7db4ff}.spk1{color:#6ee7b7}.spk2{color:#fbbf24}.spk3{color:#f472b6}.spk4{color:#c084fc}.spk5{color:#fb923c}.ov{color:#fbbf24;background:rgba(245,158,11,.18)}}
 .fix{border-bottom:2px solid var(--fix)}
 .fresh .fix{animation:flash 3.5s ease-out}
 @keyframes flash{0%{background:var(--fix)}100%{background:transparent}}
@@ -132,6 +133,7 @@ function render(s){
     const d=el('div','para '+p.status+(isRtl?' rtl':''));
     const meta=el('span','time');
     if(s.multi_speaker&&p.speaker){const b=spkBadge(p.speaker,p.speaker_id); if(b)meta.append(b);}
+    if(p.overlap){const ob=el('span','ov','overlap'); ob.title='Multiple speakers talked at the same time here'; meta.append(ob);}
     meta.append(document.createTextNode(p.time));
     d.append(meta);
     const body=el('p'); body.dir=isRtl?'rtl':'auto';
@@ -146,6 +148,7 @@ function render(s){
   for(const l of s.loose){
     const d=el('div','loose'+(isRtl?' rtl':''));
     if(s.multi_speaker&&l.speaker){const b=spkBadge(l.speaker,l.speaker_id); if(b)d.append(b);}
+    if(l.overlap){const ob=el('span','ov','overlap'); ob.title='Multiple speakers talked at the same time here'; d.append(ob);}
     const lt=el('span','',l.text); lt.dir=isRtl?'rtl':'auto';
     d.append(el('span','time',l.t), lt);
     box.append(d);

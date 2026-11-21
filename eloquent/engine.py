@@ -32,6 +32,7 @@ from .config import config_dir, is_arabic_speech
 from .diarizer import Diarizer, build_speaker_extractor, ensure_speaker_model
 from .llm import make_provider
 from .llm.prompts import build_format_instruction
+from .overlap import build_overlap_segmenter
 from .session import Session, write_session_files
 from .speech import (SAMPLE_RATE, WINDOW, build_speech_recognizer, build_vad, close_recognizer,
                      ensure_vad_model, read_wav_16k, transcribe, transcribe_detailed)
@@ -83,6 +84,8 @@ class Engine:
         self.recognizer = None
         self.vad_path = None
         self.extractor = None
+        self.segmenter = None
+        self._segmenter_tried = False
         self.diarizer = None
         self._last_clusterer = None
         self.provider = None
@@ -186,15 +189,20 @@ class Engine:
 
     def _load_speaker_extractor(self, models_dir: Path = None):
         with self._diar_lock:
-            if self.extractor is not None:
-                return
-            try:
-                mdir = models_dir or self.settings.resolved_models_dir()
-                spk_path = ensure_speaker_model(mdir, self.log)
-                self.extractor = build_speaker_extractor(spk_path, threads=1)
-                self.log("[diarize] Multi-speaker identification ready (1 background thread)")
-            except Exception as e:
-                self.log(f"[diarize] Disabled ({type(e).__name__}: {e})", "warn")
+            mdir = models_dir or self.settings.resolved_models_dir()
+            if self.extractor is None:
+                try:
+                    spk_path = ensure_speaker_model(mdir, self.log)
+                    self.extractor = build_speaker_extractor(spk_path, threads=1)
+                    self.log("[diarize] Multi-speaker identification ready (1 background thread)")
+                except Exception as e:
+                    self.log(f"[diarize] Disabled ({type(e).__name__}: {e})", "warn")
+                    return
+            if not self._segmenter_tried:
+                self._segmenter_tried = True
+                self.segmenter = build_overlap_segmenter(mdir, threads=1, log=self.log)
+                if self.segmenter is not None:
+                    self.log("[diarize] Overlap segmentation ready (pyannote-3.0)")
 
     def sync_diarizer(self):
         """Lazy-load speaker extractor if enabled and propagate live max_speakers changes."""
@@ -290,12 +298,14 @@ class Engine:
             self.session = Session(s.resolved_sessions_dir(), save_audio=s.save_audio)
             self.last_session_dir = self.session.dir
         use_diar = (not paste_mode) and s.diarize
-        if use_diar and self.extractor is None:
+        arabic = is_arabic_speech(s.resolved_speech_language())
+        if use_diar and (self.extractor is None or not self._segmenter_tried):
             self._load_speaker_extractor()
         self.diarizer = Diarizer(
             self.extractor, self.state, self.session, log=self.log,
-            arabic_mode=is_arabic_speech(s.resolved_speech_language()),
+            arabic_mode=arabic,
             max_speakers=getattr(s, "max_speakers", 0),
+            segmenter=self.segmenter,
         ) if (use_diar and self.extractor is not None) else None
         if self.diarizer is not None:
             self.diarizer.start()
@@ -683,7 +693,13 @@ class Engine:
             write_session_files(Path(self.last_session_dir), self.state)
 
     def rename_speakers(self, names: dict[str, str]):
-        """Rename speakers in State and sync raw.txt / clean.txt on disk."""
+        """Rename speakers in State (locking named clusters against merge) and sync raw.txt / clean.txt."""
+        cur_names = self.state.speaker_names_copy()
+        diar = self.diarizer
+        if diar is not None:
+            diar.set_speaker_names(names, current_names=cur_names)
+        elif self._last_clusterer is not None:
+            self._last_clusterer.set_speaker_names(names, current_names=cur_names)
         self.state.rename_speakers(names)
         self._sync_session_files()
 

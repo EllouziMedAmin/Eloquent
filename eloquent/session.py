@@ -11,15 +11,19 @@ from .speech import SAMPLE_RATE
 
 
 def _format_session_texts(state) -> tuple[str, str]:
-    multi, raw_items, clean_items = state.export_records()
+    multi, raw_items, clean_items = state.export_records(include_overlap=True)
     raw_lines = []
-    for stamp, spk, txt in raw_items:
-        prefix = f"[{stamp}] {spk}:" if (multi and spk) else f"[{stamp}]"
+    for stamp, spk, txt, ov in raw_items:
+        ov_tag = " [overlap]" if ov else ""
+        prefix = f"[{stamp}] {spk}{ov_tag}:" if (multi and spk) else f"[{stamp}]{ov_tag}"
         raw_lines.append(f"{prefix} {txt}\n")
     clean_lines = []
-    for stamp, spk, txt in clean_items:
+    for stamp, spk, txt, ov in clean_items:
+        ov_tag = " [overlap]" if ov else ""
         if multi and spk:
-            clean_lines.append(f"[{stamp}] {spk}: {txt.strip()}\n\n")
+            clean_lines.append(f"[{stamp}] {spk}{ov_tag}: {txt.strip()}\n\n")
+        elif ov:
+            clean_lines.append(f"[{stamp}] [overlap] {txt.strip()}\n\n")
         else:
             clean_lines.append(txt.strip() + "\n\n")
     return "".join(raw_lines), "".join(clean_lines)

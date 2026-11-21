@@ -65,7 +65,7 @@ class State:
                 "id": tid, "t": stamp, "start_sec": start_sec,
                 "ts": time.time(), "text": text,
                 "speaker": speaker, "spk_ready": spk_ready,
-                "gap_before": gap_before,
+                "gap_before": gap_before, "overlap": False,
             })
             self.partial = ""
             self.rev += 1
@@ -76,10 +76,12 @@ class State:
     def apply_diarization(self, seg_id: int, parts: list[tuple[int, str, float, str, str]],
                           mapping: dict[int, str],
                           old_by_spk: Optional[dict[str, list[int]]] = None,
-                          id_remap: Optional[dict[str, str]] = None):
+                          id_remap: Optional[dict[str, str]] = None,
+                          overlap_ids: Optional[set[int]] = None):
         """Attach speaker labels (and any mid-chunk splits) and propagate converged cluster IDs."""
         import time
         now = time.time()
+        ov_set = overlap_ids or set()
         with self.lock:
             segs_dirty = False
             idx = next((i for i, x in enumerate(self.loose) if x["id"] == seg_id), None)
@@ -90,6 +92,7 @@ class State:
                         "id": tid, "t": st, "start_sec": t0,
                         "ts": orig_ts if j == 0 else now, "text": txt,
                         "speaker": mapping.get(tid, spk), "spk_ready": True,
+                        "overlap": (tid in ov_set),
                     }
                     for j, (tid, st, t0, txt, spk) in enumerate(parts)
                 ]
@@ -105,21 +108,27 @@ class State:
                         idx_s = next((si for si, item in enumerate(segs_meta) if item["id"] == seg_id), None)
                         if idx_s is not None:
                             segs_meta[idx_s:idx_s + 1] = [
-                                {"id": tid, "t": st, "text": txt, "speaker": mapping.get(tid, spk)}
+                                {"id": tid, "t": st, "text": txt, "speaker": mapping.get(tid, spk),
+                                 "overlap": (tid in ov_set)}
                                 for tid, st, t0, txt, spk in parts
                             ]
                             p["seg_ids"] = [item["id"] for item in segs_meta]
+                            p["overlap"] = any(item.get("overlap") for item in segs_meta)
                             segs_dirty = True
                     elif len(sids) == 1 and len(parts) > 1:
                         p["segs"] = [
-                            {"id": tid, "t": st, "text": txt, "speaker": mapping.get(tid, spk)}
+                            {"id": tid, "t": st, "text": txt, "speaker": mapping.get(tid, spk),
+                             "overlap": (tid in ov_set)}
                             for tid, st, t0, txt, spk in parts
                         ]
                         p["seg_ids"] = [item["id"] for item in p["segs"]]
+                        p["overlap"] = any(item.get("overlap") for item in p["segs"])
                         segs_dirty = True
                     else:
                         first_tid = parts[0][0]
                         p["speaker"] = mapping.get(first_tid, parts[0][4])
+                        if any(tid in ov_set for tid, *_ in parts):
+                            p["overlap"] = True
                         if len(parts) > 1:
                             extra = [tid for tid, _, _, _, _ in parts[1:] if tid not in sids]
                             p["seg_ids"] = list(sids) + extra
@@ -163,7 +172,11 @@ class State:
                 if ncid:
                     counts[ncid] = counts.get(ncid, 0) + 1
             if counts:
-                best_ncid = max(counts.items(), key=lambda kv: (kv[1], kv[0] == old_cid))[0]
+                # Persistent IDs: keep custom name anchored to old_cid whenever old_cid still exists
+                if counts.get(old_cid, 0) > 0:
+                    best_ncid = old_cid
+                else:
+                    best_ncid = max(counts.items(), key=lambda kv: (kv[1], kv[0] == old_cid))[0]
                 if best_ncid not in new_names and custom_name != best_ncid:
                     new_names[best_ncid] = custom_name
 
@@ -219,12 +232,14 @@ class State:
                         base["speaker"] = run["speaker"]
                         base["seg_ids"] = [it["id"] for it in items]
                         base["segs"] = items
+                        base["overlap"] = any(it.get("overlap") for it in items)
                         new_paragraphs.append(base)
                     continue
                 if spk_set:
                     p["speaker"] = next(iter(spk_set))
                 elif remap and p.get("speaker") in remap:
                     p["speaker"] = remap[p["speaker"]]
+                p["overlap"] = any(it.get("overlap") for it in segs_meta)
             else:
                 counts: dict[str, int] = {}
                 for tid in p.get("seg_ids", ()):
@@ -454,14 +469,16 @@ class State:
             "loose": [
                 {"id": x["id"], "t": x["t"], "text": x["text"],
                  "speaker": self._disp_spk(x.get("speaker", "")),
-                 "speaker_id": x.get("speaker", "")}
+                 "speaker_id": x.get("speaker", ""),
+                 "overlap": bool(x.get("overlap", False))}
                 for x in self.loose
             ],
             "paragraphs": [
                 {"id": p["id"], "time": p["time"], "raw": p["raw"], "tokens": p["tokens"],
                  "status": p["status"], "note": p["note"],
                  "speaker": self._disp_spk(p.get("speaker", "")),
-                 "speaker_id": p.get("speaker", "")}
+                 "speaker_id": p.get("speaker", ""),
+                 "overlap": bool(p.get("overlap", False))}
                 for p in self.paragraphs
             ],
         }
@@ -503,10 +520,31 @@ class State:
                     out.append(f"{cur_spk}: {line}" if cur_spk else line)
         return "\n\n".join(out)
 
-    def export_records(self) -> tuple[bool, list[tuple[str, str, str]], list[tuple[str, str, str]]]:
-        """Return `(multi_speaker, [(stamp, speaker, raw)], [(stamp, speaker, clean_or_raw)])`."""
+    def export_records(self, include_overlap: bool = False):
+        """Return `(multi_speaker, raw_items, clean_items)` with optional trailing overlap flag."""
         with self.lock:
             multi = self._multi_speaker_locked()
+            if include_overlap:
+                raw_items = [
+                    (p["time"], self._disp_spk(p.get("speaker", "")), p["raw"], bool(p.get("overlap")))
+                    for p in self.paragraphs
+                ]
+                raw_items += [
+                    (x["t"], self._disp_spk(x.get("speaker", "")), x["text"], bool(x.get("overlap")))
+                    for x in self.loose
+                ]
+                clean_items = [
+                    (p["time"], self._disp_spk(p.get("speaker", "")), p["clean"] or p["raw"], bool(p.get("overlap")))
+                    for p in self.paragraphs
+                ]
+                if self.loose:
+                    clean_items.append((
+                        self.loose[0]["t"],
+                        self._disp_spk(self.loose[0].get("speaker", "")),
+                        " ".join(x["text"] for x in self.loose),
+                        any(x.get("overlap") for x in self.loose),
+                    ))
+                return multi, raw_items, clean_items
             raw_items = [(p["time"], self._disp_spk(p.get("speaker", "")), p["raw"]) for p in self.paragraphs]
             raw_items += [(x["t"], self._disp_spk(x.get("speaker", "")), x["text"]) for x in self.loose]
             clean_items = [

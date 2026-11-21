@@ -113,8 +113,10 @@ class Cleaner(threading.Thread):
                 "id": st.next_id, "time": chunk[0]["t"], "raw": raw, "clean": None,
                 "tokens": None, "status": "cleaning" if self.provider else "raw",
                 "note": "", "speaker": first_spk, "break_before": break_before,
+                "overlap": any(s.get("overlap") for s in chunk),
                 "seg_ids": [s["id"] for s in chunk],
-                "segs": [{"id": s["id"], "t": s["t"], "text": s["text"], "speaker": s.get("speaker", "")}
+                "segs": [{"id": s["id"], "t": s["t"], "text": s["text"],
+                          "speaker": s.get("speaker", ""), "overlap": bool(s.get("overlap"))}
                          for s in chunk],
             }
             st.next_id += 1

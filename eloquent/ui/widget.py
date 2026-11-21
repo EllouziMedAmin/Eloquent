@@ -157,6 +157,15 @@ def _speaker_badge(spk: str, esc, spk_id: str = "", item_ref: str = "") -> str:
             f'text-decoration:none">{esc(spk)}</a>&nbsp; ')
 
 
+def _overlap_badge(overlap: bool) -> str:
+    if not overlap:
+        return ""
+    return ('<span dir="ltr" title="Multiple speakers talked at the same time here" '
+            'style="color:#f59e0b;background:rgba(245,158,11,36);'
+            'border-radius:4px;padding:0 5px;font-size:10px;font-weight:600">'
+            'overlap</span>&nbsp; ')
+
+
 def transcript_html(snap: dict, show_raw: bool, rtl: bool = False) -> str:
     esc = html.escape
     multi = bool(snap.get("multi_speaker"))
@@ -166,8 +175,9 @@ def transcript_html(snap: dict, show_raw: bool, rtl: bool = False) -> str:
         pid = p.get("id")
         pref = f"p:{pid}" if pid is not None else ""
         badge = _speaker_badge(p.get("speaker", ""), esc, p.get("speaker_id", ""), item_ref=pref) if multi else ""
+        ov = _overlap_badge(bool(p.get("overlap")))
         t_html = f'<span dir="ltr" style="color:#7d7d7d;font-size:11px">{esc(p["time"])}</span>'
-        head = f'{badge}{t_html}'
+        head = f'{badge}{ov}{t_html}'
         if p["status"] == "cleaning":
             head += '<span dir="ltr" style="color:#7db4ff;font-size:11px"> · polishing…</span>'
             body = f'<span style="color:#9a9a9a"><i>{esc(p["raw"])}</i></span>'
@@ -187,8 +197,9 @@ def transcript_html(snap: dict, show_raw: bool, rtl: bool = False) -> str:
         xid = x.get("id")
         xref = f"l:{xid}" if xid is not None else ""
         badge = _speaker_badge(x.get("speaker", ""), esc, x.get("speaker_id", ""), item_ref=xref) if multi else ""
+        ov = _overlap_badge(bool(x.get("overlap")))
         t_html = f'<span dir="ltr" style="color:#7d7d7d;font-size:11px">{esc(x["t"])}</span>'
-        out.append(f'<p style="margin:0 0 2px 0" {dir_attr}>{badge}{t_html}</p>'
+        out.append(f'<p style="margin:0 0 2px 0" {dir_attr}>{badge}{ov}{t_html}</p>'
                    f'<p style="margin:0 0 6px 0" {dir_attr}>{esc(x["text"])}</p>')
     if not out:
         out.append('<p dir="ltr" align="left" style="color:#7d7d7d">The transcript will appear here.</p>')
