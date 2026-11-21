@@ -38,13 +38,14 @@ from PySide6.QtCore import QEasingCurve, QObject, QPoint, QRect, QRectF, Qt, QTi
 from PySide6.QtGui import (QAction, QActionGroup, QColor, QCursor, QDesktopServices, QFont, QGuiApplication, QIcon,
                            QLinearGradient, QPainter, QPainterPath, QPen, QPixmap, QRadialGradient)
 from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
-                               QFormLayout, QFrame, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QMenu,
+                               QFormLayout, QFrame, QHBoxLayout, QLabel, QLineEdit, QMenu,
                                QMessageBox, QPushButton, QSizeGrip, QSizePolicy, QSystemTrayIcon, QTextBrowser,
                                QToolButton, QVBoxLayout, QWidget)
 
 from .. import APP_NAME, __version__
 from ..audio import AUDIO_SOURCES, AUDIO_SOURCE_LABELS
-from ..config import ROOT, SETTINGS_FILE, config_dir, is_arabic_speech, normalize_speech_language
+from ..config import (ISLAND_SIZES, ROOT, SETTINGS_FILE, config_dir, is_arabic_speech,
+                      normalize_island_size, normalize_speech_language)
 from ..llm.prompts import REPORT_FORMATS
 from ..paste import capture_selection_copy, get_external_foreground, play_cue, send_paste
 from ..textutil import parse_custom_vocabulary
@@ -55,18 +56,36 @@ HOTKEY_DICTATE_ID = 2
 HOTKEY_COMPOSE_ID = 3
 HOTKEY_SWITCH_MODEL_ID = 4
 
-# Dynamic Island shadow margins & compact responsive card sizes
+# Dynamic Island shadow margins & user-selectable steady size presets
 SHADOW_PAD_X = 8
 SHADOW_PAD_TOP = 4
 SHADOW_PAD_BOT = 10
 ISLAND_IDLE_H = 30
-ISLAND_HOVER_W, ISLAND_HOVER_H = 248, 34
-ISLAND_COMPACT_MIN_W, ISLAND_COMPACT_MAX_W, ISLAND_COMPACT_H = 224, 348, 36
-ISLAND_MEETING_MIN_W, ISLAND_MEETING_MAX_W, ISLAND_MEETING_H = 290, 440, 36
 ISLAND_TOAST_MIN_W, ISLAND_TOAST_MAX_W, ISLAND_TOAST_H = 92, 380, 32
 COMPACT_WIDTH = 520
 PANEL_HEIGHT = 350
 MIN_EXPANDED_W, MIN_EXPANDED_H = 340, 210
+
+ISLAND_PRESETS = {
+    "small": {
+        "idle_h": 28, "hover_w": 236, "hover_h": 32,
+        "compact_w": 280, "compact_h": 34,
+        "meeting_w": 360, "meeting_h": 34,
+        "expanded_w": 460, "expanded_h": 310,
+    },
+    "medium": {
+        "idle_h": 30, "hover_w": 248, "hover_h": 34,
+        "compact_w": 340, "compact_h": 36,
+        "meeting_w": 430, "meeting_h": 36,
+        "expanded_w": 520, "expanded_h": 350,
+    },
+    "large": {
+        "idle_h": 32, "hover_w": 260, "hover_h": 36,
+        "compact_w": 420, "compact_h": 38,
+        "meeting_w": 540, "meeting_h": 38,
+        "expanded_w": 620, "expanded_h": 400,
+    },
+}
 
 STATUS_COLORS = {
     "idle": "#636366",
@@ -112,11 +131,12 @@ QPushButton { color: #e4e4e7; background: rgba(255,255,255,12); border: 1px soli
               border-radius: 8px; padding: 3px 8px; font: 8.5pt "Segoe UI"; }
 QPushButton:hover { background: rgba(255,255,255,24); color: #ffffff; }
 QCheckBox { color: #a1a1aa; font: 8.5pt "Segoe UI"; spacing: 5px; }
-QMenu { background: #141416; color: #f5f5f7; border: 1px solid rgba(255,255,255,22);
+QMenu { background: #121215; color: #f5f5f7; border: 1px solid rgba(255,255,255,20);
         border-radius: 10px; padding: 5px; font: 9pt "Segoe UI"; }
 QMenu::item { padding: 5px 18px 5px 12px; border-radius: 6px; }
-QMenu::item:selected { background: rgba(255,255,255,18); }
-QMenu::separator { height: 1px; background: rgba(255,255,255,16); margin: 4px 8px; }
+QMenu::item:selected { background: rgba(255,255,255,18); color: #ffffff; }
+QMenu::item:disabled { color: #52525b; }
+QMenu::separator { height: 1px; background: rgba(255,255,255,14); margin: 4px 8px; }
 QScrollBar:vertical { background: transparent; width: 6px; }
 QScrollBar::handle:vertical { background: rgba(255,255,255,30); border-radius: 3px; min-height: 24px; }
 QScrollBar::handle:vertical:hover { background: rgba(255,255,255,52); }
@@ -212,7 +232,7 @@ def transcript_html(snap: dict, show_raw: bool, rtl: bool = False) -> str:
         t_html = f'<span dir="ltr" style="color:#7d7d7d;font-size:11px">{esc(p["time"])}</span>'
         head = f'{badge}{ov}{t_html}'
         if p["status"] == "cleaning":
-            head += '<span dir="ltr" style="color:#7db4ff;font-size:11px"> · polishing…</span>'
+            head += '<span dir="ltr" style="color:#a1a1aa;font-size:11px"> · polishing…</span>'
             body = f'<span style="color:#9a9a9a"><i>{esc(p["raw"])}</i></span>'
         elif p["tokens"] and not show_raw:
             body = " ".join(
@@ -240,20 +260,73 @@ def transcript_html(snap: dict, show_raw: bool, rtl: bool = False) -> str:
 
 
 DARK_DIALOG_STYLE = """
-QDialog { background: #1e1e22; color: #ececec; font: 10pt "Segoe UI"; }
-QLabel { color: #ececec; font: 10pt "Segoe UI"; }
-QLabel#hint { color: #9a9aa2; font: 9pt "Segoe UI"; }
-QLineEdit { background: #2a2a30; color: #f2f2f2; border: 1px solid #3f3f46; border-radius: 7px;
-            padding: 6px 9px; font: 10pt "Segoe UI"; selection-background-color: #52525b; }
-QLineEdit:focus { border-color: #a1a1aa; }
-QPushButton { background: #2d2d34; color: #ececec; border: 1px solid #44444d; border-radius: 7px;
-              padding: 5px 14px; font: 9.5pt "Segoe UI"; }
-QPushButton:hover { background: #3a3a44; }
+QDialog { background: #0d0d10; color: #f5f5f7; font: 9.5pt "Segoe UI"; }
+QLabel { color: #f5f5f7; font: 9.5pt "Segoe UI"; }
+QLabel#hint { color: #8e8e93; font: 8.5pt "Segoe UI"; }
+QLineEdit { background: #1b1b1f; color: #f5f5f7; border: 1px solid rgba(255,255,255,18); border-radius: 8px;
+            padding: 6px 10px; font: 9.5pt "Segoe UI"; selection-background-color: #3f3f46; }
+QLineEdit:focus { border: 1px solid rgba(255,255,255,72); background: #1f1f24; }
+QPushButton { background: rgba(255,255,255,10); color: #e4e4e7; border: 1px solid rgba(255,255,255,16);
+              border-radius: 8px; padding: 6px 14px; font: 9.5pt "Segoe UI"; }
+QPushButton:hover { background: rgba(255,255,255,22); color: #ffffff; }
 QPushButton#primary { background: #f5f5f7; border-color: #f5f5f7; color: #09090b; font-weight: 600; }
-QPushButton#primary:hover { background: #e4e4e7; border-color: #e4e4e7; }
-QPushButton#subtle { background: transparent; border: none; color: #9a9aa2; padding: 5px 8px; }
-QPushButton#subtle:hover { color: #ececec; background: rgba(255,255,255,14); }
+QPushButton#primary:hover { background: #ffffff; border-color: #ffffff; color: #000000; }
+QPushButton#subtle { background: transparent; border: none; color: #8e8e93; padding: 5px 8px; }
+QPushButton#subtle:hover { color: #f5f5f7; background: rgba(255,255,255,14); }
 """
+
+
+class _TextPromptDialog(QDialog):
+    """Minimalist dark obsidian single-line prompt dialog (replaces legacy white QInputDialog)."""
+
+    def __init__(self, title: str, label: str, initial: str = "", ok_label: str = "Save",
+                 placeholder: str = "", parent=None):
+        super().__init__(parent)
+        self._styled_chrome = False
+        self.setWindowTitle(title)
+        self.setMinimumWidth(380)
+        self.setStyleSheet(DARK_DIALOG_STYLE)
+        self.setWindowFlag(Qt.WindowStaysOnTopHint, True)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(18, 14, 18, 14)
+        layout.setSpacing(10)
+
+        lbl = QLabel(label)
+        lbl.setWordWrap(True)
+        layout.addWidget(lbl)
+
+        self.edit = QLineEdit(initial)
+        if placeholder:
+            self.edit.setPlaceholderText(placeholder)
+        self.edit.returnPressed.connect(self.accept)
+        layout.addWidget(self.edit)
+
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        row.addStretch(1)
+        btn_cancel = QPushButton("Cancel")
+        btn_cancel.setAutoDefault(False)
+        btn_cancel.clicked.connect(self.reject)
+        btn_ok = QPushButton(ok_label)
+        btn_ok.setObjectName("primary")
+        btn_ok.setDefault(True)
+        btn_ok.clicked.connect(self.accept)
+        row.addWidget(btn_cancel)
+        row.addWidget(btn_ok)
+        layout.addLayout(row)
+
+        self.edit.setFocus()
+        self.edit.selectAll()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if not self._styled_chrome:
+            self._styled_chrome = True
+            apply_dark_titlebar(self)
+
+    def value(self) -> str:
+        return self.edit.text().strip()
 
 
 class _RenameSpeakerDialog(QDialog):
@@ -261,13 +334,14 @@ class _RenameSpeakerDialog(QDialog):
 
     def __init__(self, spk_id: str, current_name: str, parent=None):
         super().__init__(parent)
+        self._styled_chrome = False
         self.setWindowTitle(f"Rename {spk_id}")
         self.setMinimumWidth(320)
         self.setStyleSheet(DARK_DIALOG_STYLE)
         self.setWindowFlag(Qt.WindowStaysOnTopHint, True)
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setContentsMargins(18, 14, 18, 14)
         layout.setSpacing(10)
 
         lbl = QLabel(f'<b style="color:{_speaker_color(spk_id)}">{html.escape(spk_id)}</b>')
@@ -279,6 +353,7 @@ class _RenameSpeakerDialog(QDialog):
         layout.addWidget(self.edit)
 
         row = QHBoxLayout()
+        row.setSpacing(8)
         row.addStretch(1)
         btn_cancel = QPushButton("Cancel")
         btn_cancel.setAutoDefault(False)
@@ -294,6 +369,12 @@ class _RenameSpeakerDialog(QDialog):
         self.edit.setFocus()
         self.edit.selectAll()
 
+    def showEvent(self, event):
+        super().showEvent(event)
+        if not self._styled_chrome:
+            self._styled_chrome = True
+            apply_dark_titlebar(self)
+
     def value(self) -> str:
         return self.edit.text().strip()
 
@@ -303,6 +384,7 @@ class RenameSpeakersDialog(QDialog):
 
     def __init__(self, speakers: list[tuple[str, str]], edit_count: int = 0, parent=None):
         super().__init__(parent)
+        self._styled_chrome = False
         self._special_action = ""  # "", "undo", "reset_edits"
         self.setWindowTitle(f"{APP_NAME} - Rename Speakers")
         self.setMinimumWidth(360)
@@ -310,7 +392,7 @@ class RenameSpeakersDialog(QDialog):
         self.setWindowFlag(Qt.WindowStaysOnTopHint, True)
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setContentsMargins(18, 14, 18, 14)
         layout.setSpacing(10)
 
         hint = QLabel("Assign names to speakers. Click any speaker badge in the transcript to merge or reassign.")
@@ -355,6 +437,12 @@ class RenameSpeakersDialog(QDialog):
         btn_row.addWidget(btn_cancel)
         btn_row.addWidget(btn_save)
         layout.addLayout(btn_row)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if not self._styled_chrome:
+            self._styled_chrome = True
+            apply_dark_titlebar(self)
 
     def _trigger_special(self, kind: str):
         self._special_action = kind
@@ -536,7 +624,7 @@ class AudioWaveform(QWidget):
             p.drawRoundedRect(QRectF(x, cy - bh / 2.0, bar_w, bh), bar_w / 2.0, bar_w / 2.0)
 
 
-from .settings_dialog import SettingsDialog, VocabularyDialog  # noqa: E402
+from .settings_dialog import SettingsDialog, VocabularyDialog, apply_dark_titlebar  # noqa: E402
 
 
 # --------------------------------------------------------------------------- #
@@ -571,8 +659,9 @@ class EloquentWidget(QWidget):
         self._active_speaker_id = ""
         self._overlap_flash_until = 0.0
         self._last_overlap_seen = False
-        self._expanded_w = COMPACT_WIDTH
-        self._expanded_h = PANEL_HEIGHT
+        _preset = self._island_preset()
+        self._expanded_w = _preset["expanded_w"]
+        self._expanded_h = _preset["expanded_h"]
         self._anchor_cx = 0
         self._anchor_y = 8
         self._anim_rect_from = None
@@ -739,6 +828,15 @@ class EloquentWidget(QWidget):
         self.act_audio = self.menu.addAction("Save audio recording")
         self.act_audio.setCheckable(True)
         self.act_audio.toggled.connect(self._set_audio)
+        self.size_menu = self.menu.addMenu("Island size")
+        self.size_group = QActionGroup(self)
+        self.size_actions: dict[str, QAction] = {}
+        for sz_key, sz_label in ISLAND_SIZES:
+            act = self.size_menu.addAction(sz_label)
+            act.setCheckable(True)
+            act.triggered.connect(lambda _chk=False, k=sz_key: self._set_island_size(k))
+            self.size_group.addAction(act)
+            self.size_actions[sz_key] = act
         self.act_top = self.menu.addAction("Always on top")
         self.act_top.setCheckable(True)
         self.act_top.toggled.connect(self._set_on_top)
@@ -746,6 +844,7 @@ class EloquentWidget(QWidget):
         self.menu.addAction("Open sessions folder", lambda: self._open(self.s.resolved_sessions_dir()))
         self.menu.addAction("Clear Ask AI memory", self._clear_compose_history)
         self.menu.addAction("Create shortcuts + launch hotkey", self._make_shortcut)
+        self.menu.addAction("Reset island position", self._reset_island_pos)
         self.menu.addAction("Minimize", self.showMinimized)
         self.menu.addSeparator()
         self.menu.addAction(f"Quit {APP_NAME}", self.quit)
@@ -768,6 +867,14 @@ class EloquentWidget(QWidget):
             # Dock cleanly at top-center like Apple Dynamic Island
             self._anchor_cx = geo.center().x()
             self._anchor_y = geo.top() + 8
+
+    def _reset_island_pos(self):
+        scr = self.screen() or QGuiApplication.primaryScreen()
+        geo = scr.availableGeometry()
+        self._anchor_cx = geo.center().x()
+        self._anchor_y = geo.top() + 8
+        self._save_island_pos()
+        self._sync_island(animate=True)
 
     def _target_window_rect(self, card_w: int, card_h: int) -> QRect:
         win_w = int(card_w) + 2 * SHADOW_PAD_X
@@ -821,41 +928,40 @@ class EloquentWidget(QWidget):
                 return True
         return False
 
+    def _island_preset(self) -> dict:
+        key = normalize_island_size(getattr(self.s, "island_size", "medium"))
+        return ISLAND_PRESETS[key]
+
     def _desired_island_spec(self) -> tuple[str, int, int]:
         geo = self._screen_geo()
         scr_w, scr_h = max(800, geo.width()), max(600, geo.height())
+        preset = self._island_preset()
         if self.panel.isVisible():
             ew = max(MIN_EXPANDED_W, min(self._expanded_w, int(scr_w * 0.86)))
             eh = max(MIN_EXPANDED_H, min(self._expanded_h, int(scr_h * 0.80)))
             return "expanded", ew, eh
         st = self.engine.status
         mode = self.engine.session_mode
-        fm = self.caption.fontMetrics()
-        txt_w = fm.horizontalAdvance(self.caption_text or "")
         if st == "loading":
-            max_w = min(ISLAND_TOAST_MAX_W, int(scr_w * 0.36))
-            return "toast", max(200, min(max_w, txt_w + 96)), ISLAND_TOAST_H
+            return "toast", min(preset["compact_w"], int(scr_w * 0.44)), ISLAND_TOAST_H
         if st in ("listening", "stopping"):
             if mode in ("dictation", "compose"):
-                max_w = min(ISLAND_COMPACT_MAX_W, int(scr_w * 0.34))
-                w = max(ISLAND_COMPACT_MIN_W, min(max_w, txt_w + 158))
-                return "active_compact", w, ISLAND_COMPACT_H
-            max_w = min(ISLAND_MEETING_MAX_W, int(scr_w * 0.42))
-            spk_w = self.mode_pill.sizeHint().width() if self._active_speaker else 0
-            w = max(ISLAND_MEETING_MIN_W, min(max_w, txt_w + spk_w + 186))
-            return "active_meeting", w, ISLAND_MEETING_H
+                return "active_compact", min(preset["compact_w"], int(scr_w * 0.50)), preset["compact_h"]
+            return "active_meeting", min(preset["meeting_w"], int(scr_w * 0.62)), preset["meeting_h"]
         if self._toast_active:
-            max_w = min(ISLAND_TOAST_MAX_W, int(scr_w * 0.36))
+            fm = self.caption.fontMetrics()
+            txt_w = fm.horizontalAdvance(self.caption_text or "")
+            max_w = min(ISLAND_TOAST_MAX_W, int(scr_w * 0.38))
             return "toast", max(ISLAND_TOAST_MIN_W, min(max_w, txt_w + 46)), ISLAND_TOAST_H
         if self._hovered or self._menu_open:
             lang_w = self.lang_pill.sizeHint().width()
             brand_w = self.brand_lbl.sizeHint().width()
-            hov_w = max(ISLAND_HOVER_W, 16 + brand_w + lang_w + 156)
-            return "hover", min(hov_w, int(scr_w * 0.32)), ISLAND_HOVER_H
+            hov_w = max(preset["hover_w"], 16 + brand_w + lang_w + 156)
+            return "hover", min(hov_w, int(scr_w * 0.36)), preset["hover_h"]
         lang_w = self.lang_pill.sizeHint().width()
         brand_w = self.brand_lbl.sizeHint().width()
-        idle_w = max(122, min(186, 16 + brand_w + lang_w + 38))
-        return "idle", idle_w, ISLAND_IDLE_H
+        idle_w = max(122, min(192, 16 + brand_w + lang_w + 38))
+        return "idle", idle_w, preset["idle_h"]
 
     def _sync_island(self, animate: bool = True):
         mode, card_w, card_h = self._desired_island_spec()
@@ -1258,15 +1364,12 @@ class EloquentWidget(QWidget):
             self._toast_active = True
             self.dot.set_state(kind if kind in ("success", "error") else "idle")
         self._render_caption()
-        if not _from_idle:
-            if self.engine.status in ("idle", "loading") or self._toast_active:
-                self._sync_island(animate=True)
-            elif (self.engine.status == "listening" and not self.panel.isVisible()
-                  and self._morph_anim.state() != QVariantAnimation.Running):
-                _, want_w, _ = self._desired_island_spec()
-                cur_card_w = self.width() - 2 * SHADOW_PAD_X
-                if abs(want_w - cur_card_w) >= 20:
-                    self._sync_island(animate=True)
+        if not _from_idle and (self.engine.status == "idle" or self._toast_active):
+            self._sync_island(animate=True)
+
+    @staticmethod
+    def _has_arabic(text: str) -> bool:
+        return any("\u0600" <= ch <= "\u06ff" or "\u0750" <= ch <= "\u077f" or "\u08a0" <= ch <= "\u08ff" for ch in (text or ""))
 
     def _is_rtl_language(self) -> bool:
         return hasattr(self.s, "resolved_speech_language") and is_arabic_speech(self.s.resolved_speech_language())
@@ -1276,11 +1379,13 @@ class EloquentWidget(QWidget):
         self.view.setLayoutDirection(Qt.RightToLeft if rtl else Qt.LeftToRight)
 
     def _render_caption(self):
-        rtl_speech = self._is_rtl_language() and self.caption_kind in ("", "partial")
+        rtl_speech = (self._is_rtl_language() or self._has_arabic(self.caption_text)) and self.caption_kind in ("", "partial")
         self.caption.setLayoutDirection(Qt.RightToLeft if rtl_speech else Qt.LeftToRight)
-        self.caption.setAlignment((Qt.AlignRight if rtl_speech else Qt.AlignLeft) | Qt.AlignVCenter)
+        # Qt.AlignAbsolute prevents Qt from double-flipping AlignRight to visual-left under RightToLeft
+        self.caption.setAlignment((Qt.AlignRight if rtl_speech else Qt.AlignLeft) | Qt.AlignAbsolute | Qt.AlignVCenter)
         if not self.caption.isVisible():
-            self.caption.setText(self.caption_text)
+            txt = ("\u200F" + self.caption_text) if (rtl_speech and self.caption_text) else self.caption_text
+            self.caption.setText(txt)
             self.caption.setToolTip(self.caption_text if len(self.caption_text) > 60 else "")
             return
         fm = self.caption.fontMetrics()
@@ -1411,7 +1516,7 @@ class EloquentWidget(QWidget):
             st = rep["status"]
             if st == "generating":
                 self.view.setHtml(
-                    f'<p dir="ltr" align="left" style="color:#7db4ff"><i>Generating {html.escape(rep["label"])}…</i></p>')
+                    f'<p dir="ltr" align="left" style="color:#a1a1aa"><i>Generating {html.escape(rep["label"])}…</i></p>')
             elif st == "error":
                 self.view.setHtml(
                     f'<p dir="ltr" align="left" style="color:#ff8a80"><b>{html.escape(rep["label"])}</b><br>'
@@ -1623,15 +1728,16 @@ class EloquentWidget(QWidget):
         menu.exec(self.view.viewport().mapToGlobal(pos))
 
     def _fix_and_remember_selection(self, selected: str):
-        dlg = QInputDialog(self)
-        dlg.setWindowTitle(f"{APP_NAME} - Correct Word")
-        dlg.setLabelText(f'Correct "{selected}" to (also remembered for future transcripts):')
-        dlg.setTextValue(selected)
-        dlg.setWindowFlag(Qt.WindowStaysOnTopHint, True)
-        dlg.setStyleSheet("")
+        dlg = _TextPromptDialog(
+            f"{APP_NAME} - Correct Word",
+            f'Correct "{selected}" to (also remembered for future transcripts):',
+            initial=selected,
+            ok_label="Save",
+            parent=self,
+        )
         if not dlg.exec():
             return
-        replacement = dlg.textValue().strip()
+        replacement = dlg.value()
         if not replacement or replacement == selected:
             return
         count = self.engine.apply_vocabulary_fix(selected, replacement, remember=True)
@@ -1645,14 +1751,15 @@ class EloquentWidget(QWidget):
         self.engine.generate_report(format_id, custom_prompt)
 
     def _trigger_custom_gen(self):
-        dlg = QInputDialog(self)
-        dlg.setWindowTitle(f"{APP_NAME} - Custom Prompt")
-        dlg.setLabelText("How should the LLM format or analyze this transcript?")
-        dlg.setTextValue("Summarize the key points and list any action items.")
-        dlg.setWindowFlag(Qt.WindowStaysOnTopHint, True)
-        dlg.setStyleSheet("")
-        if dlg.exec() and dlg.textValue().strip():
-            self._trigger_gen("custom", dlg.textValue().strip())
+        dlg = _TextPromptDialog(
+            f"{APP_NAME} - Custom Prompt",
+            "How should the LLM format or analyze this transcript?",
+            initial="Summarize the key points and list any action items.",
+            ok_label="Generate",
+            parent=self,
+        )
+        if dlg.exec() and dlg.value():
+            self._trigger_gen("custom", dlg.value())
 
     def toggle_panel(self):
         show = not self.panel.isVisible()
@@ -1716,6 +1823,11 @@ class EloquentWidget(QWidget):
         self.act_audio.blockSignals(True)
         self.act_audio.setChecked(self.s.save_audio)
         self.act_audio.blockSignals(False)
+        cur_sz = normalize_island_size(getattr(self.s, "island_size", "medium"))
+        for k, act in self.size_actions.items():
+            act.blockSignals(True)
+            act.setChecked(k == cur_sz)
+            act.blockSignals(False)
         self.act_top.blockSignals(True)
         self.act_top.setChecked(self.s.always_on_top)
         self.act_top.blockSignals(False)
@@ -1744,6 +1856,15 @@ class EloquentWidget(QWidget):
         lbl = "Auto" if cap == 0 else f"{cap} speakers"
         self._caption(f"Max speakers set to {lbl}", "hint")
         self.caption_reset.start()
+
+    def _set_island_size(self, size_key: str):
+        sz = normalize_island_size(size_key)
+        self.s.island_size = sz
+        self.s.save()
+        preset = self._island_preset()
+        self._expanded_w = preset["expanded_w"]
+        self._expanded_h = preset["expanded_h"]
+        self._sync_island(animate=True)
 
     def _set_audio(self, on):
         self.s.save_audio = on
@@ -1782,12 +1903,17 @@ class EloquentWidget(QWidget):
     def open_settings(self, first_run=False):
         old_active = self.s.resolved_speech_language() if hasattr(self.s, "resolved_speech_language") else "parakeet"
         old_saved = normalize_speech_language(getattr(self.s, "speech_language", "parakeet"))
+        old_size = normalize_island_size(getattr(self.s, "island_size", "medium"))
         dlg = SettingsDialog(self.s, self, first_run=first_run,
                              speech_busy=(self.engine.busy or self.engine.status == "loading"))
         dlg.setWindowFlag(Qt.WindowStaysOnTopHint, True)
         if dlg.exec():
             if normalize_speech_language(self.s.speech_language) != old_saved and hasattr(self.s, "set_active_speech_language"):
                 self.s.set_active_speech_language(None)
+            if normalize_island_size(getattr(self.s, "island_size", "medium")) != old_size:
+                preset = self._island_preset()
+                self._expanded_w = preset["expanded_w"]
+                self._expanded_h = preset["expanded_h"]
             new_active = self.s.resolved_speech_language() if hasattr(self.s, "resolved_speech_language") else "parakeet"
             hk_ok = self.register_hotkey()
             self.engine.refresh_provider()

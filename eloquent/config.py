@@ -17,6 +17,18 @@ SPEECH_LANGUAGES = (
     ("arabic", "Arabic & Dialects (Cohere, Vulkan / CPU)"),
 )
 
+ISLAND_SIZES = (
+    ("small", "Small"),
+    ("medium", "Medium"),
+    ("large", "Large"),
+)
+
+
+def normalize_island_size(value: Optional[str]) -> str:
+    """Normalize the Dynamic Island size preset to ``'small'``, ``'medium'``, or ``'large'``."""
+    v = str(value or "").strip().lower()
+    return v if v in ("small", "medium", "large") else "medium"
+
 
 def is_arabic_speech(value: Optional[str]) -> bool:
     """Return True when *value* selects the Arabic Cohere speech backend."""
@@ -84,6 +96,7 @@ class Settings:
     restore_clipboard: bool = True    # restore previous clipboard text after dictation paste
     dictation_sound: bool = True      # play subtle chimes on dictation start and paste
     always_on_top: bool = True
+    island_size: str = "medium"       # small | medium | large
     widget_pos: Optional[list] = None
     web_port: int = 8765
 
@@ -98,6 +111,7 @@ class Settings:
                 if k in names:
                     setattr(s, k, v)
             s.speech_language = normalize_speech_language(s.speech_language)
+            s.island_size = normalize_island_size(s.island_size)
             try:
                 ms = int(s.max_speakers or 0)
             except (TypeError, ValueError):
