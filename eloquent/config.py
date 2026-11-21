@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Optional
@@ -48,6 +49,7 @@ class Settings:
     gemini_api_key: str = ""          # empty -> GEMINI_API_KEY / GOOGLE_API_KEY from env or .env
     llm_model: str = DEFAULT_LLM_MODEL
     keep_fillers: bool = False
+    custom_vocabulary: str = ""       # comma-separated names/terms or 'wrong -> right' learned fixes
     chunk_sentences: int = 3
     idle_flush: float = 6.0
     min_similarity: float = 0.5
@@ -55,6 +57,7 @@ class Settings:
     speech_language: str = "parakeet"  # "parakeet" (25 European languages) | "arabic" (Cohere Arabic GGUF)
     threads: int = 0                  # 0 = auto
     diarize: bool = True              # background multi-speaker identification (Speaker 1, 2, ...)
+    max_speakers: int = 0             # 0 = Auto (unlimited), >= 2 caps active speakers to top K
     audio_source: str = "mic"         # "mic" | "system" | "both"
     device: Optional[int] = None      # None = system default microphone
     loopback_device: Optional[str] = None  # None = default Windows playback speakers
@@ -95,6 +98,11 @@ class Settings:
                 if k in names:
                     setattr(s, k, v)
             s.speech_language = normalize_speech_language(s.speech_language)
+            try:
+                ms = int(s.max_speakers or 0)
+            except (TypeError, ValueError):
+                ms = 0
+            s.max_speakers = ms if ms >= 2 else 0
         except FileNotFoundError:
             pass
         except Exception as e:  # corrupted file: keep defaults, do not crash
@@ -105,6 +113,38 @@ class Settings:
         tmp = SETTINGS_FILE.with_suffix(".tmp")
         tmp.write_text(json.dumps(asdict(self), indent=2), encoding="utf-8")
         tmp.replace(SETTINGS_FILE)
+
+    def add_vocabulary_entry(self, entry: str) -> bool:
+        """Add or update a standalone term or ``'wrong -> right'`` fix in ``custom_vocabulary``."""
+        cleaned = re.sub(r"\s*(?:->|=>|→)\s*", " -> ", (entry or "").strip())
+        if not cleaned:
+            return False
+        items = [x.strip() for x in re.split(r"[,;\n،]+", self.custom_vocabulary or "") if x.strip()]
+        if " -> " in cleaned:
+            wrong, right = (p.strip() for p in cleaned.split(" -> ", 1))
+            if not wrong or not right:
+                return False
+            new_item = f"{wrong} -> {right}"
+            updated = False
+            for i, it in enumerate(items):
+                norm_it = re.sub(r"\s*(?:->|=>|→)\s*", " -> ", it)
+                if " -> " in norm_it:
+                    ex_wrong = norm_it.split(" -> ", 1)[0].strip().lower()
+                    if ex_wrong == wrong.lower():
+                        items[i] = new_item
+                        updated = True
+                        break
+            if not updated:
+                items.append(new_item)
+        else:
+            existing = {
+                it.lower() for it in items
+                if " -> " not in re.sub(r"\s*(?:->|=>|→)\s*", " -> ", it)
+            }
+            if cleaned.lower() not in existing:
+                items.append(cleaned)
+        self.custom_vocabulary = ", ".join(items)
+        return True
 
     # ------------------------------------------------------------------ #
     def __post_init__(self):

@@ -2,13 +2,15 @@
 
 from PySide6.QtCore import QPoint, Qt
 from PySide6.QtGui import QColor, QGuiApplication, QKeySequence, QPainter, QPalette, QPen, QPixmap
-from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QFileDialog, QFrame, QHBoxLayout, QKeySequenceEdit,
-                               QLabel, QLineEdit, QMessageBox, QPushButton, QScrollArea, QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDialog, QFileDialog, QFrame,
+                               QHBoxLayout, QHeaderView, QKeySequenceEdit, QLabel, QLineEdit, QMessageBox,
+                               QPushButton, QScrollArea, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget)
 
 from .. import APP_NAME
 from ..audio import AUDIO_SOURCES, list_input_devices, list_loopback_devices
 from ..config import SPEECH_LANGUAGES, config_dir, is_arabic_speech, normalize_speech_language
 from ..hotkeys import parse_hotkey
+from ..textutil import format_custom_vocabulary, parse_custom_vocabulary
 
 
 def _check_icon_path() -> str:
@@ -30,7 +32,7 @@ def _check_icon_path() -> str:
 
 
 DIALOG_STYLE = """
-SettingsDialog { background: #18181b; }
+SettingsDialog, VocabularyDialog { background: #18181b; }
 QWidget#body { background: transparent; }
 QScrollArea { background: transparent; border: none; }
 QLabel { color: #d8d8dc; font: 10pt "Segoe UI"; background: transparent; }
@@ -46,6 +48,15 @@ QLineEdit, QComboBox, QKeySequenceEdit {
 }
 QLineEdit:focus, QComboBox:focus, QKeySequenceEdit:focus { border: 1px solid #7c7cff; }
 QLineEdit:disabled, QComboBox:disabled { color: #6a6a72; background: #232327; }
+QTableWidget {
+    background: #26262b; color: #ececec; border: 1px solid #36363e; border-radius: 8px;
+    gridline-color: #32323a; font: 10pt "Segoe UI"; selection-background-color: #3b3b8f;
+}
+QTableWidget::item { padding: 4px 8px; }
+QHeaderView::section {
+    background: #2d2d34; color: #b4b4ba; border: none; border-bottom: 1px solid #3a3a42;
+    padding: 5px 8px; font: 600 9pt "Segoe UI";
+}
 QComboBox::drop-down { border: none; width: 24px; }
 QComboBox QAbstractItemView { background: #2a2a2f; color: #ececec; border: 1px solid #3a3a41;
                               selection-background-color: #3b3b8f; outline: 0; }
@@ -76,6 +87,217 @@ def _label(text: str, name: str = "", wrap: bool = False) -> QLabel:
     pal.setColor(QPalette.LinkVisited, QColor("#8fb4ff"))
     lb.setPalette(pal)
     return lb
+
+
+class VocabularyDialog(QDialog):
+    """Guided editor with separate Names & Terms and Misheard -> Corrected lists."""
+
+    def __init__(self, vocab_str: str = "", parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"{APP_NAME} - Personal Dictionary")
+        self.setMinimumSize(500, 480)
+        self.setWindowFlag(Qt.WindowStaysOnTopHint, True)
+        self.setStyleSheet(DIALOG_STYLE)
+
+        terms, pairs = parse_custom_vocabulary(vocab_str)
+        root = QVBoxLayout(self)
+        root.setContentsMargins(20, 16, 20, 16)
+        root.setSpacing(12)
+
+        root.addWidget(_label("Personal Dictionary", "title"))
+        root.addWidget(_label(
+            "Items below are only passed to the AI when your speech sounds similar, so normal sentences stay untouched.",
+            "hint", wrap=True,
+        ))
+
+        # --- Section 1: Names & Terms ---
+        root.addWidget(_label("NAMES & TERMS", "section"))
+        names_card = QFrame(objectName="card")
+        nc_lay = QVBoxLayout(names_card)
+        nc_lay.setContentsMargins(14, 11, 14, 11)
+        nc_lay.setSpacing(8)
+        nc_lay.addWidget(_label(
+            "Add your name, brands, or domain terms so they are spelled cleanly whenever mentioned.",
+            "hint", wrap=True,
+        ))
+
+        n_row = QHBoxLayout()
+        n_row.setSpacing(8)
+        self.name_input = QLineEdit()
+        self.name_input.setPlaceholderText("Name or term (e.g. John, Axbuilt, Kubernetes)")
+        self.name_input.returnPressed.connect(self.add_name)
+        self.btn_add_name = QPushButton("Add")
+        self.btn_add_name.setObjectName("small")
+        self.btn_add_name.setAutoDefault(False)
+        self.btn_add_name.clicked.connect(self.add_name)
+        n_row.addWidget(self.name_input, 1)
+        n_row.addWidget(self.btn_add_name)
+        nc_lay.addLayout(n_row)
+
+        self.names_table = QTableWidget(0, 2)
+        self.names_table.setHorizontalHeaderLabels(["Name / Term", ""])
+        self.names_table.verticalHeader().setVisible(False)
+        self.names_table.setSelectionMode(QAbstractItemView.NoSelection)
+        nh = self.names_table.horizontalHeader()
+        nh.setSectionResizeMode(0, QHeaderView.Stretch)
+        nh.setSectionResizeMode(1, QHeaderView.Fixed)
+        self.names_table.setColumnWidth(1, 42)
+        self.names_table.setMinimumHeight(115)
+        nc_lay.addWidget(self.names_table)
+        root.addWidget(names_card, 1)
+
+        # --- Section 2: Misheard -> Corrected ---
+        root.addWidget(_label("WORD CORRECTIONS", "section"))
+        pairs_card = QFrame(objectName="card")
+        pc_lay = QVBoxLayout(pairs_card)
+        pc_lay.setContentsMargins(14, 11, 14, 11)
+        pc_lay.setSpacing(8)
+        pc_lay.addWidget(_label(
+            "Map recurring ASR mistakes to their right spelling (right-clicking a mistake in the transcript also adds here, and rules work offline too).",
+            "hint", wrap=True,
+        ))
+
+        p_row = QHBoxLayout()
+        p_row.setSpacing(6)
+        self.wrong_input = QLineEdit()
+        self.wrong_input.setPlaceholderText("Misheard (e.g. axe built)")
+        self.wrong_input.returnPressed.connect(lambda: self.right_input.setFocus())
+        self.right_input = QLineEdit()
+        self.right_input.setPlaceholderText("Corrected (e.g. Axbuilt)")
+        self.right_input.returnPressed.connect(self.add_pair)
+        self.btn_add_pair = QPushButton("Add")
+        self.btn_add_pair.setObjectName("small")
+        self.btn_add_pair.setAutoDefault(False)
+        self.btn_add_pair.clicked.connect(self.add_pair)
+        p_row.addWidget(self.wrong_input, 1)
+        p_row.addWidget(_label("→"))
+        p_row.addWidget(self.right_input, 1)
+        p_row.addWidget(self.btn_add_pair)
+        pc_lay.addLayout(p_row)
+
+        self.pairs_table = QTableWidget(0, 3)
+        self.pairs_table.setHorizontalHeaderLabels(["Misheard", "Corrected", ""])
+        self.pairs_table.verticalHeader().setVisible(False)
+        self.pairs_table.setSelectionMode(QAbstractItemView.NoSelection)
+        ph = self.pairs_table.horizontalHeader()
+        ph.setSectionResizeMode(0, QHeaderView.Stretch)
+        ph.setSectionResizeMode(1, QHeaderView.Stretch)
+        ph.setSectionResizeMode(2, QHeaderView.Fixed)
+        self.pairs_table.setColumnWidth(2, 42)
+        self.pairs_table.setMinimumHeight(130)
+        pc_lay.addWidget(self.pairs_table)
+        root.addWidget(pairs_card, 1)
+
+        footer = QHBoxLayout()
+        footer.addStretch(1)
+        cancel = QPushButton("Cancel")
+        cancel.setAutoDefault(False)
+        cancel.clicked.connect(self.reject)
+        done = QPushButton("Done")
+        done.setObjectName("primary")
+        done.setAutoDefault(False)
+        done.setDefault(False)
+        done.clicked.connect(self.accept)
+        footer.addWidget(cancel)
+        footer.addWidget(done)
+        root.addLayout(footer)
+
+        for t in terms:
+            self._insert_name_row(t)
+        for w, r in pairs:
+            self._insert_pair_row(w, r)
+
+    def _make_delete_btn(self, table: QTableWidget, del_col: int) -> QPushButton:
+        btn = QPushButton("✕")
+        btn.setObjectName("small")
+        btn.setAutoDefault(False)
+        btn.setFixedWidth(32)
+        btn.setToolTip("Remove")
+        btn.clicked.connect(lambda _c=False, b=btn, tbl=table, col=del_col: self._remove_row_for_btn(tbl, b, col))
+        return btn
+
+    @staticmethod
+    def _remove_row_for_btn(table: QTableWidget, btn: QPushButton, del_col: int):
+        for r in range(table.rowCount()):
+            if table.cellWidget(r, del_col) is btn:
+                table.removeRow(r)
+                return
+
+    def _insert_name_row(self, text: str):
+        val = (text or "").strip()
+        if not val:
+            return
+        for r in range(self.names_table.rowCount()):
+            item = self.names_table.item(r, 0)
+            if item and item.text().strip().lower() == val.lower():
+                return
+        row = self.names_table.rowCount()
+        self.names_table.insertRow(row)
+        self.names_table.setItem(row, 0, QTableWidgetItem(val))
+        self.names_table.setCellWidget(row, 1, self._make_delete_btn(self.names_table, 1))
+        self.names_table.setRowHeight(row, 32)
+
+    def _insert_pair_row(self, wrong: str, right: str):
+        w, r_txt = (wrong or "").strip(), (right or "").strip()
+        if not w or not r_txt or w.lower() == r_txt.lower():
+            return
+        for r in range(self.pairs_table.rowCount()):
+            it_w = self.pairs_table.item(r, 0)
+            if it_w and it_w.text().strip().lower() == w.lower():
+                self.pairs_table.item(r, 0).setText(w)
+                self.pairs_table.item(r, 1).setText(r_txt)
+                return
+        row = self.pairs_table.rowCount()
+        self.pairs_table.insertRow(row)
+        self.pairs_table.setItem(row, 0, QTableWidgetItem(w))
+        self.pairs_table.setItem(row, 1, QTableWidgetItem(r_txt))
+        self.pairs_table.setCellWidget(row, 2, self._make_delete_btn(self.pairs_table, 2))
+        self.pairs_table.setRowHeight(row, 32)
+
+    def add_name(self, _checked: bool = False):
+        raw = self.name_input.text().strip()
+        if not raw:
+            return
+        terms, pairs = parse_custom_vocabulary(raw)
+        for t in terms:
+            self._insert_name_row(t)
+        for w, r in pairs:
+            self._insert_pair_row(w, r)
+        self.name_input.clear()
+
+    def add_pair(self, _checked: bool = False):
+        w = self.wrong_input.text().strip()
+        r = self.right_input.text().strip()
+        if not w or not r or w.lower() == r.lower():
+            return
+        self._insert_pair_row(w, r)
+        self.wrong_input.clear()
+        self.right_input.clear()
+        self.wrong_input.setFocus()
+
+    def vocabulary_string(self) -> str:
+        terms = []
+        for r in range(self.names_table.rowCount()):
+            it = self.names_table.item(r, 0)
+            if it and it.text().strip():
+                terms.append(it.text().strip())
+        extra_name = self.name_input.text().strip()
+        if extra_name:
+            extra_terms, extra_pairs = parse_custom_vocabulary(extra_name)
+            terms.extend(extra_terms)
+        else:
+            extra_pairs = []
+
+        pairs = list(extra_pairs)
+        for r in range(self.pairs_table.rowCount()):
+            it_w = self.pairs_table.item(r, 0)
+            it_r = self.pairs_table.item(r, 1)
+            if it_w and it_r and it_w.text().strip() and it_r.text().strip():
+                pairs.append((it_w.text().strip(), it_r.text().strip()))
+        ew, er = self.wrong_input.text().strip(), self.right_input.text().strip()
+        if ew and er:
+            pairs.append((ew, er))
+        return format_custom_vocabulary(terms, pairs)
 
 
 class SettingsDialog(QDialog):
@@ -227,6 +449,21 @@ class SettingsDialog(QDialog):
         self.fillers = QCheckBox("Keep filler words (uh, um)")
         self.fillers.setChecked(s.keep_fillers)
         lay.addWidget(self.fillers)
+
+        self._vocab_value = getattr(s, "custom_vocabulary", "")
+        self.vocab_summary = _label("", "hint", wrap=True)
+        self.btn_vocab = QPushButton("Manage…")
+        self.btn_vocab.setObjectName("small")
+        self.btn_vocab.clicked.connect(self._open_vocab_dialog)
+        v_row = QHBoxLayout()
+        v_col = QVBoxLayout()
+        v_col.setSpacing(2)
+        v_col.addWidget(_label("Personal dictionary"))
+        v_col.addWidget(self.vocab_summary)
+        v_row.addLayout(v_col, 1)
+        v_row.addWidget(self.btn_vocab, 0, Qt.AlignVCenter)
+        lay.addLayout(v_row)
+        self._sync_vocab_summary()
         return self._section("Transcript polishing", card)
 
     def _section_recording(self) -> QVBoxLayout:
@@ -280,6 +517,30 @@ class SettingsDialog(QDialog):
         lay.addWidget(self.diarize)
         lay.addWidget(_label("Labels speakers on 1 background thread so live caption speed is unaffected.",
                              "hint", wrap=True))
+
+        self.max_speakers = QComboBox()
+        max_opts = [(0, "Auto (detect automatically)")] + [(k, f"{k} speakers") for k in (2, 3, 4, 5, 6, 8)]
+        cur_max = int(getattr(s, "max_speakers", 0) or 0)
+        if cur_max >= 2 and all(v != cur_max for v, _ in max_opts):
+            max_opts.append((cur_max, f"{cur_max} speakers"))
+            max_opts.sort(key=lambda kv: kv[0])
+        for val, lbl in max_opts:
+            self.max_speakers.addItem(lbl, val)
+        idx_max = self.max_speakers.findData(cur_max if cur_max >= 2 else 0)
+        self.max_speakers.setCurrentIndex(max(0, idx_max))
+        self.max_speakers.setEnabled(s.diarize)
+        self.diarize.toggled.connect(self.max_speakers.setEnabled)
+        ms_box = QWidget()
+        ms_col = QVBoxLayout(ms_box)
+        ms_col.setContentsMargins(0, 0, 0, 0)
+        ms_col.setSpacing(5)
+        ms_col.addWidget(_label("Maximum speakers"))
+        ms_col.addWidget(self.max_speakers)
+        ms_col.addWidget(_label(
+            "Leave on Auto for unknown groups, or pick a fixed limit (e.g. 3) to prevent extra phantom speakers during noisy debates. Applies live.",
+            "hint", wrap=True,
+        ))
+        lay.addWidget(ms_box)
 
         row = QHBoxLayout()
         self.folder = QLineEdit(str(s.resolved_sessions_dir()))
@@ -400,6 +661,30 @@ class SettingsDialog(QDialog):
         }
         self.source_hint.setText(hints.get(src, ""))
 
+    def set_vocabulary(self, vocab_str: str):
+        self._vocab_value = (vocab_str or "").strip()
+        self._sync_vocab_summary()
+
+    def vocabulary(self) -> str:
+        return self._vocab_value
+
+    def _sync_vocab_summary(self):
+        terms, pairs = parse_custom_vocabulary(self._vocab_value)
+        if not terms and not pairs:
+            self.vocab_summary.setText("No custom names or word corrections yet.")
+        else:
+            parts = []
+            if terms:
+                parts.append(f"{len(terms)} name{'s' if len(terms) != 1 else ''}")
+            if pairs:
+                parts.append(f"{len(pairs)} correction{'s' if len(pairs) != 1 else ''}")
+            self.vocab_summary.setText(", ".join(parts) + " saved.")
+
+    def _open_vocab_dialog(self):
+        dlg = VocabularyDialog(self._vocab_value, self)
+        if dlg.exec():
+            self.set_vocabulary(dlg.vocabulary_string())
+
     def _sync_llm_enabled(self):
         on = (
             self.cleanup.isChecked()
@@ -456,8 +741,10 @@ class SettingsDialog(QDialog):
         s.llm_model = self.model.text().strip() or s.llm_model
         s.cleanup = self.cleanup.isChecked()
         s.keep_fillers = self.fillers.isChecked()
+        s.custom_vocabulary = self.vocabulary()
         s.save_audio = self.audio.isChecked()
         s.diarize = self.diarize.isChecked()
+        s.max_speakers = int(self.max_speakers.currentData() or 0)
         s.speech_language = normalize_speech_language(self.speech_lang.currentData())
         s.audio_source = self.source.currentData() or "mic"
         s.device = self.mic.currentData()

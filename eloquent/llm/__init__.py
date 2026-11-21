@@ -16,7 +16,8 @@ def make_provider(settings, force: bool = False):
         return None, "google-genai not installed (pip install google-genai)"
     try:
         speech_lang = settings.resolved_speech_language() if hasattr(settings, "resolved_speech_language") else getattr(settings, "speech_language", "parakeet")
-        return GeminiProvider(key, settings.llm_model, settings.keep_fillers, speech_language=speech_lang), ""
+        vocab = getattr(settings, "custom_vocabulary", "")
+        return GeminiProvider(key, settings.llm_model, settings.keep_fillers, speech_language=speech_lang, custom_vocabulary=vocab), ""
     except Exception as e:
         return None, f"{type(e).__name__}: {str(e)[:140]}"
 

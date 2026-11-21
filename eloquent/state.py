@@ -8,6 +8,9 @@ Event kinds emitted from here: "partial", "segment", "paragraph", "error".
 
 import json
 import threading
+from typing import Optional
+
+from .textutil import mark_changes
 
 
 def fmt_time(seconds: float) -> str:
@@ -71,7 +74,9 @@ class State:
 
     # -- diarizer side ----------------------------------------------------
     def apply_diarization(self, seg_id: int, parts: list[tuple[int, str, float, str, str]],
-                          mapping: dict[int, str]):
+                          mapping: dict[int, str],
+                          old_by_spk: Optional[dict[str, list[int]]] = None,
+                          id_remap: Optional[dict[str, str]] = None):
         """Attach speaker labels (and any mid-chunk splits) and propagate converged cluster IDs."""
         import time
         now = time.time()
@@ -120,62 +125,218 @@ class State:
                             p["seg_ids"] = list(sids) + extra
                     break
 
-            if mapping or segs_dirty:
-                for x in self.loose:
-                    if x["id"] in mapping:
-                        x["speaker"] = mapping[x["id"]]
-                new_paragraphs = []
-                for p in self.paragraphs:
-                    segs_meta = p.get("segs")
-                    if segs_meta:
-                        for item in segs_meta:
-                            if item["id"] in mapping:
-                                item["speaker"] = mapping[item["id"]]
-                        # Split into consecutive speaker runs if multiple speakers exist inside this paragraph
-                        spk_set = {item["speaker"] for item in segs_meta if item.get("speaker")}
-                        if len(spk_set) > 1:
-                            runs = []
-                            for item in segs_meta:
-                                sp = item.get("speaker", "")
-                                if runs and runs[-1]["speaker"] == sp:
-                                    runs[-1]["items"].append(item)
-                                else:
-                                    runs.append({"speaker": sp, "items": [item]})
-                            for ri, run in enumerate(runs):
-                                items = run["items"]
-                                raw_run = " ".join(it["text"] for it in items)
-                                if ri == 0:
-                                    base = p
-                                    if base.get("raw") != raw_run:
-                                        base["clean"] = None
-                                        base["tokens"] = None
-                                        base["status"] = "raw"
-                                else:
-                                    base = {
-                                        "id": self.next_id, "clean": None, "tokens": None, "status": "raw", "note": "",
-                                    }
-                                    self.next_id += 1
-                                base["time"] = items[0]["t"]
-                                base["raw"] = raw_run
-                                base["speaker"] = run["speaker"]
-                                base["seg_ids"] = [it["id"] for it in items]
-                                base["segs"] = items
-                                new_paragraphs.append(base)
-                            continue
-                        if spk_set:
-                            p["speaker"] = next(iter(spk_set))
-                    else:
-                        counts: dict[str, int] = {}
-                        for tid in p.get("seg_ids", ()):
-                            if tid in mapping:
-                                sp = mapping[tid]
-                                counts[sp] = counts.get(sp, 0) + 1
-                        if counts:
-                            p["speaker"] = max(counts.items(), key=lambda kv: kv[1])[0]
-                    new_paragraphs.append(p)
-                self.paragraphs = new_paragraphs
+            if mapping or segs_dirty or id_remap:
+                self._apply_mapping_locked(mapping or {}, id_remap=id_remap)
+            if self.speaker_names and old_by_spk and mapping:
+                self._remap_speaker_names_locked(old_by_spk, mapping)
             self.rev += 1
         self.emit("speakers", seg_id)
+
+    @staticmethod
+    def _spk_sort_key(cid: str) -> tuple[int, int, str]:
+        if cid.startswith("Speaker "):
+            tail = cid[8:].strip()
+            if tail.isdigit():
+                return (0, int(tail), cid)
+        return (1, 0, cid)
+
+    def _remap_speaker_names_locked(self, old_by_spk: dict[str, list[int]], mapping: dict[int, str]):
+        """Keep custom display names aligned with their real clusters across live renumbering."""
+        if not self.speaker_names or not old_by_spk or not mapping:
+            return
+        new_names: dict[str, str] = {}
+        tracked = []
+        untracked = []
+        for old_cid, custom_name in sorted(self.speaker_names.items(), key=lambda kv: self._spk_sort_key(kv[0])):
+            if not custom_name:
+                continue
+            tids = old_by_spk.get(old_cid, ())
+            if tids:
+                tracked.append((old_cid, custom_name, tids))
+            else:
+                untracked.append((old_cid, custom_name))
+
+        for old_cid, custom_name, tids in tracked:
+            counts: dict[str, int] = {}
+            for tid in tids:
+                ncid = mapping.get(tid)
+                if ncid:
+                    counts[ncid] = counts.get(ncid, 0) + 1
+            if counts:
+                best_ncid = max(counts.items(), key=lambda kv: (kv[1], kv[0] == old_cid))[0]
+                if best_ncid not in new_names and custom_name != best_ncid:
+                    new_names[best_ncid] = custom_name
+
+        for old_cid, custom_name in untracked:
+            if old_cid not in new_names and custom_name != old_cid:
+                new_names[old_cid] = custom_name
+
+        self.speaker_names = new_names
+
+    def _apply_mapping_locked(self, mapping: dict[int, str],
+                              id_remap: Optional[dict[str, str]] = None):
+        remap = id_remap or {}
+        for x in self.loose:
+            if x["id"] in mapping:
+                x["speaker"] = mapping[x["id"]]
+            elif remap and x.get("speaker") in remap:
+                x["speaker"] = remap[x["speaker"]]
+        new_paragraphs = []
+        for p in self.paragraphs:
+            segs_meta = p.get("segs")
+            if segs_meta:
+                for item in segs_meta:
+                    if item["id"] in mapping:
+                        item["speaker"] = mapping[item["id"]]
+                    elif remap and item.get("speaker") in remap:
+                        item["speaker"] = remap[item["speaker"]]
+                # Split into consecutive speaker runs if multiple speakers exist inside this paragraph
+                spk_set = {item["speaker"] for item in segs_meta if item.get("speaker")}
+                if len(spk_set) > 1:
+                    runs = []
+                    for item in segs_meta:
+                        sp = item.get("speaker", "")
+                        if runs and runs[-1]["speaker"] == sp:
+                            runs[-1]["items"].append(item)
+                        else:
+                            runs.append({"speaker": sp, "items": [item]})
+                    for ri, run in enumerate(runs):
+                        items = run["items"]
+                        raw_run = " ".join(it["text"] for it in items)
+                        if ri == 0:
+                            base = p
+                            if base.get("raw") != raw_run:
+                                base["clean"] = None
+                                base["tokens"] = None
+                                base["status"] = "raw"
+                        else:
+                            base = {
+                                "id": self.next_id, "clean": None, "tokens": None, "status": "raw", "note": "",
+                            }
+                            self.next_id += 1
+                        base["time"] = items[0]["t"]
+                        base["raw"] = raw_run
+                        base["speaker"] = run["speaker"]
+                        base["seg_ids"] = [it["id"] for it in items]
+                        base["segs"] = items
+                        new_paragraphs.append(base)
+                    continue
+                if spk_set:
+                    p["speaker"] = next(iter(spk_set))
+                elif remap and p.get("speaker") in remap:
+                    p["speaker"] = remap[p["speaker"]]
+            else:
+                counts: dict[str, int] = {}
+                for tid in p.get("seg_ids", ()):
+                    if tid in mapping:
+                        sp = mapping[tid]
+                        counts[sp] = counts.get(sp, 0) + 1
+                if counts:
+                    p["speaker"] = max(counts.items(), key=lambda kv: kv[1])[0]
+                elif remap and p.get("speaker") in remap:
+                    p["speaker"] = remap[p["speaker"]]
+            new_paragraphs.append(p)
+        self.paragraphs = new_paragraphs
+
+    def speaker_names_copy(self) -> dict[str, str]:
+        with self.lock:
+            return dict(self.speaker_names)
+
+    def apply_cluster_remap(self, mapping: dict[int, str],
+                            new_speaker_names: Optional[dict[str, str]] = None,
+                            id_remap: Optional[dict[str, str]] = None) -> bool:
+        """Apply a full cluster remap (from merge/dissolve/max-speakers) and updated names."""
+        if not mapping and not id_remap and new_speaker_names is None:
+            return False
+        with self.lock:
+            if mapping or id_remap:
+                self._apply_mapping_locked(mapping or {}, id_remap=id_remap)
+            if new_speaker_names is not None:
+                self.speaker_names = {
+                    k: v.strip() for k, v in new_speaker_names.items()
+                    if k and v and v.strip() and v.strip() != k
+                }
+            self.rev += 1
+        self.emit("speakers", None)
+        return True
+
+    def merge_speakers_fallback(self, src_cid: str, dst_cid: str) -> bool:
+        """Merge *src_cid* into *dst_cid* directly in State when voiceprints are unavailable."""
+        if not src_cid or not dst_cid or src_cid == dst_cid:
+            return False
+        changed = False
+        with self.lock:
+            for x in self.loose:
+                if x.get("speaker") == src_cid:
+                    x["speaker"] = dst_cid
+                    changed = True
+            for p in self.paragraphs:
+                if p.get("speaker") == src_cid:
+                    p["speaker"] = dst_cid
+                    changed = True
+                for item in p.get("segs") or ():
+                    if item.get("speaker") == src_cid:
+                        item["speaker"] = dst_cid
+                        changed = True
+            if changed:
+                src_name = self.speaker_names.pop(src_cid, "")
+                if src_name and dst_cid not in self.speaker_names:
+                    self.speaker_names[dst_cid] = src_name
+                self.rev += 1
+        if changed:
+            self.emit("speakers", None)
+        return changed
+
+    def item_turn_ids(self, item_kind: str, item_id: int) -> list[int]:
+        """Return the diarizer turn IDs belonging to a clicked paragraph (`'p'`) or loose segment (`'l'`)."""
+        with self.lock:
+            if item_kind == "l":
+                return [item_id]
+            if item_kind == "p":
+                for p in self.paragraphs:
+                    if p["id"] == item_id:
+                        segs = p.get("segs")
+                        if segs:
+                            return [it["id"] for it in segs]
+                        return list(p.get("seg_ids") or ())
+        return []
+
+    def reassign_item_speaker(self, item_kind: str, item_id: int, dst_cid: str) -> bool:
+        """Reassign only a single paragraph (`'p'`) or loose segment (`'l'`) to *dst_cid*."""
+        if not dst_cid:
+            return False
+        changed = False
+        with self.lock:
+            if item_kind == "l":
+                for x in self.loose:
+                    if x["id"] == item_id:
+                        if x.get("speaker") != dst_cid:
+                            x["speaker"] = dst_cid
+                            changed = True
+                        break
+                else:
+                    # Loose segment may have just been grouped into a paragraph by Cleaner
+                    for p in self.paragraphs:
+                        if item_id in (p.get("seg_ids") or ()):
+                            self._apply_mapping_locked({item_id: dst_cid})
+                            changed = True
+                            break
+            elif item_kind == "p":
+                for p in self.paragraphs:
+                    if p["id"] == item_id:
+                        if p.get("speaker") != dst_cid:
+                            p["speaker"] = dst_cid
+                            changed = True
+                        for it in p.get("segs") or ():
+                            if it.get("speaker") != dst_cid:
+                                it["speaker"] = dst_cid
+                                changed = True
+                        break
+            if changed:
+                self.rev += 1
+        if changed:
+            self.emit("speakers", None)
+        return changed
 
     # -- cleaner side -----------------------------------------------------
     def touch(self, kind: str, data=None):
@@ -200,17 +361,12 @@ class State:
 
     # -- readers ----------------------------------------------------------
     def _multi_speaker_locked(self) -> bool:
-        seen = set()
         for p in self.paragraphs:
             if p.get("speaker"):
-                seen.add(p["speaker"])
-                if len(seen) >= 2:
-                    return True
+                return True
         for x in self.loose:
             if x.get("speaker"):
-                seen.add(x["speaker"])
-                if len(seen) >= 2:
-                    return True
+                return True
         return False
 
     def _disp_spk(self, spk_id: str) -> str:
@@ -263,6 +419,30 @@ class State:
             self.rev += 1
         self.emit("speakers", None)
 
+    def replace_text(self, old_text: str, new_text: str) -> int:
+        """Replace *old_text* with *new_text* across active paragraphs and loose segments."""
+        if not old_text or not new_text or old_text == new_text:
+            return 0
+        changed = 0
+        with self.lock:
+            for p in self.paragraphs:
+                cur = p["clean"] if p.get("clean") else p["raw"]
+                if old_text in cur:
+                    updated = cur.replace(old_text, new_text)
+                    p["clean"] = updated
+                    p["tokens"] = mark_changes(p["raw"], updated)
+                    p["status"] = "done"
+                    changed += 1
+            for x in self.loose:
+                if old_text in x["text"]:
+                    x["text"] = x["text"].replace(old_text, new_text)
+                    changed += 1
+            if changed:
+                self.rev += 1
+        if changed:
+            self.emit("paragraph", None)
+        return changed
+
     def _build(self) -> dict:
         return {
             "rev": self.rev,
@@ -272,7 +452,7 @@ class State:
             "speakers": [{"id": cid, "name": name} for cid, name in self._speakers_locked()],
             "report": dict(self.report) if self.report else None,
             "loose": [
-                {"t": x["t"], "text": x["text"],
+                {"id": x["id"], "t": x["t"], "text": x["text"],
                  "speaker": self._disp_spk(x.get("speaker", "")),
                  "speaker_id": x.get("speaker", "")}
                 for x in self.loose

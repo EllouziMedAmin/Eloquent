@@ -5,6 +5,7 @@ import re
 import unicodedata
 
 WORD_RE = re.compile(r"[\w']+", re.UNICODE)
+_ARROW_RE = re.compile(r"\s*(?:->|=>|→)\s*")
 _HARAKAT = frozenset(chr(c) for c in range(0x064B, 0x0660)) | {"\u0670", "\u0640"}
 _PHONETIC_CLUSTERS = (
     ("qu", "k"), ("ch", "s"), ("sh", "s"), ("ph", "f"), ("th", "t"),
@@ -55,8 +56,121 @@ def phonetic_skeleton(text: str) -> str:
     return "".join(out)
 
 
+def parse_custom_vocabulary(vocab) -> tuple[list[str], list[tuple[str, str]]]:
+    """Parse comma/newline/semicolon-separated vocabulary into standalone terms and ``(wrong, right)`` pairs."""
+    if not vocab:
+        return [], []
+    raw_items = re.split(r"[,;\n،]+", vocab) if isinstance(vocab, str) else list(vocab)
+    terms: list[str] = []
+    seen_terms: set[str] = set()
+    pairs: list[tuple[str, str]] = []
+    pair_idx: dict[str, int] = {}
+
+    for item in raw_items:
+        s = (item or "").strip()
+        if not s:
+            continue
+        if _ARROW_RE.search(s):
+            parts = _ARROW_RE.split(s, maxsplit=1)
+            wrong, right = parts[0].strip(), parts[1].strip()
+            if wrong and right and wrong.lower() != right.lower():
+                key = wrong.lower()
+                if key in pair_idx:
+                    pairs[pair_idx[key]] = (wrong, right)
+                else:
+                    pair_idx[key] = len(pairs)
+                    pairs.append((wrong, right))
+        else:
+            key = s.lower()
+            if key not in seen_terms:
+                seen_terms.add(key)
+                terms.append(s)
+    return terms, pairs
+
+
+def format_custom_vocabulary(terms, pairs) -> str:
+    """Format standalone *terms* and ``(wrong, right)`` *pairs* back into a normalized settings string."""
+    combined = [str(t).strip() for t in (terms or ()) if str(t).strip()]
+    combined += [f"{str(w).strip()} -> {str(r).strip()}" for w, r in (pairs or ()) if str(w).strip() and str(r).strip()]
+    clean_terms, clean_pairs = parse_custom_vocabulary(combined)
+    return ", ".join(clean_terms + [f"{w} -> {r}" for w, r in clean_pairs])
+
+
+def apply_learned_replacements(text: str, vocab) -> str:
+    """Apply exact learned ``wrong -> right`` rules to *text* (useful when LLM cleanup is off)."""
+    if not text or not vocab:
+        return text
+    _, pairs = parse_custom_vocabulary(vocab)
+    out = text
+    for wrong, right in pairs:
+        pattern = re.compile(rf"(?<!\w){re.escape(wrong)}(?!\w)", re.IGNORECASE)
+        out = pattern.sub(lambda _m, r=right: r, out)
+    return out
+
+
+def match_custom_vocabulary(raw: str, vocab, max_matches: int = 8) -> tuple[list[str], list[tuple[str, str]]]:
+    """Return only custom vocabulary terms and learned pairs phonetically/lexically relevant to *raw*."""
+    terms, pairs = parse_custom_vocabulary(vocab)
+    if (not terms and not pairs) or not raw or not raw.strip():
+        return [], []
+    raw_norm = norm_ar_for_sim(strip_diacritics_and_norm(raw))
+    raw_words = WORD_RE.findall(raw_norm)
+    if not raw_words:
+        return [], []
+
+    windows: list[tuple[int, str, str]] = []
+    n_raw = len(raw_words)
+    for wlen in (1, 2, 3):
+        for i in range(max(0, n_raw - wlen + 1)):
+            chunk = raw_words[i:i + wlen]
+            windows.append((wlen, "".join(chunk), phonetic_skeleton(" ".join(chunk))))
+
+    def _matches(phrase: str) -> bool:
+        p_norm = norm_ar_for_sim(strip_diacritics_and_norm(phrase))
+        if p_norm and p_norm in raw_norm:
+            return True
+        p_words = WORD_RE.findall(p_norm)
+        if not p_words:
+            return False
+        t_len = len(p_words)
+        t_compact = "".join(p_words)
+        t_sk = phonetic_skeleton(phrase)
+        for wlen, w_compact, w_sk in windows:
+            if wlen > t_len + 1:
+                continue
+            if difflib.SequenceMatcher(None, t_compact, w_compact, autojunk=False).ratio() >= 0.74:
+                return True
+            if not t_sk or not w_sk:
+                continue
+            sk_sim = difflib.SequenceMatcher(None, t_sk, w_sk, autojunk=False).ratio()
+            if len(t_sk) >= 4 and (t_sk == w_sk or sk_sim >= 0.75):
+                return True
+            if len(t_sk) == 3 and (t_sk == w_sk or (sk_sim >= 0.80 and t_sk[0] == w_sk[0])):
+                return True
+            if len(t_sk) == 2 and t_sk == w_sk and abs(len(w_compact) - len(t_compact)) <= 2 and len(w_compact) >= 4:
+                return True
+        return False
+
+    matched_pairs = [(w, r) for w, r in pairs if _matches(w) or _matches(r)][:max_matches]
+    matched_terms = [t for t in terms if _matches(t)][:max_matches]
+    return matched_terms, matched_pairs
+
+
+def _copies_upcoming_tail(raw_w: list[str], clean_w: list[str], up_w: list[str]) -> bool:
+    """Return True if *clean_w* appended 2+ extra words copied from *up_w*."""
+    if not up_w or len(clean_w) <= len(raw_w):
+        return False
+    span = min(len(up_w), max(2, len(clean_w) - len(raw_w)))
+    tail = clean_w[-span:]
+    return (
+        len(tail) >= 2
+        and raw_w[-len(tail):] != tail
+        and any(up_w[i:i + len(tail)] == tail for i in range(max(0, len(up_w) - len(tail) + 1)))
+    )
+
+
 def accept_bilingual_fix(raw: str, clean: str, min_sim: float, context: str = "",
-                         dictation: bool = False) -> tuple[bool, float]:
+                         dictation: bool = False, upcoming: str = "") -> tuple[bool, float]:
     """Allow meaning-based word fixes and French/English term restorations while blocking rewrites and hallucinations."""
     rw = WORD_RE.findall(norm_ar_for_sim(strip_diacritics_and_norm(raw)))
     cw = WORD_RE.findall(norm_ar_for_sim(strip_diacritics_and_norm(clean)))
@@ -79,6 +193,10 @@ def accept_bilingual_fix(raw: str, clean: str, min_sim: float, context: str = ""
         span = min(len(ctx_w), max(2, nc - nr))
         head = cw[:span]
         if len(head) >= 2 and any(ctx_w[i:i + len(head)] == head for i in range(max(0, len(ctx_w) - len(head) + 1))):
+            return False, 0.0
+    if upcoming:
+        up_w = WORD_RE.findall(norm_ar_for_sim(strip_diacritics_and_norm(upcoming)))[:16]
+        if _copies_upcoming_tail(rw, cw, up_w):
             return False, 0.0
 
     lex_sim = difflib.SequenceMatcher(None, rw, cw, autojunk=False).ratio()
@@ -110,18 +228,22 @@ def norm_words(text: str):
     return [w.lower() for w in WORD_RE.findall(text)]
 
 
-def accept_cleaned(raw: str, clean: str, min_sim: float, dictation: bool = False):
+def accept_cleaned(raw: str, clean: str, min_sim: float, dictation: bool = False, upcoming: str = ""):
     """Reject the model's output if it rewrote, shortened or padded the text."""
     a, b = norm_words(raw), norm_words(clean)
     if not b:
         return False, 0.0
-    sim = difflib.SequenceMatcher(None, a, b, autojunk=False).ratio()
+    if upcoming and _copies_upcoming_tail(a, b, norm_words(upcoming)[:16]):
+        return False, 0.0
+    word_sim = difflib.SequenceMatcher(None, a, b, autojunk=False).ratio()
+    compact_sim = difflib.SequenceMatcher(None, "".join(a), "".join(b), autojunk=False).ratio()
+    sim = max(word_sim, compact_sim * 0.9)
     ratio = len(b) / max(1, len(a))
     if dictation:
         threshold = min(min_sim, 0.25)
         return (sim >= threshold and 0.20 <= ratio <= 1.35), sim
     threshold = min_sim if len(a) >= 12 else min(min_sim, 0.5)
-    return (sim >= threshold and 0.5 <= ratio <= 1.3), sim
+    return (sim >= threshold and 0.45 <= ratio <= 1.3), sim
 
 
 def mark_changes(raw: str, clean: str):

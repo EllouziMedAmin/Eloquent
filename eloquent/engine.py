@@ -21,12 +21,14 @@ import gc
 import queue
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
 
 from .audio import LoopbackCapture, MicCapture
 from .cleaner import Cleaner, DICTATION_PAUSE_SEC
+from .config import config_dir, is_arabic_speech
 from .diarizer import Diarizer, build_speaker_extractor, ensure_speaker_model
 from .llm import make_provider
 from .llm.prompts import build_format_instruction
@@ -42,11 +44,14 @@ class _StreamPipe:
     """Per-audio-source VAD + partial buffer + speaker routing state."""
 
     def __init__(self, tag: str, vad, preroll: int, partial_every: int,
+                 max_samples: int = int(8.0 * SAMPLE_RATE),
                  use_diarizer: bool = True, fixed_speaker: str = "", partial_prefix: str = ""):
         self.tag = tag
         self.vad = vad
         self.preroll = preroll
         self.partial_every = partial_every
+        self.max_samples = max(int(SAMPLE_RATE), int(max_samples))
+        self.speech_samples = 0
         self.use_diarizer = use_diarizer
         self.fixed_speaker = fixed_speaker
         self.partial_prefix = partial_prefix
@@ -79,12 +84,14 @@ class Engine:
         self.vad_path = None
         self.extractor = None
         self.diarizer = None
+        self._last_clusterer = None
         self.provider = None
         self.dict_provider = None
         self.compose_provider = None
         self.compose_history = []
         self._diar_lock = threading.Lock()
         self._model_lock = threading.Lock()
+        self._log_lock = threading.Lock()
         self._provider_key = None
         self._listeners = []
         self._stop = threading.Event()
@@ -106,6 +113,13 @@ class Engine:
                 print(f"[engine] listener error on {kind}: {e}")
 
     def log(self, msg: str, level: str = "info"):
+        try:
+            line = f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} [{level.upper()}] {msg}\n"
+            with self._log_lock:
+                with open(config_dir() / "eloquent.log", "a", encoding="utf-8") as f:
+                    f.write(line)
+        except Exception:
+            pass
         self._emit("log", (level, msg))
 
     def _set_status(self, status: str):
@@ -183,9 +197,10 @@ class Engine:
                 self.log(f"[diarize] Disabled ({type(e).__name__}: {e})", "warn")
 
     def sync_diarizer(self):
-        """Lazy-load speaker extractor in the background if diarization was toggled ON after startup."""
+        """Lazy-load speaker extractor if enabled and propagate live max_speakers changes."""
         if self.settings.diarize and self._loaded and self.extractor is None:
             threading.Thread(target=self._load_speaker_extractor, daemon=True, name="eloquent-diar-load").start()
+        self.set_max_speakers(getattr(self.settings, "max_speakers", 0))
 
     def clear_compose_history(self):
         self.compose_history.clear()
@@ -193,6 +208,10 @@ class Engine:
     def refresh_provider(self, force: bool = False):
         """(Re)create the LLM provider(s) when settings change. The key check runs in the background."""
         s = self.settings
+        vocab = getattr(s, "custom_vocabulary", "")
+        for p in (self.provider, self.dict_provider, self.compose_provider):
+            if p is not None and hasattr(p, "custom_vocabulary"):
+                p.custom_vocabulary = vocab
         key = (s.cleanup, s.dictation_cleanup, bool(s.compose_hotkey),
                s.resolved_api_key(), s.llm_model, s.keep_fillers, s.resolved_speech_language())
         if key == self._provider_key and not force:
@@ -264,6 +283,7 @@ class Engine:
         self._paste_on_stop = paste_mode
 
         self.state.reset()
+        self._last_clusterer = None
         if paste_mode:
             self.session = None
         else:
@@ -272,9 +292,11 @@ class Engine:
         use_diar = (not paste_mode) and s.diarize
         if use_diar and self.extractor is None:
             self._load_speaker_extractor()
-        self.diarizer = Diarizer(self.extractor, self.state, self.session, log=self.log) if (
-            use_diar and self.extractor is not None
-        ) else None
+        self.diarizer = Diarizer(
+            self.extractor, self.state, self.session, log=self.log,
+            arabic_mode=is_arabic_speech(s.resolved_speech_language()),
+            max_speakers=getattr(s, "max_speakers", 0),
+        ) if (use_diar and self.extractor is not None) else None
         if self.diarizer is not None:
             self.diarizer.start()
         self.cleaner = Cleaner(
@@ -293,26 +315,27 @@ class Engine:
         max_utt = min(float(max_utt_raw), 8.0)
         self._is_file_run = wav_path is not None
         self._session_t0 = time.monotonic()
+        max_samples = int(max_utt * SAMPLE_RATE)
         self._pipes: dict[str, _StreamPipe] = {}
         if wav_path is not None:
             self._pipes["file"] = _StreamPipe(
                 "file", build_vad(self.vad_path, s.vad_threshold, silence, max_utt),
-                preroll, partial_every, use_diarizer=(self.diarizer is not None),
+                preroll, partial_every, max_samples=max_samples, use_diarizer=(self.diarizer is not None),
             )
         elif src == "both":
             self._pipes["mic"] = _StreamPipe(
                 "mic", build_vad(self.vad_path, s.vad_threshold, silence, max_utt),
-                preroll, partial_every, use_diarizer=False, fixed_speaker="You", partial_prefix="You: ",
+                preroll, partial_every, max_samples=max_samples, use_diarizer=False, fixed_speaker="You", partial_prefix="You: ",
             )
             self._pipes["system"] = _StreamPipe(
                 "system", build_vad(self.vad_path, s.vad_threshold, silence, max_utt),
-                preroll, partial_every, use_diarizer=(self.diarizer is not None),
+                preroll, partial_every, max_samples=max_samples, use_diarizer=(self.diarizer is not None),
                 fixed_speaker="" if self.diarizer is not None else "Remote",
             )
         else:
             self._pipes[src] = _StreamPipe(
                 src, build_vad(self.vad_path, s.vad_threshold, silence, max_utt),
-                preroll, partial_every, use_diarizer=(self.diarizer is not None),
+                preroll, partial_every, max_samples=max_samples, use_diarizer=(self.diarizer is not None),
             )
 
         self._stop.clear()
@@ -446,11 +469,30 @@ class Engine:
         pipe.buf_len += len(frame)
         speaking = vad.is_speech_detected()
 
+        # sherpa-onnx Silero VAD suppresses max_speech_duration after its first forced cut until silence;
+        # flush cleanly at max_samples so continuous fast speech still emits bounded segments and partials.
+        if speaking:
+            pipe.speech_samples += len(frame)
+            if pipe.speech_samples >= pipe.max_samples and vad.empty():
+                vad.flush()
+                pipe.speech_samples = 0
+                speaking = vad.is_speech_detected()
+        else:
+            pipe.speech_samples = 0
+
         if not speaking and vad.empty():
             # keep a short pre-roll so the first syllable is not cut
             while pipe.buf_len - len(pipe.buf[0]) >= pipe.preroll and len(pipe.buf) > 1:
-                pipe.buf_len -= len(pipe.buf.popleft())
+                dropped = len(pipe.buf.popleft())
+                pipe.buf_len -= dropped
+                pipe.partial_cut = max(0, pipe.partial_cut - dropped)
             return
+
+        max_buf = pipe.max_samples + pipe.preroll
+        while pipe.buf_len - len(pipe.buf[0]) >= max_buf and len(pipe.buf) > 1:
+            dropped = len(pipe.buf.popleft())
+            pipe.buf_len -= dropped
+            pipe.partial_cut = max(0, pipe.partial_cut - dropped)
 
         pipe.since_partial += len(frame)
         buf_sec = pipe.buf_len / SAMPLE_RATE
@@ -464,39 +506,44 @@ class Engine:
             full = np.concatenate(pipe.buf)
             tail = full[pipe.partial_cut:]
             t_dec = time.monotonic()
-            if supports_words and len(tail) > int(4.4 * SAMPLE_RATE):
-                tail_raw, pwords = transcribe_detailed(self.recognizer, tail)
-                tail_dur = len(tail) / SAMPLE_RATE
-                cut_idx = None
-                for wi in range(len(pwords) - 1, -1, -1):
-                    if pwords[wi]["t1"] <= tail_dur - 1.8:
-                        if wi + 1 < len(pwords) and (pwords[wi + 1]["t0"] - pwords[wi]["t1"]) >= 0.06:
-                            cut_idx = wi
-                            break
-                        if cut_idx is None:
-                            cut_idx = wi
-                if cut_idx is not None:
-                    committed = " ".join(w["w"] for w in pwords[:cut_idx + 1]).strip()
-                    rest = " ".join(w["w"] for w in pwords[cut_idx + 1:]).strip()
-                    if committed:
-                        pipe.partial_prefix_text = f"{pipe.partial_prefix_text} {committed}".strip()
-                    t_adv = float(pwords[cut_idx]["t1"])
-                    if cut_idx + 1 < len(pwords):
-                        gap = float(pwords[cut_idx + 1]["t0"]) - t_adv
-                        t_adv = t_adv + min(0.03, 0.5 * max(0.0, gap))
-                    pipe.partial_cut += min(len(tail), max(0, int(t_adv * SAMPLE_RATE)))
-                    text = f"{pipe.partial_prefix_text} {rest}".strip()
-                elif pwords:
-                    text = f"{pipe.partial_prefix_text} {' '.join(w['w'] for w in pwords)}".strip()
+            try:
+                if supports_words and len(tail) > int(4.4 * SAMPLE_RATE):
+                    tail_raw, pwords = transcribe_detailed(self.recognizer, tail)
+                    tail_dur = len(tail) / SAMPLE_RATE
+                    cut_idx = None
+                    for wi in range(len(pwords) - 1, -1, -1):
+                        if pwords[wi]["t1"] <= tail_dur - 1.8:
+                            if wi + 1 < len(pwords) and (pwords[wi + 1]["t0"] - pwords[wi]["t1"]) >= 0.06:
+                                cut_idx = wi
+                                break
+                            if cut_idx is None:
+                                cut_idx = wi
+                    if cut_idx is not None:
+                        committed = " ".join(w["w"] for w in pwords[:cut_idx + 1]).strip()
+                        rest = " ".join(w["w"] for w in pwords[cut_idx + 1:]).strip()
+                        if committed:
+                            pipe.partial_prefix_text = f"{pipe.partial_prefix_text} {committed}".strip()
+                        t_adv = float(pwords[cut_idx]["t1"])
+                        if cut_idx + 1 < len(pwords):
+                            gap = float(pwords[cut_idx + 1]["t0"]) - t_adv
+                            t_adv = t_adv + min(0.03, 0.5 * max(0.0, gap))
+                        pipe.partial_cut += min(len(tail), max(0, int(t_adv * SAMPLE_RATE)))
+                        text = f"{pipe.partial_prefix_text} {rest}".strip()
+                    elif pwords:
+                        text = f"{pipe.partial_prefix_text} {' '.join(w['w'] for w in pwords)}".strip()
+                    else:
+                        text = f"{pipe.partial_prefix_text} {tail_raw}".strip()
                 else:
-                    text = f"{pipe.partial_prefix_text} {tail_raw}".strip()
-            else:
-                tail_text = transcribe(self.recognizer, tail)
-                text = f"{pipe.partial_prefix_text} {tail_text}".strip()
-            pipe.last_partial_dt = time.monotonic() - t_dec
-            if text and text != pipe.last_partial:
-                pipe.last_partial = text
-                self.state.set_partial(f"{pipe.partial_prefix}{text}" if pipe.partial_prefix else text)
+                    if len(tail) > pipe.max_samples:
+                        tail = tail[-pipe.max_samples:]
+                    tail_text = transcribe(self.recognizer, tail)
+                    text = f"{pipe.partial_prefix_text} {tail_text}".strip()
+                pipe.last_partial_dt = time.monotonic() - t_dec
+                if text and text != pipe.last_partial:
+                    pipe.last_partial = text
+                    self.state.set_partial(f"{pipe.partial_prefix}{text}" if pipe.partial_prefix else text)
+            except Exception as e:
+                self.log(f"[asr] partial skipped: {type(e).__name__}: {e}", "warn")
 
         self._drain_pipe(pipe, elapsed)
 
@@ -507,7 +554,11 @@ class Engine:
             seg = np.asarray(vad.front.samples, dtype=np.float32)
             vad.pop()
             t1 = time.time()
-            text, words = transcribe_detailed(self.recognizer, seg)
+            try:
+                text, words = transcribe_detailed(self.recognizer, seg)
+            except Exception as e:
+                self.log(f"[asr] segment skipped: {type(e).__name__}: {e}", "warn")
+                text, words = "", []
             dur = len(seg) / SAMPLE_RATE
             decode = time.time() - t1
             if text:
@@ -530,6 +581,7 @@ class Engine:
                 self.state.set_partial("")
             pipe.buf.clear()
             pipe.buf_len = 0
+            pipe.speech_samples = 0
             pipe.since_partial = 0
             pipe.last_partial = ""
             pipe.partial_cut = 0
@@ -602,6 +654,8 @@ class Engine:
             if self.diarizer is not None or self.state.snapshot().get("multi_speaker"):
                 self.session.sync_from_state(self.state)
             self.session.close()
+        if self.diarizer is not None:
+            self._last_clusterer = self.diarizer.clusterer
         self.diarizer = None
         d = str(self.session.dir) if self.session is not None else ""
         mode = self.session_mode
@@ -622,13 +676,267 @@ class Engine:
     # ------------------------------------------------------------------ #
     # speaker naming & post-session document generation
     # ------------------------------------------------------------------ #
-    def rename_speakers(self, names: dict[str, str]):
-        """Rename speakers in State and sync raw.txt / clean.txt on disk."""
-        self.state.rename_speakers(names)
+    def _sync_session_files(self):
         if self.session is not None and not self.session.raw_f.closed:
             self.session.sync_from_state(self.state)
         elif self.last_session_dir:
             write_session_files(Path(self.last_session_dir), self.state)
+
+    def rename_speakers(self, names: dict[str, str]):
+        """Rename speakers in State and sync raw.txt / clean.txt on disk."""
+        self.state.rename_speakers(names)
+        self._sync_session_files()
+
+    def can_dissolve_speaker(self, spk_cid: str) -> bool:
+        """Return True when *spk_cid* has voiceprints and at least 2 diarized speakers exist."""
+        if not spk_cid:
+            return False
+        diar = self.diarizer
+        if diar is not None:
+            return diar.has_speaker(spk_cid) and diar.speaker_count() >= 2
+        cl = self._last_clusterer
+        if cl is not None:
+            return cl.has_speaker(spk_cid) and cl.speaker_count() >= 2
+        return False
+
+    def speaker_anchor_ids(self, spk_cid: str) -> list[int]:
+        """Capture stable turn IDs for *spk_cid* so live UI clicks survive renumbering."""
+        if not spk_cid:
+            return []
+        diar = self.diarizer
+        if diar is not None:
+            return diar.speaker_anchor_ids(spk_cid)
+        cl = self._last_clusterer
+        if cl is not None:
+            return cl.speaker_anchor_ids(spk_cid)
+        return []
+
+    def resolve_speaker_from_anchors(self, fallback_cid: str, anchors: list[int]) -> str:
+        diar = self.diarizer
+        if diar is not None:
+            return diar.resolve_speaker_from_anchors(fallback_cid, anchors)
+        cl = self._last_clusterer
+        if cl is not None:
+            return cl.resolve_speaker_from_anchors(fallback_cid, anchors)
+        return fallback_cid
+
+    def merge_speakers(self, src_cid: str, dst_cid: str,
+                       src_anchors: list[int] = None, dst_anchors: list[int] = None) -> bool:
+        """Merge *src_cid* into *dst_cid* (live voiceprint merge when available, else State merge)."""
+        if src_anchors:
+            src_cid = self.resolve_speaker_from_anchors(src_cid, src_anchors)
+        if dst_anchors:
+            dst_cid = self.resolve_speaker_from_anchors(dst_cid, dst_anchors)
+        if not src_cid or not dst_cid or src_cid == dst_cid:
+            return False
+        old_names = self.state.speaker_names_copy()
+        diar = self.diarizer
+        if diar is not None and diar.has_speaker(src_cid) and diar.has_speaker(dst_cid):
+            mapping, remapped = diar.merge_speakers(src_cid, dst_cid, old_names=old_names)
+            if mapping:
+                self.state.apply_cluster_remap(mapping, remapped, id_remap=diar.last_id_remap())
+                self._sync_session_files()
+                return True
+        cl = self._last_clusterer
+        if diar is None and cl is not None and cl.has_speaker(src_cid) and cl.has_speaker(dst_cid):
+            mapping, remapped = cl.merge_speakers(src_cid, dst_cid, old_names=old_names)
+            if mapping:
+                self.state.apply_cluster_remap(mapping, remapped, id_remap=cl.last_id_remap)
+                self._sync_session_files()
+                return True
+        if self.state.merge_speakers_fallback(src_cid, dst_cid):
+            self._sync_session_files()
+            return True
+        return False
+
+    def reassign_line_speaker(self, item_kind: str, item_id: int, dst_cid: str,
+                              dst_anchors: list[int] = None) -> bool:
+        """Reassign only one paragraph (`'p'`) or loose segment (`'l'`) to *dst_cid*."""
+        if dst_anchors:
+            dst_cid = self.resolve_speaker_from_anchors(dst_cid, dst_anchors)
+        if not item_kind or item_id is None or not dst_cid:
+            return False
+        turn_ids = self.state.item_turn_ids(item_kind, item_id)
+        old_names = self.state.speaker_names_copy()
+        diar = self.diarizer
+        if diar is not None and turn_ids and diar.has_speaker(dst_cid) and diar.has_any_turn(turn_ids):
+            mapping, remapped = diar.pin_turns_to_speaker(turn_ids, dst_cid, old_names=old_names)
+            if mapping:
+                id_remap = diar.last_id_remap()
+                self.state.apply_cluster_remap(mapping, remapped, id_remap=id_remap)
+                self.state.reassign_item_speaker(item_kind, item_id, id_remap.get(dst_cid, dst_cid))
+                self._sync_session_files()
+                return True
+        cl = self._last_clusterer
+        if diar is None and cl is not None and turn_ids and cl.has_speaker(dst_cid) and cl.has_any_turn(turn_ids):
+            mapping, remapped = cl.pin_turns_to_speaker(turn_ids, dst_cid, old_names=old_names)
+            if mapping:
+                id_remap = cl.last_id_remap
+                self.state.apply_cluster_remap(mapping, remapped, id_remap=id_remap)
+                self.state.reassign_item_speaker(item_kind, item_id, id_remap.get(dst_cid, dst_cid))
+                self._sync_session_files()
+                return True
+        if self.state.reassign_item_speaker(item_kind, item_id, dst_cid):
+            self._sync_session_files()
+            return True
+        return False
+
+    def dissolve_speaker(self, src_cid: str, src_anchors: list[int] = None) -> bool:
+        """Reassign a clash/overlap speaker's turns individually to the closest remaining speakers."""
+        if src_anchors:
+            src_cid = self.resolve_speaker_from_anchors(src_cid, src_anchors)
+        if not src_cid:
+            return False
+        old_names = self.state.speaker_names_copy()
+        diar = self.diarizer
+        if diar is not None and diar.has_speaker(src_cid) and diar.speaker_count() >= 2:
+            mapping, remapped = diar.dissolve_speaker(src_cid, old_names=old_names)
+            if mapping:
+                self.state.apply_cluster_remap(mapping, remapped, id_remap=diar.last_id_remap())
+                self._sync_session_files()
+                return True
+        cl = self._last_clusterer
+        if diar is None and cl is not None and cl.has_speaker(src_cid) and cl.speaker_count() >= 2:
+            mapping, remapped = cl.dissolve_speaker(src_cid, old_names=old_names)
+            if mapping:
+                self.state.apply_cluster_remap(mapping, remapped, id_remap=cl.last_id_remap)
+                self._sync_session_files()
+                return True
+        return False
+
+    def speaker_edit_count(self) -> int:
+        """Number of reversible manual speaker merges / overlap reassignments in the active or last session."""
+        diar = self.diarizer
+        if diar is not None:
+            return diar.manual_edit_count()
+        cl = self._last_clusterer
+        if cl is not None:
+            return cl.manual_edit_count()
+        return 0
+
+    def undo_last_speaker_edit(self) -> bool:
+        """Undo the most recent manual speaker merge or overlap reassignment."""
+        old_names = self.state.speaker_names_copy()
+        diar = self.diarizer
+        if diar is not None and diar.manual_edit_count() > 0:
+            mapping, remapped = diar.undo_last_speaker_edit(old_names=old_names)
+            if mapping:
+                self.state.apply_cluster_remap(mapping, remapped, id_remap=diar.last_id_remap())
+                self._sync_session_files()
+                return True
+            return False
+        cl = self._last_clusterer
+        if diar is None and cl is not None and cl.manual_edit_count() > 0:
+            mapping, remapped = cl.undo_last_speaker_edit(old_names=old_names)
+            if mapping:
+                self.state.apply_cluster_remap(mapping, remapped, id_remap=cl.last_id_remap)
+                self._sync_session_files()
+                return True
+        return False
+
+    def reset_speaker_edits(self) -> bool:
+        """Reset all manual speaker merges and overlap reassignments back to automatic clustering."""
+        old_names = self.state.speaker_names_copy()
+        diar = self.diarizer
+        if diar is not None and diar.manual_edit_count() > 0:
+            mapping, remapped = diar.reset_speaker_edits(old_names=old_names)
+            if mapping:
+                self.state.apply_cluster_remap(mapping, remapped, id_remap=diar.last_id_remap())
+                self._sync_session_files()
+                return True
+            return False
+        cl = self._last_clusterer
+        if diar is None and cl is not None and cl.manual_edit_count() > 0:
+            mapping, remapped = cl.reset_speaker_edits(old_names=old_names)
+            if mapping:
+                self.state.apply_cluster_remap(mapping, remapped, id_remap=cl.last_id_remap)
+                self._sync_session_files()
+                return True
+        return False
+
+    def set_max_speakers(self, max_speakers: int) -> bool:
+        """Apply a new maximum speaker limit live (or to the just-finished session)."""
+        cap = int(max_speakers) if int(max_speakers or 0) >= 2 else 0
+        old_names = self.state.speaker_names_copy()
+        diar = self.diarizer
+        if diar is not None:
+            mapping, remapped = diar.set_max_speakers(cap, old_names=old_names)
+            if mapping:
+                self.state.apply_cluster_remap(mapping, remapped, id_remap=diar.last_id_remap())
+                self._sync_session_files()
+                return True
+            return False
+        cl = self._last_clusterer
+        if cl is not None:
+            mapping, remapped = cl.set_max_speakers(cap, old_names=old_names)
+            if mapping:
+                self.state.apply_cluster_remap(mapping, remapped, id_remap=cl.last_id_remap)
+                self._sync_session_files()
+                return True
+        return False
+
+    def apply_speaker_actions(self, renames: dict[str, str],
+                              merges: list[tuple[str, str]],
+                              dissolves: list[str]) -> None:
+        """Apply renames, merges, and overlap dissolves safely even when IDs renumber mid-batch."""
+        if renames:
+            self.rename_speakers(renames)
+        if not merges and not dissolves:
+            return
+        diar = self.diarizer
+        cl = diar.clusterer if diar is not None else self._last_clusterer
+        anchors: dict[str, list[int]] = {}
+        if cl is not None:
+            if diar is not None:
+                with diar._cluster_lock:
+                    anchors = cl._speaker_turn_ids()
+            else:
+                anchors = cl._speaker_turn_ids()
+
+        def _resolve_live(orig_cid: str, redirected: dict[str, str]) -> str:
+            if anchors.get(orig_cid) and cl is not None:
+                tids = set(anchors[orig_cid])
+                if diar is not None:
+                    with diar._cluster_lock:
+                        labels = [t.get("speaker", "") for t in cl.turns if t["id"] in tids and t.get("speaker")]
+                else:
+                    labels = [t.get("speaker", "") for t in cl.turns if t["id"] in tids and t.get("speaker")]
+                if labels:
+                    return max(set(labels), key=labels.count)
+            cur = orig_cid
+            seen = set()
+            while cur in redirected and cur not in seen:
+                seen.add(cur)
+                cur = redirected[cur]
+            return cur
+
+        redirected: dict[str, str] = {}
+        for src_orig, dst_orig in merges:
+            cur_src = _resolve_live(src_orig, redirected)
+            cur_dst = _resolve_live(dst_orig, redirected)
+            if cur_src and cur_dst and cur_src != cur_dst:
+                if self.merge_speakers(cur_src, cur_dst):
+                    redirected[src_orig] = dst_orig
+        for src_orig in dissolves:
+            cur_src = _resolve_live(src_orig, redirected)
+            if cur_src:
+                self.dissolve_speaker(cur_src)
+
+    def apply_vocabulary_fix(self, wrong: str, right: str, remember: bool = True) -> int:
+        """Fix a misheard word/phrase in State (+ session files) and save to custom vocabulary."""
+        wrong, right = (wrong or "").strip(), (right or "").strip()
+        count = self.state.replace_text(wrong, right) if (wrong and right and wrong != right) else 0
+        if remember:
+            entry = f"{wrong} -> {right}" if (wrong and right and wrong.lower() != right.lower()) else (right or wrong)
+            if self.settings.add_vocabulary_entry(entry):
+                self.settings.save()
+                self.refresh_provider()
+        if count > 0:
+            if self.session is not None and not self.session.raw_f.closed:
+                self.session.sync_from_state(self.state)
+            elif self.last_session_dir:
+                write_session_files(Path(self.last_session_dir), self.state)
+        return count
 
     def generate_report(self, format_id: str, custom_prompt: str = "", blocking: bool = False):
         """Format or summarize the current transcript with the LLM and save to the session folder."""

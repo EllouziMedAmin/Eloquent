@@ -131,8 +131,11 @@ def ensure_transcribe_cpp(models_dir: Path, log=print):
 
 
 def clean_arabic_asr_artifacts(text: str) -> str:
-    """Strip Cohere silence/noise control tokens (e.g. '@@@فراغ', '@@@ضوضاء') and bare punctuation."""
-    cleaned = re.sub(r"@+\s*فراغ|\S*@@@\S*", "", text).strip()
+    """Strip Cohere silence/noise control tokens, stray truncation '#' markers, and repetition loops."""
+    cleaned = re.sub(r"@+\s*فراغ|\S*@@@\S*|###\S*|#+", "", text)
+    cleaned = re.sub(r"(.)\1{4,}", r"\1\1", cleaned)
+    cleaned = re.sub(r"\s{2,}", " ", cleaned).strip()
+    cleaned = re.sub(r"\b(\S+(?:\s+\S+)?)(?:\s+\1){2,}\b", r"\1", cleaned).strip()
     return "" if cleaned in ("", ".", "،", "؟", "!", "...") else cleaned
 
 
@@ -160,7 +163,12 @@ class CohereRecognizer:
         with self._lock:
             if self._closed:
                 return ""
-            raw = self._session.run(pcm, language=self.language).text.strip()
+            try:
+                res = self._session.run(pcm, language=self.language)
+                raw = (res.text or "").strip()
+            except Exception as exc:
+                partial = getattr(exc, "partial_result", None)
+                raw = (getattr(partial, "text", "") or "").strip() if partial is not None else ""
         return clean_arabic_asr_artifacts(raw)
 
     def close(self):

@@ -29,17 +29,18 @@ if sys.platform == "win32":
     os.environ.setdefault("QT_LOGGING_RULES", "qt.gui.icc.warning=false")
 
 from PySide6.QtCore import QObject, QPoint, Qt, QTimer, QUrl, Signal
-from PySide6.QtGui import QAction, QActionGroup, QColor, QDesktopServices, QFont, QGuiApplication, QIcon, QPainter, QPixmap
+from PySide6.QtGui import QAction, QActionGroup, QColor, QCursor, QDesktopServices, QFont, QGuiApplication, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
                                QFormLayout, QFrame, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QMenu,
-                               QMessageBox, QPushButton, QSizeGrip, QSystemTrayIcon, QTextBrowser, QToolButton,
-                               QVBoxLayout, QWidget)
+                               QMessageBox, QPushButton, QSizeGrip, QSizePolicy, QSystemTrayIcon, QTextBrowser,
+                               QToolButton, QVBoxLayout, QWidget)
 
 from .. import APP_NAME, __version__
 from ..audio import AUDIO_SOURCES, AUDIO_SOURCE_LABELS
 from ..config import ROOT, SETTINGS_FILE, config_dir, is_arabic_speech, normalize_speech_language
 from ..llm.prompts import REPORT_FORMATS
 from ..paste import capture_selection_copy, get_external_foreground, play_cue, send_paste
+from ..textutil import parse_custom_vocabulary
 
 WM_HOTKEY = 0x0312
 HOTKEY_ID = 1
@@ -131,13 +132,26 @@ def _speaker_color(spk_id: str) -> str:
     return SPEAKER_COLORS[idx % len(SPEAKER_COLORS)]
 
 
-def _speaker_badge(spk: str, esc, spk_id: str = "") -> str:
+def _speaker_dot_icon(color: str) -> QIcon:
+    pm = QPixmap(12, 12)
+    pm.fill(Qt.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.Antialiasing)
+    p.setBrush(QColor(color))
+    p.setPen(Qt.NoPen)
+    p.drawEllipse(2, 2, 8, 8)
+    p.end()
+    return QIcon(pm)
+
+
+def _speaker_badge(spk: str, esc, spk_id: str = "", item_ref: str = "") -> str:
     if not spk:
         return ""
     key = spk_id or spk
     color = _speaker_color(key)
     href = urllib.parse.quote(key, safe="")
-    return (f'<a href="spk:{href}" title="Click to rename {esc(spk)}" '
+    target = f"spk:{href}?ref={item_ref}" if item_ref else f"spk:{href}"
+    return (f'<a href="{target}" title="Click to change, rename, or merge {esc(spk)}" '
             f'style="color:{color};background:rgba(255,255,255,14);'
             f'border-radius:4px;padding:0 5px;font-size:10px;font-weight:600;'
             f'text-decoration:none">{esc(spk)}</a>&nbsp; ')
@@ -149,7 +163,9 @@ def transcript_html(snap: dict, show_raw: bool, rtl: bool = False) -> str:
     dir_attr = 'dir="rtl" align="right"' if rtl else 'dir="ltr"'
     out = []
     for p in snap["paragraphs"]:
-        badge = _speaker_badge(p.get("speaker", ""), esc, p.get("speaker_id", "")) if multi else ""
+        pid = p.get("id")
+        pref = f"p:{pid}" if pid is not None else ""
+        badge = _speaker_badge(p.get("speaker", ""), esc, p.get("speaker_id", ""), item_ref=pref) if multi else ""
         t_html = f'<span dir="ltr" style="color:#7d7d7d;font-size:11px">{esc(p["time"])}</span>'
         head = f'{badge}{t_html}'
         if p["status"] == "cleaning":
@@ -168,7 +184,9 @@ def transcript_html(snap: dict, show_raw: bool, rtl: bool = False) -> str:
         else:
             out.append(f'<p style="margin:0 0 12px 0" {dir_attr}>{body}</p>')
     for x in snap["loose"]:
-        badge = _speaker_badge(x.get("speaker", ""), esc, x.get("speaker_id", "")) if multi else ""
+        xid = x.get("id")
+        xref = f"l:{xid}" if xid is not None else ""
+        badge = _speaker_badge(x.get("speaker", ""), esc, x.get("speaker_id", ""), item_ref=xref) if multi else ""
         t_html = f'<span dir="ltr" style="color:#7d7d7d;font-size:11px">{esc(x["t"])}</span>'
         out.append(f'<p style="margin:0 0 2px 0" {dir_attr}>{badge}{t_html}</p>'
                    f'<p style="margin:0 0 6px 0" {dir_attr}>{esc(x["text"])}</p>')
@@ -177,34 +195,129 @@ def transcript_html(snap: dict, show_raw: bool, rtl: bool = False) -> str:
     return "".join(out)
 
 
-class RenameSpeakersDialog(QDialog):
-    def __init__(self, speakers: list[tuple[str, str]], parent=None):
+DARK_DIALOG_STYLE = """
+QDialog { background: #1e1e22; color: #ececec; font: 10pt "Segoe UI"; }
+QLabel { color: #ececec; font: 10pt "Segoe UI"; }
+QLabel#hint { color: #9a9aa2; font: 9pt "Segoe UI"; }
+QLineEdit { background: #2a2a30; color: #f2f2f2; border: 1px solid #3f3f46; border-radius: 7px;
+            padding: 6px 9px; font: 10pt "Segoe UI"; selection-background-color: #2b6cb0; }
+QLineEdit:focus { border-color: #7db4ff; }
+QPushButton { background: #2d2d34; color: #ececec; border: 1px solid #44444d; border-radius: 7px;
+              padding: 5px 14px; font: 9.5pt "Segoe UI"; }
+QPushButton:hover { background: #3a3a44; }
+QPushButton#primary { background: #2e9e5b; border-color: #2e9e5b; color: white; font-weight: 600; }
+QPushButton#primary:hover { background: #36b368; }
+QPushButton#subtle { background: transparent; border: none; color: #9a9aa2; padding: 5px 8px; }
+QPushButton#subtle:hover { color: #ececec; background: rgba(255,255,255,14); }
+"""
+
+
+class _RenameSpeakerDialog(QDialog):
+    """Compact dark-themed single-speaker rename dialog."""
+
+    def __init__(self, spk_id: str, current_name: str, parent=None):
         super().__init__(parent)
-        self.setWindowTitle(f"{APP_NAME} - Rename Speakers")
-        self.setMinimumWidth(340)
-        self.setStyleSheet("")
+        self.setWindowTitle(f"Rename {spk_id}")
+        self.setMinimumWidth(320)
+        self.setStyleSheet(DARK_DIALOG_STYLE)
         self.setWindowFlag(Qt.WindowStaysOnTopHint, True)
 
         layout = QVBoxLayout(self)
-        hint = QLabel("Assign names to speakers before generating notes or minutes.")
+        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setSpacing(10)
+
+        lbl = QLabel(f'<b style="color:{_speaker_color(spk_id)}">{html.escape(spk_id)}</b>')
+        layout.addWidget(lbl)
+
+        self.edit = QLineEdit("" if current_name == spk_id else current_name)
+        self.edit.setPlaceholderText(f"Name for {spk_id}…")
+        self.edit.returnPressed.connect(self.accept)
+        layout.addWidget(self.edit)
+
+        row = QHBoxLayout()
+        row.addStretch(1)
+        btn_cancel = QPushButton("Cancel")
+        btn_cancel.setAutoDefault(False)
+        btn_cancel.clicked.connect(self.reject)
+        btn_save = QPushButton("Save")
+        btn_save.setObjectName("primary")
+        btn_save.setDefault(True)
+        btn_save.clicked.connect(self.accept)
+        row.addWidget(btn_cancel)
+        row.addWidget(btn_save)
+        layout.addLayout(row)
+
+        self.edit.setFocus()
+        self.edit.selectAll()
+
+    def value(self) -> str:
+        return self.edit.text().strip()
+
+
+class RenameSpeakersDialog(QDialog):
+    """Clean dark-themed dialog to rename all detected speakers at once."""
+
+    def __init__(self, speakers: list[tuple[str, str]], edit_count: int = 0, parent=None):
+        super().__init__(parent)
+        self._special_action = ""  # "", "undo", "reset_edits"
+        self.setWindowTitle(f"{APP_NAME} - Rename Speakers")
+        self.setMinimumWidth(360)
+        self.setStyleSheet(DARK_DIALOG_STYLE)
+        self.setWindowFlag(Qt.WindowStaysOnTopHint, True)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setSpacing(10)
+
+        hint = QLabel("Assign names to speakers. Click any speaker badge in the transcript to merge or reassign.")
+        hint.setObjectName("hint")
         hint.setWordWrap(True)
         layout.addWidget(hint)
 
         form = QFormLayout()
+        form.setSpacing(8)
         self.inputs: dict[str, QLineEdit] = {}
         for cid, name in speakers:
-            lbl = QLabel(f"<b>{html.escape(cid)}</b>")
-            lbl.setStyleSheet(f"color: {_speaker_color(cid)};")
+            lbl = QLabel(f'<b style="color:{_speaker_color(cid)}">{html.escape(cid)}</b>')
             edit = QLineEdit("" if name == cid else name)
             edit.setPlaceholderText(cid)
             form.addRow(lbl, edit)
             self.inputs[cid] = edit
         layout.addLayout(form)
 
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
+        btn_row = QHBoxLayout()
+        self.btn_undo = None
+        self.btn_reset = None
+        if edit_count >= 1:
+            self.btn_undo = QPushButton("Undo last" if edit_count >= 2 else "Undo merge")
+            self.btn_undo.setObjectName("subtle")
+            self.btn_undo.setAutoDefault(False)
+            self.btn_undo.clicked.connect(lambda: self._trigger_special("undo"))
+            btn_row.addWidget(self.btn_undo)
+            if edit_count >= 2:
+                self.btn_reset = QPushButton("Reset edits")
+                self.btn_reset.setObjectName("subtle")
+                self.btn_reset.setAutoDefault(False)
+                self.btn_reset.clicked.connect(lambda: self._trigger_special("reset_edits"))
+                btn_row.addWidget(self.btn_reset)
+        btn_row.addStretch(1)
+        btn_cancel = QPushButton("Cancel")
+        btn_cancel.setAutoDefault(False)
+        btn_cancel.clicked.connect(self.reject)
+        btn_save = QPushButton("Save")
+        btn_save.setObjectName("primary")
+        btn_save.setDefault(True)
+        btn_save.clicked.connect(self.accept)
+        btn_row.addWidget(btn_cancel)
+        btn_row.addWidget(btn_save)
+        layout.addLayout(btn_row)
+
+    def _trigger_special(self, kind: str):
+        self._special_action = kind
+        self.accept()
+
+    def special_action(self) -> str:
+        return self._special_action
 
     def values(self) -> dict[str, str]:
         return {cid: edit.text().strip() for cid, edit in self.inputs.items()}
@@ -213,6 +326,21 @@ class RenameSpeakersDialog(QDialog):
 class Bridge(QObject):
     """Carries engine events (any thread) to the GUI thread."""
     event = Signal(str, object)
+
+
+class _CaptionLabel(QLabel):
+    """Responsive single-line caption label that never pushes past its layout bounds."""
+
+    def __init__(self, on_resize=None, **kwargs):
+        super().__init__(**kwargs)
+        self._on_resize = on_resize
+        self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.setMinimumWidth(0)
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        if self._on_resize is not None:
+            self._on_resize()
 
 
 class LevelDot(QWidget):
@@ -242,7 +370,7 @@ class LevelDot(QWidget):
         p.drawEllipse(c, 5, 5)
 
 
-from .settings_dialog import SettingsDialog  # noqa: E402
+from .settings_dialog import SettingsDialog, VocabularyDialog  # noqa: E402
 
 
 # --------------------------------------------------------------------------- #
@@ -302,8 +430,7 @@ class EloquentWidget(QWidget):
         top = QHBoxLayout()
         top.setSpacing(6)
         self.dot = LevelDot()
-        self.caption = QLabel(objectName="caption")
-        self.caption.setMinimumWidth(200)
+        self.caption = _CaptionLabel(on_resize=self._render_caption, objectName="caption")
         self.btn_toggle = QToolButton(objectName="toggle", text="▶")
         self.btn_toggle.clicked.connect(self._toggle_meeting)
         self.btn_expand = QToolButton(text="⤢", toolTip="Show transcript")
@@ -330,6 +457,8 @@ class EloquentWidget(QWidget):
         self.view = QTextBrowser()
         self.view.setOpenLinks(False)
         self.view.anchorClicked.connect(self._on_anchor)
+        self.view.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.view.customContextMenuRequested.connect(self._show_view_context_menu)
         self.view.setMinimumHeight(PANEL_HEIGHT - 60)
         self._sync_view_direction()
         pv.addWidget(self.view, 1)
@@ -340,6 +469,8 @@ class EloquentWidget(QWidget):
         self.btn_back.clicked.connect(self._switch_view)
         self.btn_back.hide()
         self.lbl_llm = QLabel(objectName="llm")
+        self.lbl_llm.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.lbl_llm.setMinimumWidth(0)
         self.btn_gen = QPushButton("Generate ▾")
         self.btn_gen.clicked.connect(self._show_gen_menu)
         btn_copy = QPushButton("Copy")
@@ -372,6 +503,7 @@ class EloquentWidget(QWidget):
 
         self.menu = QMenu(self)
         self.act_settings = self.menu.addAction("Settings…", self.open_settings)
+        self.menu.addAction("Personal dictionary…", self.open_vocabulary)
         self.act_switch_model = self.menu.addAction("Switch speech model", self._toggle_speech_model)
         src_menu = self.menu.addMenu("Audio source")
         self.src_group = QActionGroup(self)
@@ -382,6 +514,15 @@ class EloquentWidget(QWidget):
             act.triggered.connect(lambda _chk=False, k=key: self._set_audio_source(k))
             self.src_group.addAction(act)
             self.src_actions[key] = act
+        self.max_spk_menu = self.menu.addMenu("Max speakers")
+        self.max_spk_group = QActionGroup(self)
+        self.max_spk_actions: dict[int, QAction] = {}
+        for cap, label in [(0, "Auto")] + [(k, f"{k} speakers") for k in (2, 3, 4, 5, 6, 8)]:
+            act = self.max_spk_menu.addAction(label)
+            act.setCheckable(True)
+            act.triggered.connect(lambda _chk=False, c=cap: self._set_max_speakers(c))
+            self.max_spk_group.addAction(act)
+            self.max_spk_actions[cap] = act
         self.act_audio = self.menu.addAction("Save audio recording")
         self.act_audio.setCheckable(True)
         self.act_audio.toggled.connect(self._set_audio)
@@ -647,7 +788,8 @@ class EloquentWidget(QWidget):
         self.caption.setAlignment((Qt.AlignRight if rtl_speech else Qt.AlignLeft) | Qt.AlignVCenter)
         fm = self.caption.fontMetrics()
         elide = Qt.ElideLeft if self.caption_kind in ("", "partial") else Qt.ElideRight
-        shown = fm.elidedText(self.caption_text, elide, max(50, self.caption.width() - 4))
+        avail = max(16, self.caption.contentsRect().width() - 4)
+        shown = fm.elidedText(self.caption_text, elide, avail)
         self.caption.setText(("\u200F" + shown) if (rtl_speech and shown) else shown)
         self.caption.setToolTip(self.caption_text if len(self.caption_text) > 60 else "")
 
@@ -783,33 +925,195 @@ class EloquentWidget(QWidget):
         self._rebuild()
 
     def _show_gen_menu(self):
-        multi = bool(self.engine.state.snapshot().get("multi_speaker"))
+        multi = bool(self.engine.state.snapshot().get("multi_speaker")) or self.engine.speaker_edit_count() > 0
         self.act_rename.setVisible(multi)
         self.act_rename_sep.setVisible(multi)
         self.gen_menu.exec(self.btn_gen.mapToGlobal(QPoint(0, self.btn_gen.height())))
 
-    def _on_anchor(self, url: QUrl):
+    def _build_speaker_menu(self, spk_id: str, item_kind: str = "", item_id: int = None) -> QMenu:
+        """Build the 1-click dark popover menu shown when clicking a speaker badge."""
+        cur = self.engine.state.display_speaker(spk_id) or spk_id
+        src_anchors = self.engine.speaker_anchor_ids(spk_id)
+        others = [
+            (cid, name, self.engine.speaker_anchor_ids(cid))
+            for cid, name in self.engine.state.speakers()
+            if cid != spk_id
+        ]
+        can_dissolve = self.engine.can_dissolve_speaker(spk_id) and len(others) >= 2
+        edit_count = self.engine.speaker_edit_count()
+
+        menu = QMenu(self)
+        safe_cur = cur.replace("&", "&&")
+
+        if item_kind and item_id is not None and others:
+            line_sub = menu.addMenu("Change this line to")
+            for ocid, oname, oanc in others:
+                olbl = f"{oname} ({ocid})" if (oname and oname != ocid) else ocid
+                act_l = line_sub.addAction(_speaker_dot_icon(_speaker_color(ocid)), olbl.replace("&", "&&"))
+                act_l.triggered.connect(
+                    lambda _c=False, ik=item_kind, iid=item_id, d=ocid, da=oanc, dn=oname:
+                        self._reassign_one_line(ik, iid, d, da, dn)
+                )
+
+        act_ren = menu.addAction(f'Rename "{safe_cur}"…')
+        act_ren.triggered.connect(
+            lambda _c=False, sid=spk_id, cname=cur, anc=src_anchors: self._rename_one_speaker(sid, cname, anc)
+        )
+
+        if others:
+            menu.addSeparator()
+            merge_sub = menu.addMenu(f'Merge all "{safe_cur}" into')
+            for ocid, oname, oanc in others:
+                olbl = f"{oname} ({ocid})" if (oname and oname != ocid) else ocid
+                act_m = merge_sub.addAction(_speaker_dot_icon(_speaker_color(ocid)), olbl.replace("&", "&&"))
+                act_m.triggered.connect(
+                    lambda _c=False, s=spk_id, sa=src_anchors, sn=cur, d=ocid, da=oanc, dn=oname:
+                        self._merge_one_speaker(s, sa, sn, d, da, dn)
+                )
+            if can_dissolve:
+                act_dis = menu.addAction("Reassign all overlap turns")
+                act_dis.triggered.connect(
+                    lambda _c=False, s=spk_id, sa=src_anchors, sn=cur: self._dissolve_one_speaker(s, sa, sn)
+                )
+
+        if edit_count >= 1:
+            menu.addSeparator()
+            act_u = menu.addAction("Undo last speaker change")
+            act_u.triggered.connect(self._undo_speaker_edit)
+            if edit_count >= 2:
+                act_r = menu.addAction("Reset speaker edits")
+                act_r.triggered.connect(self._reset_speaker_edits)
+        return menu
+
+    def _reassign_one_line(self, item_kind: str, item_id: int, dst_id: str,
+                           dst_anchors: list[int], dst_name: str):
+        if self.engine.reassign_line_speaker(item_kind, item_id, dst_id, dst_anchors=dst_anchors):
+            self._rebuild()
+            self._caption(f"Changed line to {dst_name}", "hint")
+            self.caption_reset.start()
+
+    def _rename_one_speaker(self, spk_id: str, cur_name: str, src_anchors: list[int]):
+        live_id = self.engine.resolve_speaker_from_anchors(spk_id, src_anchors)
+        if not src_anchors:
+            src_anchors = self.engine.speaker_anchor_ids(live_id)
+        dlg = _RenameSpeakerDialog(live_id, self.engine.state.display_speaker(live_id) or cur_name, self)
+        if dlg.exec():
+            target_id = self.engine.resolve_speaker_from_anchors(live_id, src_anchors)
+            self.engine.rename_speakers({target_id: dlg.value()})
+            self._rebuild()
+
+    def _merge_one_speaker(self, src_id: str, src_anchors: list[int], src_name: str,
+                           dst_id: str, dst_anchors: list[int], dst_name: str):
+        if self.engine.merge_speakers(src_id, dst_id, src_anchors=src_anchors, dst_anchors=dst_anchors):
+            self._rebuild()
+            self._caption(f"Merged all {src_name} into {dst_name}", "hint")
+            self.caption_reset.start()
+
+    def _dissolve_one_speaker(self, src_id: str, src_anchors: list[int], src_name: str):
+        if self.engine.dissolve_speaker(src_id, src_anchors=src_anchors):
+            self._rebuild()
+            self._caption(f"Reassigned {src_name} turns to closest speakers", "hint")
+            self.caption_reset.start()
+
+    def _undo_speaker_edit(self):
+        if self.engine.undo_last_speaker_edit():
+            self._rebuild()
+            self._caption("Undid last speaker change", "hint")
+            self.caption_reset.start()
+
+    def _reset_speaker_edits(self):
+        if self.engine.reset_speaker_edits():
+            self._rebuild()
+            self._caption("Reset all speaker edits", "hint")
+            self.caption_reset.start()
+
+    @staticmethod
+    def _parse_speaker_url(url: QUrl) -> tuple[str, str, int | None]:
         raw = url.toString()
         if not raw.startswith("spk:"):
+            return "", "", None
+        payload = raw[4:]
+        item_kind, item_id = "", None
+        if "?" in payload:
+            spk_part, query = payload.split("?", 1)
+            spk_id = urllib.parse.unquote(spk_part)
+            ref_vals = urllib.parse.parse_qs(query).get("ref") or []
+            ref_part = ref_vals[0] if ref_vals else ""
+            if ":" in ref_part:
+                rk, rid = ref_part.split(":", 1)
+                if rk in ("p", "l"):
+                    try:
+                        item_kind, item_id = rk, int(rid)
+                    except ValueError:
+                        pass
+        else:
+            spk_id = urllib.parse.unquote(payload)
+        return spk_id, item_kind, item_id
+
+    def _on_anchor(self, url: QUrl):
+        spk_id, item_kind, item_id = self._parse_speaker_url(url)
+        if not spk_id:
             return
-        spk_id = urllib.parse.unquote(raw[4:])
-        cur = self.engine.state.display_speaker(spk_id) or spk_id
-        dlg = QInputDialog(self)
-        dlg.setWindowTitle(f"{APP_NAME} - Rename {spk_id}")
-        dlg.setLabelText(f"Name for {spk_id}:")
-        dlg.setTextValue("" if cur == spk_id else cur)
-        dlg.setWindowFlag(Qt.WindowStaysOnTopHint, True)
-        dlg.setStyleSheet("")
-        if dlg.exec():
-            self.engine.rename_speakers({spk_id: dlg.textValue().strip()})
+        menu = self._build_speaker_menu(spk_id, item_kind=item_kind, item_id=item_id)
+        menu.exec(QCursor.pos())
 
     def rename_speakers(self):
         speakers = self.engine.state.speakers()
-        if not speakers:
+        edit_count = self.engine.speaker_edit_count()
+        if not speakers and edit_count == 0:
             return
-        dlg = RenameSpeakersDialog(speakers, self)
+        anchors = {cid: self.engine.speaker_anchor_ids(cid) for cid, _ in speakers}
+        dlg = RenameSpeakersDialog(speakers, edit_count=edit_count, parent=self)
         if dlg.exec():
-            self.engine.rename_speakers(dlg.values())
+            special = dlg.special_action()
+            if special == "undo":
+                self._undo_speaker_edit()
+            elif special == "reset_edits":
+                self._reset_speaker_edits()
+            else:
+                resolved = {}
+                for cid, val in dlg.values().items():
+                    target = self.engine.resolve_speaker_from_anchors(cid, anchors.get(cid, []))
+                    if target not in resolved or val:
+                        resolved[target] = val
+                self.engine.rename_speakers(resolved)
+                self._rebuild()
+
+    def _show_view_context_menu(self, pos: QPoint):
+        menu = self.view.createStandardContextMenu(pos)
+        if self.view_mode == "transcript":
+            sel = self.view.textCursor().selectedText().replace("\u2029", " ").strip()
+            if 1 <= len(sel) <= 80:
+                short = sel if len(sel) <= 28 else sel[:25] + "…"
+                safe_short = short.replace("&", "&&")
+                act_fix = QAction(f'Correct "{safe_short}"…', menu)
+                act_fix.triggered.connect(lambda _c=False, t=sel: self._fix_and_remember_selection(t))
+                acts = menu.actions()
+                if acts:
+                    sep = menu.insertSeparator(acts[0])
+                    menu.insertAction(sep, act_fix)
+                else:
+                    menu.addAction(act_fix)
+        menu.exec(self.view.viewport().mapToGlobal(pos))
+
+    def _fix_and_remember_selection(self, selected: str):
+        dlg = QInputDialog(self)
+        dlg.setWindowTitle(f"{APP_NAME} - Correct Word")
+        dlg.setLabelText(f'Correct "{selected}" to (also remembered for future transcripts):')
+        dlg.setTextValue(selected)
+        dlg.setWindowFlag(Qt.WindowStaysOnTopHint, True)
+        dlg.setStyleSheet("")
+        if not dlg.exec():
+            return
+        replacement = dlg.textValue().strip()
+        if not replacement or replacement == selected:
+            return
+        count = self.engine.apply_vocabulary_fix(selected, replacement, remember=True)
+        self._rebuild()
+        msg = (f'Corrected ({count}): {selected} -> {replacement}'
+               if count else f'Remembered: {selected} -> {replacement}')
+        self._caption(msg, "hint")
+        self.caption_reset.start()
 
     def _trigger_gen(self, format_id: str, custom_prompt: str = ""):
         self.engine.generate_report(format_id, custom_prompt)
@@ -885,6 +1189,14 @@ class EloquentWidget(QWidget):
             act.blockSignals(True)
             act.setChecked(k == cur_src)
             act.blockSignals(False)
+        self.max_spk_menu.setEnabled(bool(self.s.diarize))
+        cur_cap = int(getattr(self.s, "max_speakers", 0) or 0)
+        if cur_cap not in self.max_spk_actions:
+            cur_cap = 0
+        for cap, act in self.max_spk_actions.items():
+            act.blockSignals(True)
+            act.setChecked(cap == cur_cap)
+            act.blockSignals(False)
         self.act_audio.blockSignals(True)
         self.act_audio.setChecked(self.s.save_audio)
         self.act_audio.blockSignals(False)
@@ -902,6 +1214,15 @@ class EloquentWidget(QWidget):
             self.caption_reset.start()
         else:
             self._idle_caption()
+
+    def _set_max_speakers(self, cap: int):
+        cap = int(cap) if int(cap or 0) >= 2 else 0
+        self.s.max_speakers = cap
+        self.s.save()
+        self.engine.set_max_speakers(cap)
+        lbl = "Auto" if cap == 0 else f"{cap} speakers"
+        self._caption(f"Max speakers set to {lbl}", "hint")
+        self.caption_reset.start()
 
     def _set_audio(self, on):
         self.s.save_audio = on
@@ -960,6 +1281,16 @@ class EloquentWidget(QWidget):
                                  name="eloquent-asr-reload").start()
             elif self.engine.status == "idle" and hk_ok:
                 self._idle_caption()
+
+    def open_vocabulary(self):
+        dlg = VocabularyDialog(getattr(self.s, "custom_vocabulary", ""), self)
+        if dlg.exec():
+            self.s.custom_vocabulary = dlg.vocabulary_string()
+            self.s.save()
+            self.engine.refresh_provider()
+            terms, pairs = parse_custom_vocabulary(self.s.custom_vocabulary)
+            self._caption(f"Dictionary saved ({len(terms)} names, {len(pairs)} corrections)", "hint")
+            self.caption_reset.start()
 
     def _toggle_visible(self):
         if self.isVisible():
