@@ -1271,8 +1271,10 @@ class EloquentWidget(QWidget):
         is_toast = (mode == "toast")
         is_compact = (mode == "active_compact")
         is_meeting = (mode == "active_meeting")
+        is_paused = (self.engine.status == "paused")
         is_busy = self.engine.status in ("listening", "stopping", "loading")
         can_pause = (self.engine.status in ("listening", "paused") and self.engine.session_mode == "meeting")
+        show_active_btns = self._hovered or self._menu_open
 
         # Configure clean tight inner padding for pill vs expanded card
         if is_exp:
@@ -1281,6 +1283,8 @@ class EloquentWidget(QWidget):
             self._card_layout.setContentsMargins(10, 3, 10, 3)
         elif is_toast:
             self._card_layout.setContentsMargins(10, 4, 12, 4)
+        elif (is_compact or is_meeting) and not show_active_btns and not is_paused:
+            self._card_layout.setContentsMargins(11, 4, 11, 4)
         else:
             self._card_layout.setContentsMargins(11, 4, 8, 4)
 
@@ -1289,11 +1293,16 @@ class EloquentWidget(QWidget):
         self.mode_pill.setVisible(has_mode_pill and (is_compact or is_meeting or is_exp))
         self.caption.setVisible(is_toast or is_compact or is_meeting or is_exp)
         self._idle_spacer.setVisible(is_idle or is_hover)
-        self.waveform.setVisible(is_busy and (is_compact or is_meeting or is_exp or self.engine.status == "loading"))
-        self.btn_pause.setVisible(can_pause and (is_meeting or is_exp))
-        self.btn_toggle.setVisible(is_hover or is_compact or is_meeting or is_exp)
-        self.btn_expand.setVisible(is_hover or is_meeting or is_exp)
-        self.btn_menu.setVisible(is_hover or is_meeting or is_exp)
+        show_wave = is_busy and (
+            is_exp
+            or self.engine.status == "loading"
+            or ((is_compact or is_meeting) and not show_active_btns)
+        )
+        self.waveform.setVisible(show_wave)
+        self.btn_pause.setVisible(can_pause and (is_exp or is_paused or (is_meeting and show_active_btns)))
+        self.btn_toggle.setVisible(is_hover or is_exp or is_paused or ((is_compact or is_meeting) and show_active_btns))
+        self.btn_expand.setVisible(is_hover or is_exp or (is_meeting and show_active_btns))
+        self.btn_menu.setVisible(is_hover or is_exp or (is_meeting and show_active_btns))
         self.btn_close.setVisible(is_hover or is_exp)
         self.btn_expand.setText("⤡" if is_exp else "⤢")
 
