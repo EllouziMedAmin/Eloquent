@@ -231,6 +231,9 @@ class Engine:
             forced, _ = make_provider(s, force=True)
         self.dict_provider = (self.provider or forced) if s.dictation_cleanup else None
         self.compose_provider = (self.provider or forced) if s.compose_hotkey else None
+        for p in (self.provider, self.dict_provider, self.compose_provider):
+            if p is not None and hasattr(p, "log") and p.log is None:
+                p.log = self.log
 
         if self.provider is None:
             self._set_llm("off", reason)

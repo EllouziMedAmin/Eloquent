@@ -10,7 +10,18 @@ from typing import Optional
 from . import APP_NAME
 
 ROOT = Path(__file__).resolve().parent.parent          # repo folder when run from source
-DEFAULT_LLM_MODEL = "gemini-3.1-flash-lite"
+DEFAULT_LLM_MODEL = "auto"
+
+LLM_MODELS = (
+    ("auto", "Auto (Smart Free Tier)"),
+    ("gemini-3.5-flash-lite", "Gemini 3.5 Flash-Lite (Fast, 500/day)"),
+    ("gemma-4-26b-a4b-it", "Gemma 4 26B MoE (14.4K/day, sharp dictation/AR)"),
+    ("gemini-3.6-flash", "Gemini 3.6 Flash (Smart & fast, 20/day)"),
+    ("gemini-3.1-flash-lite", "Gemini 3.1 Flash-Lite (Fast, 500/day)"),
+    ("gemini-4-hydrogen", "Gemini 4 Hydrogen (Gen 4, slower on Free Tier)"),
+    ("gemini-3.8-flash", "Gemini 3.8 Flash (20/day)"),
+    ("gemma-4-31b-it", "Gemma 4 31B Dense (14.4K/day)"),
+)
 
 SPEECH_LANGUAGES = (
     ("parakeet", "25 European languages (Parakeet v3, Default)"),
