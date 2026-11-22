@@ -956,6 +956,12 @@ class EloquentWidget(QWidget):
         self.btn_back.clicked.connect(self._switch_view)
         self.btn_back.hide()
         dbar.addWidget(self.btn_back, 0, Qt.AlignVCenter)
+
+        self.btn_docs = QPushButton("Docs ▾", objectName="reportPill")
+        self.btn_docs.setCursor(Qt.PointingHandCursor)
+        self.btn_docs.clicked.connect(self._on_docs_pill_clicked)
+        self.btn_docs.hide()
+        dbar.addWidget(self.btn_docs, 0, Qt.AlignVCenter)
         pv.addLayout(dbar)
 
         # Stacked body: Page 0 = Transcript / Report viewer, Page 1 = Session History
@@ -1783,6 +1789,7 @@ class EloquentWidget(QWidget):
         if in_hist:
             self.chk_raw.hide()
             self.btn_back.hide()
+            self.btn_docs.hide()
             self.history_banner.setVisible(self.engine.busy)
 
     def _set_drawer_tab(self, tab: str):
@@ -1837,7 +1844,7 @@ class EloquentWidget(QWidget):
         if meta:
             self._open_history_session(meta)
 
-    def _open_history_session(self, meta: dict):
+    def _open_history_session(self, meta: dict, open_report: dict = None):
         if self.engine.busy:
             self._caption("Stop the active recording before opening a past session", "hint")
             self.caption_reset.start()
@@ -1852,13 +1859,44 @@ class EloquentWidget(QWidget):
         self._loaded_session_rtl = bool(data["rtl"])
         self._loaded_reports = list(data.get("reports") or [])
         self._scroll_to_top_once = True
-        self.view_mode = "transcript"
+        if open_report and self.engine.open_saved_report(open_report):
+            self.view_mode = "report"
+        else:
+            self.view_mode = "transcript"
         self._set_drawer_tab("transcript")
 
     def _open_saved_report_item(self, rep_meta: dict):
         if self.engine.open_saved_report(rep_meta):
             self.view_mode = "report"
             self._set_drawer_tab("transcript")
+
+    def _on_docs_pill_clicked(self):
+        self._refresh_loaded_reports()
+        reports = self._loaded_reports
+        if len(reports) >= 2:
+            cur_file = (self.engine.state.snapshot().get("report") or {}).get("file", "")
+            menu = QMenu(self)
+            for rep_meta in reports:
+                act = menu.addAction(
+                    rep_meta["label"],
+                    lambda rm=rep_meta: self._open_saved_report_item(rm),
+                )
+                act.setCheckable(True)
+                try:
+                    is_cur = bool(cur_file) and Path(cur_file).resolve() == Path(rep_meta["path"]).resolve()
+                except OSError:
+                    is_cur = False
+                act.setChecked(is_cur and self.view_mode == "report")
+            self._menu_open = True
+            try:
+                menu.exec(self.btn_docs.mapToGlobal(QPoint(0, self.btn_docs.height())))
+            finally:
+                self._menu_open = False
+        elif len(reports) == 1:
+            self._open_saved_report_item(reports[0])
+        else:
+            self.view_mode = "report"
+            self._rebuild()
 
     def _delete_history_session(self, meta: dict):
         target = Path(meta["dir"])
@@ -1906,6 +1944,21 @@ class EloquentWidget(QWidget):
         menu = QMenu(self)
         act_open = menu.addAction("Open session", lambda m=meta: self._open_history_session(m))
         act_open.setEnabled(not self.engine.busy)
+        reps = meta.get("reports") or []
+        if len(reps) == 1:
+            act_doc = menu.addAction(
+                f"Open {_short_report_tag(reps[0]['label'])}",
+                lambda m=meta, r=reps[0]: self._open_history_session(m, open_report=r),
+            )
+            act_doc.setEnabled(not self.engine.busy)
+        elif len(reps) >= 2:
+            doc_sub = menu.addMenu(f"Open saved doc ({len(reps)})")
+            doc_sub.setEnabled(not self.engine.busy)
+            for rep_meta in reps:
+                doc_sub.addAction(
+                    rep_meta["label"],
+                    lambda m=meta, r=rep_meta: self._open_history_session(m, open_report=r),
+                )
         menu.addAction("Open folder", lambda p=meta["dir"]: self._open(Path(p)))
         menu.addSeparator()
         menu.addAction("Delete session…", lambda m=meta: self._delete_history_session(m))
@@ -1927,10 +1980,18 @@ class EloquentWidget(QWidget):
         snap = self.engine.state.snapshot()
         rep = snap.get("report")
         has_rep = bool(rep and rep.get("status") in ("generating", "done", "error"))
+        n_docs = len(self._loaded_reports)
         if self.view_mode == "report" and has_rep:
             self.chk_raw.hide()
             self.btn_back.setText("← Transcript")
+            self.btn_back.setToolTip("Back to transcript")
             self.btn_back.show()
+            if n_docs >= 2:
+                self.btn_docs.setText(f"{n_docs} docs ▾")
+                self.btn_docs.setToolTip("Switch between saved documents")
+                self.btn_docs.show()
+            else:
+                self.btn_docs.hide()
             st = rep["status"]
             if st == "generating":
                 self.view.setHtml(
@@ -1948,13 +2009,23 @@ class EloquentWidget(QWidget):
         else:
             self.view_mode = "transcript"
             self.chk_raw.show()
-            if has_rep and rep.get("status") == "done":
+            self.btn_back.hide()
+            if n_docs >= 2:
+                self.btn_docs.setText(f"{n_docs} docs ▾")
+                self.btn_docs.setToolTip("Choose a saved document to view")
+                self.btn_docs.show()
+            elif n_docs == 1:
+                short_lbl = _short_report_tag(self._loaded_reports[0]["label"])
+                self.btn_docs.setText(f"{short_lbl} →")
+                self.btn_docs.setToolTip(f"View {self._loaded_reports[0]['label']}")
+                self.btn_docs.show()
+            elif has_rep and rep.get("status") == "done":
                 short_lbl = _short_report_tag(rep["label"])
-                self.btn_back.setText(f"{short_lbl} →")
-                self.btn_back.setToolTip(f"View {rep['label']}")
-                self.btn_back.show()
+                self.btn_docs.setText(f"{short_lbl} →")
+                self.btn_docs.setToolTip(f"View {rep['label']}")
+                self.btn_docs.show()
             else:
-                self.btn_back.hide()
+                self.btn_docs.hide()
             opt = self.view.document().defaultTextOption()
             opt.setTextDirection(Qt.RightToLeft if rtl else Qt.LeftToRight)
             opt.setAlignment(Qt.AlignRight if rtl else Qt.AlignLeft)
@@ -1975,17 +2046,8 @@ class EloquentWidget(QWidget):
         self._rebuild()
 
     def _show_gen_menu(self):
-        self._refresh_loaded_reports()
         multi = bool(self.engine.state.snapshot().get("multi_speaker")) or self.engine.speaker_edit_count() > 0
         menu = QMenu(self)
-        if self._loaded_reports:
-            saved_sub = menu.addMenu(f"Saved outputs ({len(self._loaded_reports)})")
-            for rep_meta in self._loaded_reports:
-                saved_sub.addAction(
-                    rep_meta["label"],
-                    lambda rm=rep_meta: self._open_saved_report_item(rm),
-                )
-            menu.addSeparator()
         if multi:
             menu.addAction("Rename speakers…", self.rename_speakers)
             menu.addSeparator()
