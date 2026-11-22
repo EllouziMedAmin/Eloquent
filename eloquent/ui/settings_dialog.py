@@ -12,7 +12,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDialog,
 
 from .. import APP_NAME
 from ..audio import AUDIO_SOURCES, list_input_devices, list_loopback_devices
-from ..config import (ISLAND_SIZES, SPEECH_LANGUAGES, is_arabic_speech,
+from ..config import (DEFAULT_LLM_MODEL, ISLAND_SIZES, LLM_MODELS, SPEECH_LANGUAGES, is_arabic_speech,
                       normalize_island_size, normalize_speech_language)
 from ..hotkeys import parse_hotkey
 from ..textutil import format_custom_vocabulary, parse_custom_vocabulary
@@ -243,6 +243,9 @@ QHeaderView::section {
     font: 600 8.5pt "Segoe UI";
 }
 QComboBox { padding-right: 26px; }
+QComboBox QLineEdit { background: transparent; border: none; padding: 0; color: #f5f5f7; }
+QComboBox QLineEdit:focus { background: transparent; border: none; }
+QComboBox QLineEdit:disabled { background: transparent; border: none; color: #52525b; }
 QComboBox::drop-down { border: none; width: 24px; }
 QComboBox::down-arrow { image: none; width: 0px; height: 0px; }
 QComboBox QAbstractItemView {
@@ -857,12 +860,29 @@ class SettingsDialog(QDialog):
         self.key_box = key_box
         lay.addWidget(key_box)
 
-        self.model = QLineEdit(s.llm_model)
+        self.model = _ComboBox()
+        self.model.setEditable(True)
+        self.model.setInsertPolicy(QComboBox.NoInsert)
+        self._model_label_to_id: dict[str, str] = {}
+        for mid, mlabel in LLM_MODELS:
+            self.model.addItem(mlabel, mid)
+            self._model_label_to_id[mlabel] = mid
+        cur_m = (s.llm_model or DEFAULT_LLM_MODEL).strip()
+        idx_m = self.model.findData(cur_m)
+        if idx_m >= 0:
+            self.model.setCurrentIndex(idx_m)
+        else:
+            self.model.setEditText(cur_m)
+        self.model.currentTextChanged.connect(self._sync_model_hint)
+        self.model_hint = _label("", "hint", wrap=True)
         self.model_box = QWidget()
         mb = QVBoxLayout(self.model_box)
         mb.setContentsMargins(0, 0, 0, 0)
+        mb.setSpacing(4)
         mb.addLayout(self._field("Model", self.model))
+        mb.addWidget(self.model_hint)
         lay.addWidget(self.model_box)
+        self._sync_model_hint()
         lay.addWidget(_divider())
 
         self.fillers = ToggleSwitch(s.keep_fillers)
@@ -1058,6 +1078,23 @@ class SettingsDialog(QDialog):
         if hasattr(self, "_fillers_row"):
             self._fillers_row.setEnabled(on)
 
+    def selected_llm_model(self) -> str:
+        raw = self.model.currentText().strip()
+        if not raw:
+            return DEFAULT_LLM_MODEL
+        return self._model_label_to_id.get(raw, raw)
+
+    def _sync_model_hint(self):
+        mid = self.selected_llm_model()
+        if mid.lower() == "auto":
+            self.model_hint.setText(
+                "Routes live polishing, dictation, Ask AI, and reports across fast Free Tier models with automatic fallback."
+            )
+        else:
+            self.model_hint.setText(
+                f"Pinned to {mid}. Pick Auto (Smart Free Tier) for automatic routing and rate-limit fallback."
+            )
+
     def _toggle_key(self, show: bool):
         self.key.setEchoMode(QLineEdit.Normal if show else QLineEdit.Password)
         self.btn_show.setText("Hide" if show else "Show")
@@ -1105,7 +1142,7 @@ class SettingsDialog(QDialog):
             used[k] = name
         s = self.s
         s.gemini_api_key = self.key.text().strip()
-        s.llm_model = self.model.text().strip() or s.llm_model
+        s.llm_model = self.selected_llm_model() or s.llm_model
         s.cleanup = self.cleanup.isChecked()
         s.keep_fillers = self.fillers.isChecked()
         s.custom_vocabulary = self.vocabulary()

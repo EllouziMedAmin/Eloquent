@@ -15,7 +15,7 @@
 
 Built for **voice dictation into any app, Ask AI writing at your cursor, meetings, classes, lectures, interviews, calls, and voice notes**, wrapped in a minimalist **Apple Dynamic Island** floating widget. Speech recognition and speaker diarization run **100% locally on your PC** (audio never leaves your device), with **NVIDIA Parakeet TDT 0.6B v3** as the default (**25 European languages** on CPU) plus built-in **Arabic & Dialects** support (**Cohere Arabic Q4_K_M GGUF** on Vulkan iGPU / CPU, switchable anytime with **`Ctrl+Alt+M`**).
 
-Optionally, a free **Gemini 3.1 Flash-Lite** API key polishes transcripts in the background, powers **Dictate** / **Ask AI at cursor**, and generates **Meeting Minutes, Lecture Notes (with LaTeX math), Summaries, Bullet Points, or Reports** at the end of a session.
+Optionally, a free **Google AI Studio (Gemini API)** key powers smart Free-Tier routing (`Auto` across Gemini 3.5/3.6 Flash, Flash-Lite, and Gemma 4 with automatic rate-limit fallback) to polish transcripts in the background, power **Dictate** / **Ask AI at cursor**, and generate **Meeting Minutes, Lecture Notes (with LaTeX math), Summaries, Bullet Points, or Reports** at the end of a session.
 
 <!-- Add your 20s demo GIF or video here:
 ![Eloquent Demo](docs/demo.gif)
@@ -44,7 +44,7 @@ Optionally, a free **Gemini 3.1 Flash-Lite** API key polishes transcripts in the
 - **Personal Dictionary & Right-Click "Correct & Remember":** Store custom names/brands and `misheard -> corrected` rules (`⋯ → Personal dictionary…`), or right-click any misheard word in the transcript to fix it immediately and remember it for future sessions (correction rules work offline too).
 
 ### Background Polishing, Post-Session Reports & 3 Interfaces
-- **Safe background LLM proofreading:** Every few sentences, Gemini 3.1 Flash-Lite fixes misheard words, punctuation, and spoken fillers in a background thread. If offline or if an edit diverges too far, raw text is kept automatically.
+- **Smart Free-Tier LLM routing & fallback:** In `Auto` mode (default), Eloquent automatically picks fast Free-Tier models per task (Gemini 3.5 Flash-Lite for live polishing, Gemma 4 26B for dictation, Gemini 3.6 Flash for Ask AI & reports) and fails over automatically on `429` rate limits or `503`/`504` timeouts. If offline or if an edit diverges too far, raw text is kept automatically.
 - **One-Click Post-Session Outputs (`Generate ▾`):** Turn any recorded session into:
   - **Concise Summary** (`summary.md`)
   - **Key Bullet Points** (`bullet_points.md`)
