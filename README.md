@@ -13,7 +13,7 @@
 
 **Open-source live speech-to-text, voice dictation, and AI writing assistant for Windows that runs fast on an ordinary CPU.**
 
-Built for **voice dictation into any app, Ask AI writing at your cursor, meetings, classes, lectures, interviews, calls, and voice notes**, wrapped in a minimalist **Apple Dynamic Island** floating widget. Speech recognition and speaker diarization run **100% locally on your PC** (audio never leaves your device), with **NVIDIA Parakeet TDT 0.6B v3** as the default (**25 European languages** on CPU) plus built-in **Arabic & Dialects** support (**Cohere Arabic Q4_K_M GGUF** on Vulkan iGPU / CPU, switchable anytime with **`Ctrl+Alt+M`**).
+Built for **voice dictation into any app, Ask AI writing at your cursor, meetings, classes, lectures, interviews, calls, and voice notes**, wrapped in a minimalist **Apple Dynamic Island** floating widget. Speech recognition and speaker diarization run **100% locally on your PC** by default (audio never leaves your device unless you opt in to Gemini Audio overlap separation), with **NVIDIA Parakeet TDT 0.6B v3** as the default (**25 European languages** on CPU) plus built-in **Arabic & Dialects** support (**Cohere Arabic Q4_K_M GGUF** on Vulkan iGPU / CPU, switchable anytime with **`Ctrl+Alt+M`**).
 
 Optionally, a free **Google AI Studio (Gemini API)** key powers smart Free-Tier routing (`Auto` across Gemini 3.5/3.6 Flash, Flash-Lite, and Gemma 4 with automatic rate-limit fallback) to polish transcripts in the background, power **Dictate** / **Ask AI at cursor**, and generate **Meeting Minutes, Lecture Notes (with LaTeX math), Summaries, Bullet Points, or Reports** at the end of a session.
 
@@ -40,6 +40,7 @@ Optionally, a free **Google AI Studio (Gemini API)** key powers smart Free-Tier 
 
 ### Overlap-Aware Multi-Speaker Diarization & Personal Dictionary
 - **TitaNet-Small + `pyannote-segmentation-3.0`:** Identifies **Speaker 1, Speaker 2, …** on 1 low-priority background thread with zero impact on live speech latency (works in both **Parakeet** and **Arabic** modes). Strips overlapping speech frames before extracting voiceprints so cross-talk doesn't corrupt speaker clusters, and marks cross-talk turns with **`overlap`** badges (`[overlap]` in saved files).
+- **Optional Overlapping-Speech Separation (`Off` / `On demand` / `Automatic`):** Off by default so audio stays 100% local. Enable in **`Settings → AI & Polishing → Overlapping speech`** to separate simultaneous speakers via a dedicated Gemini Audio provider (independent of your text polishing model, using short RAM-only speaker voice samples). Click any **`overlap ✦`** badge on demand or let `Automatic` resolve heavy overlaps in the background.
 - **Interactive live speaker editing:** Click any speaker badge in the transcript drawer to **Change a single line**, **Rename**, **Merge all into another speaker**, **Reassign overlap turns**, or **Undo / Reset**. Use **`⋯ → Max speakers`** (`Auto` or `2–8`) live during noisy calls or debates.
 - **Personal Dictionary & Right-Click "Correct & Remember":** Store custom names/brands and `misheard -> corrected` rules (`⋯ → Personal dictionary…`), or right-click any misheard word in the transcript to fix it immediately and remember it for future sessions (correction rules work offline too).
 
@@ -162,7 +163,7 @@ All models download automatically on demand into `models/`:
 ### 2. Getting the Cleanest Multi-Speaker Diarization
 - **Use `Max speakers` when you know the headcount:** For a 2-person interview or 3-person panel in a noisy/echoey room, set **`⋯ → Max speakers`** to `2` or `3`. It applies live without restarting the recording and prevents extra phantom speakers.
 - **Fix speakers on the fly:** Click any speaker badge in the expanded transcript drawer to rename (`Speaker 1` → `Sarah`), merge two clusters of the same person, or move a single misattributed line. Eloquent locks your manual anchors so later turns stay consistent.
-- **Understand `overlap` badges:** When two people talk over each other simultaneously, `pyannote-segmentation-3.0` strips the overlapping frames before voiceprinting so clusters stay pure, and flags that turn with an **`overlap`** badge (`[overlap]` in saved text files) so you know cross-talk occurred there.
+- **Handle overlapping speech (`overlap` badges):** When two people talk over each other simultaneously, `pyannote-segmentation-3.0` strips the overlapping frames before voiceprinting so clusters stay pure, and flags that turn with an **`overlap`** badge (`[overlap]` in saved files). To also separate and transcribe both simultaneous voices, enable **`Settings → AI & Polishing → Separate overlapping voices`** (`On demand` to click `overlap ✦` badges, or `Automatic` for live background separation).
 
 ### 3. Arabic & Bilingual (AR + FR/EN) Tips
 - **Instant toggle:** Press **`Ctrl+Alt+M`** while idle to flip between Parakeet and Cohere Arabic without changing your startup default (`Settings → Audio & Speech → Default speech model`).
@@ -206,7 +207,7 @@ Every meeting/note session is saved to `sessions/<YYYY-MM-DD_HH-MM-SS>/` contain
 
 - [x] Shared low-latency engine + Widget, Terminal, and SSE Web UIs
 - [x] Post-session document generation (Summary, Bullets, Meeting Minutes, Lecture Notes + LaTeX math, Report, Memo, Custom Prompt)
-- [x] Overlap-aware multi-speaker diarization (`TitaNet-Small` + `pyannote-segmentation-3.0`) with live speaker rename, merge, line reassignment & `Max speakers` cap
+- [x] Overlap-aware multi-speaker diarization (`TitaNet-Small` + `pyannote-segmentation-3.0`) with live speaker editing, `Max speakers` cap & optional Gemini Audio overlap separation
 - [x] System-wide Voice Dictation (`Ctrl+Alt+Space`) and Ask AI / Compose at Cursor (`Ctrl+Alt+A`) with screen selection context & follow-up memory
 - [x] Windows WASAPI system audio loopback (`Microphone`, `System audio`, `Mic + System`)
 - [x] Local Arabic & dialects speech engine (`Cohere Transcribe Arabic Q4_K_M GGUF` on Vulkan / CPU) + RTL UI
