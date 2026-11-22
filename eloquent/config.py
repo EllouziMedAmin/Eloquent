@@ -98,6 +98,7 @@ class Settings:
     # --- interface ---
     ui: str = "widget"                # widget | terminal | web
     hotkey: str = "ctrl+shift+space"  # start/stop recording while the widget runs (empty = off)
+    pause_hotkey: str = "ctrl+shift+p" # pause/resume meeting recording (empty = off)
     dictate_hotkey: str = "ctrl+alt+space"  # start/stop dictation & paste at cursor (empty = off)
     compose_hotkey: str = "ctrl+alt+a"      # start/stop Ask AI (speak prompt -> generate & paste, empty = off)
     switch_model_hotkey: str = "ctrl+alt+m" # quick toggle between Parakeet and Arabic (empty = off)

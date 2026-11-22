@@ -99,6 +99,10 @@ class Engine:
         self._provider_key = None
         self._listeners = []
         self._stop = threading.Event()
+        self._paused = threading.Event()
+        self._active_sec = 0.0
+        self._resume_t0 = 0.0
+        self._is_file_run = False
         self._worker = None
         self._loaded = False
         self._loaded_speech_lang = None
@@ -263,7 +267,13 @@ class Engine:
     # ------------------------------------------------------------------ #
     @property
     def busy(self) -> bool:
-        return self.status in ("listening", "stopping")
+        return self.status in ("listening", "paused", "stopping")
+
+    def _active_elapsed(self, now: float = None) -> float:
+        if self._paused.is_set() or self.status == "paused":
+            return self._active_sec
+        t = time.monotonic() if now is None else now
+        return self._active_sec + max(0.0, t - self._resume_t0)
 
     def start(self, wav_path: Path = None, mode: str = "meeting", selected_text: str = "") -> bool:
         if not self._loaded or self.status != "idle":
@@ -329,6 +339,9 @@ class Engine:
         max_utt = min(float(max_utt_raw), 8.0)
         self._is_file_run = wav_path is not None
         self._session_t0 = time.monotonic()
+        self._active_sec = 0.0
+        self._resume_t0 = self._session_t0
+        self._paused.clear()
         max_samples = int(max_utt * SAMPLE_RATE)
         self._pipes: dict[str, _StreamPipe] = {}
         if wav_path is not None:
@@ -363,17 +376,47 @@ class Engine:
         self._worker.start()
         return True
 
+    def pause(self) -> bool:
+        """Pause an active live meeting recording without closing the session."""
+        if self.status != "listening" or self.session_mode != "meeting" or self._is_file_run:
+            return False
+        self._active_sec = self._active_elapsed()
+        self._paused.set()
+        self.level = 0.0
+        self._set_status("paused")
+        return True
+
+    def resume(self) -> bool:
+        """Resume a paused meeting recording into the same session and audio file."""
+        if self.status != "paused":
+            return False
+        self._resume_t0 = time.monotonic()
+        self._paused.clear()
+        self._set_status("listening")
+        return True
+
+    def toggle_pause(self) -> bool:
+        if self.status == "listening":
+            return self.pause()
+        if self.status == "paused":
+            return self.resume()
+        return False
+
     def stop(self, paste: bool = True):
         """Ask the audio thread to stop. Returns immediately; status goes stopping -> idle."""
-        if self.status == "listening":
+        if self.status in ("listening", "paused"):
             if not paste:
                 self._paste_on_stop = False
+            if self.status == "paused":
+                self._paused.clear()
+            else:
+                self._active_sec = self._active_elapsed()
             self._stop.set()
 
     def toggle(self, mode: str = "meeting", selected_text: str = "") -> bool:
         if self.status == "idle":
             return self.start(mode=mode, selected_text=selected_text)
-        if self.status == "listening":
+        if self.status in ("listening", "paused"):
             if mode == self.session_mode:
                 self.stop(paste=True)
                 return True
@@ -421,10 +464,50 @@ class Engine:
                 captures.append(sys_cap)
 
             self._session_t0 = time.monotonic()
+            self._active_sec = 0.0
+            self._resume_t0 = self._session_t0
             for p in self._pipes.values():
                 p.last_frame_t = self._session_t0
+            was_paused = False
 
             while not self._stop.is_set():
+                if self._paused.is_set():
+                    if not was_paused:
+                        was_paused = True
+                        self.level = 0.0
+                        if wav_sys is not None:
+                            wav_sys.clear()
+                        for pipe in self._pipes.values():
+                            pipe.level = 0.0
+                            try:
+                                pipe.vad.flush()
+                                self._drain_pipe(pipe, self._active_sec)
+                            except Exception as e:
+                                self.log(f"Pause flush error: {e}", "warn")
+                        self.state.set_partial("")
+                    # Discard incoming frames quietly while paused (never write silence to audio.wav)
+                    try:
+                        q.get(timeout=0.04)
+                        while not q.empty():
+                            q.get_nowait()
+                    except queue.Empty:
+                        pass
+                    continue
+
+                if was_paused:
+                    was_paused = False
+                    if wav_sys is not None:
+                        wav_sys.clear()
+                    while not q.empty():
+                        try:
+                            q.get_nowait()
+                        except queue.Empty:
+                            break
+                    now_r = time.monotonic()
+                    for p in self._pipes.values():
+                        p.last_frame_t = now_r
+                        p.level = 0.0
+
                 try:
                     tag, frame = q.get(timeout=0.04)
                 except queue.Empty:
@@ -444,7 +527,7 @@ class Engine:
                                 wav_sys.append(frame)
                         else:
                             self.session.write_audio(frame)
-                    self._process_pipe(pipe, frame, allow_partial=q.qsize() < 6, elapsed=now - self._session_t0)
+                    self._process_pipe(pipe, frame, allow_partial=q.qsize() < 6, elapsed=self._active_elapsed(now))
 
                 # Windows WASAPI loopback pauses callbacks during total system silence; inject trailing
                 # quiet frames if speech was active so Silero VAD finalizes immediately on YouTube pause.
@@ -454,7 +537,7 @@ class Engine:
                     if sys_pipe.vad.is_speech_detected() or not sys_pipe.vad.empty():
                         sys_pipe.last_frame_t += frame_dt
                         self._process_pipe(sys_pipe, _SILENCE_FRAME, allow_partial=False,
-                                           elapsed=now - self._session_t0)
+                                           elapsed=self._active_elapsed(now))
 
                 self.level = max((p.level for p in self._pipes.values()), default=0.0)
         finally:
@@ -651,10 +734,11 @@ class Engine:
 
     def _finish(self):
         """Flush all active streams, finish diarization & cleanup, then close session files."""
+        elapsed = None if self._is_file_run else self._active_elapsed()
         self._set_status("stopping")
+        self._paused.clear()
         self.level = 0.0
         try:
-            elapsed = None if self._is_file_run else (time.monotonic() - self._session_t0)
             for pipe in self._pipes.values():
                 pipe.vad.flush()
                 self._drain_pipe(pipe, elapsed)

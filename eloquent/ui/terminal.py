@@ -120,7 +120,7 @@ class TerminalUI:
 
     def _status_line(self) -> Text:
         e = self.engine
-        colors = {"listening": "green", "stopping": "yellow", "idle": "bright_black", "loading": "cyan"}
+        colors = {"listening": "green", "paused": "yellow", "stopping": "yellow", "idle": "bright_black", "loading": "cyan"}
         t = Text()
         t.append("● ", style=colors.get(e.status, ""))
         t.append(e.status, style="bold")
@@ -138,8 +138,9 @@ class TerminalUI:
             t.append(f"\nGenerate: {opts}  [Esc] cancel", style="cyan")
         else:
             ren = " · R rename" if self.engine.state.snapshot().get("multi_speaker") else ""
+            p_key = " · P resume" if e.status == "paused" else (" · P pause" if e.status == "listening" else "")
             src_key = " · A source" if e.status == "idle" else ""
-            hint = f"  Space start/stop{src_key}{ren} · G generate · Q quit" if msvcrt and not self.wav_path else "  Ctrl+C stop"
+            hint = f"  Space start/stop{p_key}{src_key}{ren} · G generate · Q quit" if msvcrt and not self.wav_path else "  Ctrl+C stop"
             t.append(hint, style="dim")
         return t
 
@@ -181,6 +182,8 @@ class TerminalUI:
                 continue
             if ch == " ":
                 self.engine.toggle()
+            elif ch.lower() == "p" and self.engine.status in ("listening", "paused"):
+                self.engine.toggle_pause()
             elif ch.lower() == "a" and self.engine.status == "idle":
                 order = ("mic", "system", "both")
                 cur = self.engine.settings.audio_source

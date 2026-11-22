@@ -954,6 +954,14 @@ class SettingsDialog(QDialog):
         lay.addWidget(rec_box)
         lay.addWidget(_divider())
 
+        self.pause_hotkey, pause_box = self._hotkey_row(
+            "Pause / resume recording (meetings)",
+            getattr(self.s, "pause_hotkey", "ctrl+shift+p"),
+            "Pause during breaks and resume into the same session & audio file.",
+        )
+        lay.addWidget(pause_box)
+        lay.addWidget(_divider())
+
         self.dictate_hotkey, dict_box = self._hotkey_row(
             "Dictate & paste at cursor",
             self.s.dictate_hotkey,
@@ -1113,11 +1121,13 @@ class SettingsDialog(QDialog):
 
     def _save(self):
         hk = self._hotkey_text(self.hotkey)
+        phk = self._hotkey_text(self.pause_hotkey)
         dhk = self._hotkey_text(self.dictate_hotkey)
         chk = self._hotkey_text(self.compose_hotkey)
         smhk = self._hotkey_text(self.switch_model_hotkey)
         for label, val in (
             ("recording hotkey", hk),
+            ("pause hotkey", phk),
             ("dictation hotkey", dhk),
             ("Ask AI hotkey", chk),
             ("switch model hotkey", smhk),
@@ -1127,11 +1137,13 @@ class SettingsDialog(QDialog):
                 _show_warning(
                     self,
                     f"That {label} can't be used. Include Ctrl, Alt, Shift or Win plus one key,\n"
-                    "for example Ctrl+Shift+Space, Ctrl+Alt+Space, Ctrl+Alt+A, or Ctrl+Alt+M.",
+                    "for example Ctrl+Shift+Space, Ctrl+Shift+P, Ctrl+Alt+Space, Ctrl+Alt+A, or Ctrl+Alt+M.",
                 )
                 return
         used = {}
-        for name, val in (("Recording", hk), ("Dictation", dhk), ("Ask AI", chk), ("Switch model", smhk)):
+        for name, val in (
+            ("Recording", hk), ("Pause", phk), ("Dictation", dhk), ("Ask AI", chk), ("Switch model", smhk)
+        ):
             if not val:
                 continue
             k = val.lower()
@@ -1154,6 +1166,7 @@ class SettingsDialog(QDialog):
         s.device = self.mic.currentData()
         s.loopback_device = self.loopback.currentData()
         s.hotkey = hk
+        s.pause_hotkey = phk
         s.dictate_hotkey = dhk
         s.compose_hotkey = chk
         s.switch_model_hotkey = smhk

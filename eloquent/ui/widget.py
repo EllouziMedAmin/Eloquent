@@ -57,6 +57,7 @@ HOTKEY_ID = 1
 HOTKEY_DICTATE_ID = 2
 HOTKEY_COMPOSE_ID = 3
 HOTKEY_SWITCH_MODEL_ID = 4
+HOTKEY_PAUSE_ID = 5
 
 # Dynamic Island shadow margins & user-selectable steady size presets
 SHADOW_PAD_X = 8
@@ -93,6 +94,7 @@ STATUS_COLORS = {
     "idle": "#636366",
     "loading": "#a1a1aa",
     "listening": "#f5f5f7",
+    "paused": "#8e8e93",
     "dictating": "#f5f5f7",
     "composing": "#f5f5f7",
     "stopping": "#a1a1aa",
@@ -125,6 +127,10 @@ QToolButton:disabled { color: #52525b; background: rgba(255,255,255,6); }
 #toggle[on="true"] { background: rgba(255,255,255,28); color: #ffffff; padding-left: 0px; }
 #toggle[on="true"]:hover { background: rgba(255,255,255,46); color: #ffffff; }
 #toggle:disabled { background: #1c1c1e; color: #52525b; }
+#pauseBtn { background: rgba(255,255,255,14); }
+#pauseBtn:hover { background: rgba(255,255,255,28); }
+#pauseBtn[paused="true"] { background: rgba(255,255,255,28); }
+#pauseBtn[paused="true"]:hover { background: rgba(255,255,255,46); }
 #closeBtn { background: transparent; color: #71717a; }
 #closeBtn:hover { background: rgba(255,255,255,18); color: #f5f5f7; }
 QTextBrowser { background: transparent; border: none; color: #f2f2f7; font: 10pt "Segoe UI";
@@ -618,6 +624,41 @@ class Bridge(QObject):
     event = Signal(str, object)
 
 
+class _PauseButton(QToolButton):
+    """Crisp vector monochrome Pause (||) / Resume (▶) button with zero emoji-font glitches."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("pauseBtn")
+        self._is_paused = False
+
+    def set_paused(self, paused: bool):
+        self._is_paused = bool(paused)
+        self.setProperty("paused", "true" if paused else "false")
+        self.style().unpolish(self)
+        self.style().polish(self)
+        self.update()
+
+    def paintEvent(self, e):
+        super().paintEvent(e)
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor("#ffffff") if self._is_paused else QColor("#e4e4e7"))
+        cx = self.width() / 2.0
+        cy = self.height() / 2.0
+        if self._is_paused:
+            tri = QPainterPath()
+            tri.moveTo(cx - 2.6, cy - 4.0)
+            tri.lineTo(cx + 3.8, cy)
+            tri.lineTo(cx - 2.6, cy + 4.0)
+            tri.closeSubpath()
+            p.drawPath(tri)
+        else:
+            p.drawRoundedRect(QRectF(cx - 3.3, cy - 4.0, 2.2, 8.0), 1.0, 1.0)
+            p.drawRoundedRect(QRectF(cx + 1.1, cy - 4.0, 2.2, 8.0), 1.0, 1.0)
+
+
 class _CaptionLabel(QLabel):
     """Responsive single-line caption label that never pushes past its layout bounds."""
 
@@ -806,6 +847,7 @@ class EloquentWidget(QWidget):
         self._drag_moved = False
         self.quitting = False
         self.hotkey_ok = False
+        self.pause_hotkey_ok = False
         self.dictate_hotkey_ok = False
         self.compose_hotkey_ok = False
         self.switch_model_hotkey_ok = False
@@ -889,6 +931,9 @@ class EloquentWidget(QWidget):
         self.caption = _CaptionLabel(on_resize=self._render_caption, objectName="caption")
         self.waveform = AudioWaveform()
         self.waveform.hide()
+        self.btn_pause = _PauseButton()
+        self.btn_pause.clicked.connect(self._toggle_pause)
+        self.btn_pause.hide()
         self.btn_toggle = QToolButton(objectName="toggle", text="▶")
         self.btn_toggle.clicked.connect(self._toggle_meeting)
         self.btn_expand = QToolButton(text="⤢", toolTip="Show transcript")
@@ -908,6 +953,7 @@ class EloquentWidget(QWidget):
         self._idle_spacer.hide()
         top.addWidget(self._idle_spacer)
         top.addWidget(self.waveform, 0, Qt.AlignVCenter)
+        top.addWidget(self.btn_pause, 0, Qt.AlignVCenter)
         top.addWidget(self.btn_toggle, 0, Qt.AlignVCenter)
         top.addWidget(self.btn_expand, 0, Qt.AlignVCenter)
         top.addWidget(self.btn_menu, 0, Qt.AlignVCenter)
@@ -1150,6 +1196,10 @@ class EloquentWidget(QWidget):
             "color:#e4e4e7;background:rgba(255,255,255,18);border-radius:7px;"
             "padding:1px 7px;font:600 8pt 'Segoe UI';"
         )
+        if st == "paused":
+            self.mode_pill.setText("Paused")
+            self.mode_pill.setStyleSheet(mono_pill)
+            return True
         if st in ("listening", "stopping"):
             if mode == "compose":
                 self.mode_pill.setText("Ask AI")
@@ -1189,7 +1239,7 @@ class EloquentWidget(QWidget):
         mode = self.engine.session_mode
         if st == "loading":
             return "toast", min(preset["compact_w"], int(scr_w * 0.44)), ISLAND_TOAST_H
-        if st in ("listening", "stopping"):
+        if st in ("listening", "paused", "stopping"):
             if mode in ("dictation", "compose"):
                 return "active_compact", min(preset["compact_w"], int(scr_w * 0.50)), preset["compact_h"]
             return "active_meeting", min(preset["meeting_w"], int(scr_w * 0.62)), preset["meeting_h"]
@@ -1222,6 +1272,7 @@ class EloquentWidget(QWidget):
         is_compact = (mode == "active_compact")
         is_meeting = (mode == "active_meeting")
         is_busy = self.engine.status in ("listening", "stopping", "loading")
+        can_pause = (self.engine.status in ("listening", "paused") and self.engine.session_mode == "meeting")
 
         # Configure clean tight inner padding for pill vs expanded card
         if is_exp:
@@ -1239,6 +1290,7 @@ class EloquentWidget(QWidget):
         self.caption.setVisible(is_toast or is_compact or is_meeting or is_exp)
         self._idle_spacer.setVisible(is_idle or is_hover)
         self.waveform.setVisible(is_busy and (is_compact or is_meeting or is_exp or self.engine.status == "loading"))
+        self.btn_pause.setVisible(can_pause and (is_meeting or is_exp))
         self.btn_toggle.setVisible(is_hover or is_compact or is_meeting or is_exp)
         self.btn_expand.setVisible(is_hover or is_meeting or is_exp)
         self.btn_menu.setVisible(is_hover or is_meeting or is_exp)
@@ -1376,6 +1428,8 @@ class EloquentWidget(QWidget):
         m = QMenu()
         m.addAction("Show / hide", self._toggle_visible)
         self.tray_toggle = m.addAction("Start", self._toggle_meeting)
+        self.tray_pause = m.addAction("Pause", self._toggle_pause)
+        self.tray_pause.setEnabled(False)
         m.addAction("Settings…", self.open_settings)
         m.addSeparator()
         m.addAction("Quit", self.quit)
@@ -1493,8 +1547,13 @@ class EloquentWidget(QWidget):
     def _toggle_meeting(self):
         self.engine.toggle("meeting")
 
+    def _toggle_pause(self):
+        if self.engine.toggle_pause():
+            if self.engine.status == "listening":
+                self._caption(self.last_final or "Listening…", "" if self.last_final else "hint")
+
     def _toggle_dictation(self):
-        if self.engine.status == "listening" and self.engine.session_mode != "dictation":
+        if self.engine.status in ("listening", "paused") and self.engine.session_mode != "dictation":
             self._caption("Stop the current recording first", "hint")
             self.caption_reset.start()
             return
@@ -1503,7 +1562,7 @@ class EloquentWidget(QWidget):
         self.engine.toggle("dictation")
 
     def _toggle_compose(self):
-        if self.engine.status == "listening":
+        if self.engine.status in ("listening", "paused"):
             if self.engine.session_mode != "compose":
                 self._caption("Stop the current recording first", "hint")
                 self.caption_reset.start()
@@ -1708,17 +1767,21 @@ class EloquentWidget(QWidget):
     def _update_controls(self):
         st = self.engine.status
         dot_st = self._dot_status()
-        on = st == "listening"
+        paused = (st == "paused")
+        on = st in ("listening", "paused")
         mode = self.engine.session_mode
         dictating = (mode == "dictation")
         composing = (mode == "compose")
         if st != "idle":
             self._toast_active = False
         self.btn_toggle.setText("■" if on else "▶")
-        self.btn_toggle.setEnabled(st in ("idle", "listening"))
+        self.btn_toggle.setEnabled(st in ("idle", "listening", "paused"))
         self.btn_toggle.setProperty("on", "true" if on else "false")
         self.btn_toggle.style().unpolish(self.btn_toggle)
         self.btn_toggle.style().polish(self.btn_toggle)
+        phk = f" ({self.s.pause_hotkey})" if self.pause_hotkey_ok and getattr(self.s, "pause_hotkey", "") else ""
+        self.btn_pause.set_paused(paused)
+        self.btn_pause.setToolTip(("Resume" if paused else "Pause") + phk)
         if on and composing:
             self.btn_toggle.setToolTip("Cancel Ask AI (keep prompt in drawer)")
         elif on and dictating:
@@ -1728,7 +1791,9 @@ class EloquentWidget(QWidget):
             self.btn_toggle.setToolTip(("Stop" if on else "Start") + hk)
         if self.tray:
             self.tray_toggle.setText("Stop" if on else "Start")
-            self.tray_toggle.setEnabled(st in ("idle", "listening"))
+            self.tray_toggle.setEnabled(st in ("idle", "listening", "paused"))
+            self.tray_pause.setText("Resume" if paused else "Pause")
+            self.tray_pause.setEnabled(st in ("listening", "paused") and mode == "meeting")
             self.tray.setToolTip(f"{APP_NAME} - {dot_st}")
         if st in ("listening", "stopping", "loading"):
             self.level_timer.start()
@@ -1736,7 +1801,9 @@ class EloquentWidget(QWidget):
             self.level_timer.stop()
             self.dot.set_state(dot_st)
             self.waveform.set_state("idle", 0.0)
-        if st == "stopping":
+        if paused:
+            self._caption(f"Press ▶{(' or ' + self.s.pause_hotkey) if phk else ''} to resume", "hint")
+        elif st == "stopping":
             if composing:
                 msg = "Generating & pasting…"
             elif dictating:
@@ -2462,6 +2529,7 @@ class EloquentWidget(QWidget):
         failed = []
         for hk_id, text, attr in (
             (HOTKEY_ID, self.s.hotkey, "hotkey_ok"),
+            (HOTKEY_PAUSE_ID, getattr(self.s, "pause_hotkey", ""), "pause_hotkey_ok"),
             (HOTKEY_DICTATE_ID, self.s.dictate_hotkey, "dictate_hotkey_ok"),
             (HOTKEY_COMPOSE_ID, self.s.compose_hotkey, "compose_hotkey_ok"),
             (HOTKEY_SWITCH_MODEL_ID, self.s.switch_model_hotkey, "switch_model_hotkey_ok"),
@@ -2487,6 +2555,7 @@ class EloquentWidget(QWidget):
             hwnd = int(self.winId())
             for hk_id, attr in (
                 (HOTKEY_ID, "hotkey_ok"),
+                (HOTKEY_PAUSE_ID, "pause_hotkey_ok"),
                 (HOTKEY_DICTATE_ID, "dictate_hotkey_ok"),
                 (HOTKEY_COMPOSE_ID, "compose_hotkey_ok"),
                 (HOTKEY_SWITCH_MODEL_ID, "switch_model_hotkey_ok"),
@@ -2503,6 +2572,9 @@ class EloquentWidget(QWidget):
                 if msg.message == WM_HOTKEY:
                     if msg.wParam == HOTKEY_ID:
                         self._toggle_meeting()
+                        return True, 0
+                    if msg.wParam == HOTKEY_PAUSE_ID:
+                        self._toggle_pause()
                         return True, 0
                     if msg.wParam == HOTKEY_DICTATE_ID:
                         self._toggle_dictation()
