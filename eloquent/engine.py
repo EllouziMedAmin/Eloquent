@@ -23,6 +23,7 @@ import threading
 import time
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 
@@ -33,7 +34,7 @@ from .diarizer import Diarizer, build_speaker_extractor, ensure_speaker_model
 from .llm import make_provider
 from .llm.prompts import build_format_instruction
 from .overlap import build_overlap_segmenter
-from .session import Session, write_session_files
+from .session import Session, load_session_data, write_session_files
 from .speech import (SAMPLE_RATE, WINDOW, build_speech_recognizer, build_vad, close_recognizer,
                      ensure_vad_model, read_wav_16k, transcribe, transcribe_detailed)
 from .state import State, fmt_time
@@ -956,6 +957,43 @@ class Engine:
             elif self.last_session_dir:
                 write_session_files(Path(self.last_session_dir), self.state)
         return count
+
+    def load_session(self, session_dir: Path) -> Optional[dict]:
+        """Load a saved session folder into State so it can be read, edited, or formatted."""
+        if self.busy:
+            return None
+        d = Path(session_dir)
+        if not d.exists() or not d.is_dir():
+            return None
+        data = load_session_data(d)
+        self._last_clusterer = None
+        self.session = None
+        self.last_session_dir = d
+        self.state.load_saved_session(data["paragraphs"], report=data.get("report"))
+        return data
+
+    def open_saved_report(self, report_meta: dict) -> bool:
+        """Load an existing saved ``.md`` report from the active/loaded session into State."""
+        if not report_meta:
+            return False
+        p = Path(report_meta["path"])
+        if not p.exists():
+            return False
+        try:
+            text = p.read_text(encoding="utf-8", errors="ignore").strip()
+        except OSError:
+            return False
+        if not text:
+            return False
+        self.state.set_report({
+            "format_id": report_meta.get("format_id", "custom"),
+            "label": report_meta.get("label", p.stem),
+            "status": "done",
+            "text": text,
+            "file": str(p),
+            "error": "",
+        })
+        return True
 
     def generate_report(self, format_id: str, custom_prompt: str = "", blocking: bool = False):
         """Format or summarize the current transcript with the LLM and save to the session folder."""

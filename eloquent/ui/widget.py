@@ -34,13 +34,14 @@ if sys.platform == "win32":
                 pass
     os.environ.setdefault("QT_LOGGING_RULES", "qt.gui.icc.warning=false")
 
-from PySide6.QtCore import QEasingCurve, QObject, QPoint, QRect, QRectF, Qt, QTimer, QUrl, QVariantAnimation, Signal
+from PySide6.QtCore import (QEasingCurve, QObject, QPoint, QRect, QRectF, QSize, Qt, QTimer, QUrl,
+                            QVariantAnimation, Signal)
 from PySide6.QtGui import (QAction, QActionGroup, QColor, QCursor, QDesktopServices, QFont, QGuiApplication, QIcon,
                            QLinearGradient, QPainter, QPainterPath, QPen, QPixmap, QRadialGradient)
-from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
-                               QFormLayout, QFrame, QHBoxLayout, QLabel, QLineEdit, QMenu,
-                               QMessageBox, QPushButton, QSizeGrip, QSizePolicy, QSystemTrayIcon, QTextBrowser,
-                               QToolButton, QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
+                               QFileDialog, QFormLayout, QFrame, QHBoxLayout, QLabel, QLineEdit, QListWidget,
+                               QListWidgetItem, QMenu, QMessageBox, QPushButton, QSizeGrip, QSizePolicy,
+                               QStackedWidget, QSystemTrayIcon, QTextBrowser, QToolButton, QVBoxLayout, QWidget)
 
 from .. import APP_NAME, __version__
 from ..audio import AUDIO_SOURCES, AUDIO_SOURCE_LABELS
@@ -48,6 +49,7 @@ from ..config import (ISLAND_SIZES, ROOT, SETTINGS_FILE, config_dir, is_arabic_s
                       normalize_island_size, normalize_speech_language)
 from ..llm.prompts import REPORT_FORMATS
 from ..paste import capture_selection_copy, get_external_foreground, play_cue, send_paste
+from ..session import _short_report_tag, delete_session, list_sessions
 from ..textutil import parse_custom_vocabulary
 
 WM_HOTKEY = 0x0312
@@ -130,6 +132,26 @@ QTextBrowser { background: transparent; border: none; color: #f2f2f7; font: 10pt
 QPushButton { color: #e4e4e7; background: rgba(255,255,255,12); border: 1px solid rgba(255,255,255,18);
               border-radius: 8px; padding: 3px 8px; font: 8.5pt "Segoe UI"; }
 QPushButton:hover { background: rgba(255,255,255,24); color: #ffffff; }
+QFrame#drawerTabs { background: rgba(255,255,255,9); border: 1px solid rgba(255,255,255,14); border-radius: 8px; }
+QPushButton#drawerTab { color: #8e8e93; background: transparent; border: none; border-radius: 6px;
+                        padding: 2px 9px; font: 500 8.5pt "Segoe UI"; }
+QPushButton#drawerTab:hover { color: #e4e4e7; background: rgba(255,255,255,8); }
+QPushButton#drawerTab:checked { color: #ffffff; background: rgba(255,255,255,22); font-weight: 600; }
+QLabel#sessionTag { color: #71717a; font: 8pt "Segoe UI"; }
+QPushButton#reportPill { color: #e4e4e7; background: rgba(255,255,255,12); border: 1px solid rgba(255,255,255,16);
+                         border-radius: 7px; padding: 2px 8px; font: 500 8pt "Segoe UI"; }
+QPushButton#reportPill:hover { background: rgba(255,255,255,24); color: #ffffff; }
+QLineEdit#historySearch { background: rgba(255,255,255,9); color: #f5f5f7; border: 1px solid rgba(255,255,255,16);
+                          border-radius: 8px; padding: 4px 9px; font: 9pt "Segoe UI";
+                          selection-background-color: #3f3f46; }
+QLineEdit#historySearch:focus { border: 1px solid rgba(255,255,255,56); background: rgba(255,255,255,13); }
+QListWidget#historyList { background: transparent; border: none; outline: 0; }
+QListWidget#historyList::item { background: transparent; border: none; padding: 2px 0; }
+QListWidget#historyList::item:selected { background: transparent; }
+QLabel#historyBanner { color: #a1a1aa; background: rgba(255,255,255,8); border-radius: 7px;
+                       padding: 4px 8px; font: 8pt "Segoe UI"; }
+QLabel#historyEmpty { color: #71717a; font: 9pt "Segoe UI"; }
+QLabel#histCount { color: #71717a; font: 8.5pt "Segoe UI"; }
 QCheckBox { color: #a1a1aa; font: 8.5pt "Segoe UI"; spacing: 5px; }
 QMenu { background: #121215; color: #f5f5f7; border: 1px solid rgba(255,255,255,20);
         border-radius: 10px; padding: 5px; font: 9pt "Segoe UI"; }
@@ -141,6 +163,7 @@ QScrollBar:vertical { background: transparent; width: 6px; }
 QScrollBar::handle:vertical { background: rgba(255,255,255,30); border-radius: 3px; min-height: 24px; }
 QScrollBar::handle:vertical:hover { background: rgba(255,255,255,52); }
 QScrollBar::add-line, QScrollBar::sub-line { height: 0; }
+QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: none; }
 """
 
 
@@ -327,6 +350,141 @@ class _TextPromptDialog(QDialog):
 
     def value(self) -> str:
         return self.edit.text().strip()
+
+
+class _ConfirmDialog(QDialog):
+    """Minimalist obsidian confirmation dialog (replaces legacy white QMessageBox)."""
+
+    def __init__(self, title: str, message: str, ok_label: str = "Delete", parent=None):
+        super().__init__(parent)
+        self._styled_chrome = False
+        self.setWindowTitle(title)
+        self.setMinimumWidth(340)
+        self.setStyleSheet(DARK_DIALOG_STYLE)
+        self.setWindowFlag(Qt.WindowStaysOnTopHint, True)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(18, 14, 18, 14)
+        layout.setSpacing(12)
+
+        lbl = QLabel(message)
+        lbl.setWordWrap(True)
+        layout.addWidget(lbl)
+
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        row.addStretch(1)
+        btn_cancel = QPushButton("Cancel")
+        btn_cancel.setAutoDefault(False)
+        btn_cancel.clicked.connect(self.reject)
+        btn_ok = QPushButton(ok_label)
+        btn_ok.setObjectName("primary")
+        btn_ok.setDefault(True)
+        btn_ok.clicked.connect(self.accept)
+        row.addWidget(btn_cancel)
+        row.addWidget(btn_ok)
+        layout.addLayout(row)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if not self._styled_chrome:
+            self._styled_chrome = True
+            apply_dark_titlebar(self)
+
+
+class _SessionRowWidget(QFrame):
+    """Clean Apple-style 2-line session card inside the History list."""
+
+    def __init__(self, meta: dict, active: bool = False, locked: bool = False, parent=None):
+        super().__init__(parent)
+        self.meta = meta
+        self._active = active
+        self._hovered = False
+        self.setObjectName("histRow")
+        self.setCursor(Qt.ForbiddenCursor if locked else Qt.PointingHandCursor)
+        self.setMouseTracking(True)
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(10, 6, 10, 6)
+        lay.setSpacing(3)
+
+        top = QHBoxLayout()
+        top.setContentsMargins(0, 0, 0, 0)
+        top.setSpacing(5)
+
+        if active:
+            dot = QLabel("●")
+            dot.setStyleSheet("color:#f5f5f7;font:7pt 'Segoe UI';background:transparent;")
+            top.addWidget(dot, 0, Qt.AlignVCenter)
+
+        date_lbl = QLabel(meta["date_label"])
+        date_lbl.setStyleSheet("color:#f5f5f7;font:600 8.5pt 'Segoe UI';background:transparent;")
+        top.addWidget(date_lbl, 0, Qt.AlignVCenter)
+        top.addStretch(1)
+
+        badges = []
+        if meta.get("rtl"):
+            badges.append("AR")
+        if meta.get("speaker_count", 0) >= 2:
+            badges.append(f"{meta['speaker_count']} spk")
+        if meta.get("report_tag"):
+            badges.append(meta["report_tag"])
+        if meta.get("has_audio"):
+            badges.append("WAV")
+        for btxt in badges:
+            b = QLabel(btxt)
+            b.setStyleSheet(
+                "color:#a1a1aa;background:rgba(255,255,255,14);border-radius:5px;"
+                "padding:0px 5px;font:600 7.5pt 'Segoe UI';"
+            )
+            top.addWidget(b, 0, Qt.AlignVCenter)
+        lay.addLayout(top)
+
+        self._raw_preview = meta.get("preview") or "(empty)"
+        self._rtl = bool(meta.get("rtl"))
+        self.preview_lbl = QLabel()
+        self.preview_lbl.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.preview_lbl.setMinimumWidth(0)
+        self.preview_lbl.setLayoutDirection(Qt.RightToLeft if self._rtl else Qt.LeftToRight)
+        self.preview_lbl.setAlignment(
+            (Qt.AlignRight if self._rtl else Qt.AlignLeft) | Qt.AlignAbsolute | Qt.AlignVCenter
+        )
+        self.preview_lbl.setStyleSheet("color:#8e8e93;font:8.5pt 'Segoe UI';background:transparent;")
+        lay.addWidget(self.preview_lbl)
+        self._apply_bg()
+        self._elide_preview()
+
+    def _apply_bg(self):
+        if self._hovered:
+            bg = "rgba(255,255,255,18)"
+            bd = "rgba(255,255,255,26)"
+        elif self._active:
+            bg = "rgba(255,255,255,13)"
+            bd = "rgba(255,255,255,24)"
+        else:
+            bg = "rgba(255,255,255,6)"
+            bd = "rgba(255,255,255,10)"
+        self.setStyleSheet(f"QFrame#histRow {{ background:{bg}; border:1px solid {bd}; border-radius:9px; }}")
+
+    def _elide_preview(self):
+        fm = self.preview_lbl.fontMetrics()
+        avail = max(80, self.preview_lbl.width() - 4)
+        elided = fm.elidedText(self._raw_preview, Qt.ElideRight, avail)
+        self.preview_lbl.setText(("\u200F" + elided) if (self._rtl and elided) else elided)
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self._elide_preview()
+
+    def enterEvent(self, e):
+        self._hovered = True
+        self._apply_bg()
+        super().enterEvent(e)
+
+    def leaveEvent(self, e):
+        self._hovered = False
+        self._apply_bg()
+        super().leaveEvent(e)
 
 
 class _RenameSpeakerDialog(QDialog):
@@ -636,6 +794,12 @@ class EloquentWidget(QWidget):
         self.engine, self.s = engine, settings
         self.show_raw = False
         self.view_mode = "transcript"
+        self.drawer_tab = "transcript"  # "transcript" | "history"
+        self._loaded_session_dir: Path | None = None
+        self._loaded_session_label = ""
+        self._loaded_session_rtl: bool | None = None
+        self._loaded_reports: list[dict] = []
+        self._scroll_to_top_once = False
         self.dirty = True
         self.drag_offset = None
         self._press_global = None
@@ -691,6 +855,7 @@ class EloquentWidget(QWidget):
         self.rebuild_timer = QTimer(self, singleShot=True, interval=80, timeout=self._rebuild)
         self.caption_reset = QTimer(self, singleShot=True, interval=4500, timeout=self._idle_caption)
         self._leave_timer = QTimer(self, singleShot=True, interval=450, timeout=self._on_leave_timeout)
+        self._hist_search_timer = QTimer(self, singleShot=True, interval=120, timeout=self._refresh_history)
 
         self._place()
         self._tray()
@@ -757,6 +922,44 @@ class EloquentWidget(QWidget):
         line.setFixedHeight(1)
         line.setStyleSheet("background: rgba(255,255,255,22);")
         pv.addWidget(line)
+
+        # Compact Apple segmented drawer bar: [ Transcript | History ]   <session tag>   [ Report → ]
+        dbar = QHBoxLayout()
+        dbar.setContentsMargins(0, 0, 0, 0)
+        dbar.setSpacing(6)
+        tabs_box = QFrame(objectName="drawerTabs")
+        tb_lay = QHBoxLayout(tabs_box)
+        tb_lay.setContentsMargins(2, 2, 2, 2)
+        tb_lay.setSpacing(2)
+        self.tab_transcript = QPushButton("Transcript")
+        self.tab_transcript.setObjectName("drawerTab")
+        self.tab_transcript.setCheckable(True)
+        self.tab_transcript.setChecked(True)
+        self.tab_transcript.setCursor(Qt.PointingHandCursor)
+        self.tab_transcript.clicked.connect(lambda: self._set_drawer_tab("transcript"))
+        self.tab_history = QPushButton("History")
+        self.tab_history.setObjectName("drawerTab")
+        self.tab_history.setCheckable(True)
+        self.tab_history.setCursor(Qt.PointingHandCursor)
+        self.tab_history.clicked.connect(lambda: self._set_drawer_tab("history"))
+        tb_lay.addWidget(self.tab_transcript)
+        tb_lay.addWidget(self.tab_history)
+        dbar.addWidget(tabs_box, 0, Qt.AlignVCenter)
+
+        self.lbl_session_tag = QLabel("", objectName="sessionTag")
+        self.lbl_session_tag.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.lbl_session_tag.setMinimumWidth(0)
+        dbar.addWidget(self.lbl_session_tag, 1, Qt.AlignVCenter)
+
+        self.btn_back = QPushButton("← Transcript", objectName="reportPill")
+        self.btn_back.setCursor(Qt.PointingHandCursor)
+        self.btn_back.clicked.connect(self._switch_view)
+        self.btn_back.hide()
+        dbar.addWidget(self.btn_back, 0, Qt.AlignVCenter)
+        pv.addLayout(dbar)
+
+        # Stacked body: Page 0 = Transcript / Report viewer, Page 1 = Session History
+        self.drawer_stack = QStackedWidget()
         self.view = QTextBrowser()
         self.view.setOpenLinks(False)
         self.view.anchorClicked.connect(self._on_anchor)
@@ -764,30 +967,66 @@ class EloquentWidget(QWidget):
         self.view.customContextMenuRequested.connect(self._show_view_context_menu)
         self.view.setMinimumHeight(96)
         self._sync_view_direction()
-        pv.addWidget(self.view, 1)
+        self.drawer_stack.addWidget(self.view)
+
+        self.history_page = QWidget()
+        hp = QVBoxLayout(self.history_page)
+        hp.setContentsMargins(0, 0, 0, 0)
+        hp.setSpacing(6)
+        self.history_banner = QLabel(
+            "Recording in progress. Stop recording to open a past session.",
+            objectName="historyBanner",
+        )
+        self.history_banner.setWordWrap(True)
+        self.history_banner.hide()
+        hp.addWidget(self.history_banner)
+        self.history_search = QLineEdit(objectName="historySearch")
+        self.history_search.setPlaceholderText("Search past sessions, speakers, or words…")
+        self.history_search.setClearButtonEnabled(True)
+        self.history_search.textChanged.connect(lambda _t: self._hist_search_timer.start())
+        hp.addWidget(self.history_search)
+        self.history_list = QListWidget(objectName="historyList")
+        self.history_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.history_list.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+        self.history_list.setSpacing(2)
+        self.history_list.setMinimumHeight(80)
+        self.history_list.itemClicked.connect(self._on_history_item_clicked)
+        self.history_list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.history_list.customContextMenuRequested.connect(self._show_history_context_menu)
+        hp.addWidget(self.history_list, 1)
+        self.history_empty = QLabel("No saved sessions yet.", objectName="historyEmpty")
+        self.history_empty.setAlignment(Qt.AlignCenter)
+        self.history_empty.hide()
+        hp.addWidget(self.history_empty, 1)
+        self.drawer_stack.addWidget(self.history_page)
+        pv.addWidget(self.drawer_stack, 1)
+
         bottom = QHBoxLayout()
         bottom.setSpacing(5)
         self.chk_raw = QCheckBox("show raw")
         self.chk_raw.toggled.connect(self._set_raw)
-        self.btn_back = QPushButton("← Transcript")
-        self.btn_back.clicked.connect(self._switch_view)
-        self.btn_back.hide()
+        self.lbl_hist_count = QLabel("", objectName="histCount")
+        self.lbl_hist_count.hide()
         self.lbl_llm = QLabel(objectName="llm")
         self.lbl_llm.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         self.lbl_llm.setMinimumWidth(0)
+        self.btn_hist_refresh = QPushButton("Refresh")
+        self.btn_hist_refresh.clicked.connect(self._refresh_history)
+        self.btn_hist_refresh.hide()
         self.btn_gen = QPushButton("Generate ▾")
         self.btn_gen.clicked.connect(self._show_gen_menu)
-        btn_copy = QPushButton("Copy")
-        btn_copy.clicked.connect(self._copy)
-        btn_folder = QPushButton("Folder")
-        btn_folder.setToolTip("Open session folder")
-        btn_folder.clicked.connect(self._open_folder)
+        self.btn_copy = QPushButton("Copy")
+        self.btn_copy.clicked.connect(self._copy)
+        self.btn_folder = QPushButton("Folder")
+        self.btn_folder.setToolTip("Open session folder")
+        self.btn_folder.clicked.connect(self._open_folder)
         bottom.addWidget(self.chk_raw)
-        bottom.addWidget(self.btn_back)
+        bottom.addWidget(self.lbl_hist_count)
         bottom.addWidget(self.lbl_llm, 1)
+        bottom.addWidget(self.btn_hist_refresh)
         bottom.addWidget(self.btn_gen)
-        bottom.addWidget(btn_copy)
-        bottom.addWidget(btn_folder)
+        bottom.addWidget(self.btn_copy)
+        bottom.addWidget(self.btn_folder)
         bottom.addWidget(QSizeGrip(self), 0, Qt.AlignBottom | Qt.AlignRight)
         pv.addLayout(bottom)
         self.panel.hide()
@@ -1170,11 +1409,13 @@ class EloquentWidget(QWidget):
         elif kind == "report":
             if data and data.get("status") in ("generating", "done", "error"):
                 self.view_mode = "report"
+                self._set_drawer_tab("transcript")
                 if not self.panel.isVisible():
                     self.toggle_panel()
                 if data["status"] == "generating":
                     self._caption(f"Generating {data['label']}…", "hint")
                 elif data["status"] == "done":
+                    self._refresh_loaded_reports()
                     self._caption(f"{data['label']} ready (saved in session folder)", "hint")
                     self.caption_reset.start()
                 elif data["status"] == "error":
@@ -1185,6 +1426,15 @@ class EloquentWidget(QWidget):
             mode = (data or {}).get("mode", "meeting")
             if mode in ("dictation", "compose") and self.s.dictation_sound:
                 play_cue("start")
+            if mode == "meeting":
+                self._loaded_session_dir = None
+                self._loaded_session_label = "Live"
+                self._loaded_session_rtl = None
+                self._loaded_reports = []
+                if self.drawer_tab == "history":
+                    self._set_drawer_tab("transcript")
+                else:
+                    self._sync_drawer_chrome()
             self._caption(self._listening_hint(mode), "hint")
         elif kind == "session_ended":
             if not self.quitting:
@@ -1192,7 +1442,15 @@ class EloquentWidget(QWidget):
                 if mode in ("dictation", "compose"):
                     self._handle_dictation_ended(data)
                 else:
-                    self._caption("Saved. Open the transcript with ⤢ or the folder from ⋯", "hint")
+                    d_str = (data or {}).get("dir", "")
+                    if d_str:
+                        self._loaded_session_dir = Path(d_str)
+                        self._loaded_session_label = "Latest"
+                        self._refresh_loaded_reports()
+                    self._sync_drawer_chrome()
+                    if self.drawer_tab == "history":
+                        self._refresh_history()
+                    self._caption("Saved. Open the transcript with ⤢ or browse History", "hint")
                     self.caption_reset.start()
         elif kind == "compose_ready":
             self._on_compose_ready(*data)
@@ -1374,8 +1632,13 @@ class EloquentWidget(QWidget):
     def _is_rtl_language(self) -> bool:
         return hasattr(self.s, "resolved_speech_language") and is_arabic_speech(self.s.resolved_speech_language())
 
+    def _is_view_rtl(self) -> bool:
+        if self._loaded_session_rtl is not None:
+            return self._loaded_session_rtl
+        return self._is_rtl_language()
+
     def _sync_view_direction(self):
-        rtl = self._is_rtl_language()
+        rtl = self._is_view_rtl()
         self.view.setLayoutDirection(Qt.RightToLeft if rtl else Qt.LeftToRight)
 
     def _render_caption(self):
@@ -1501,10 +1764,165 @@ class EloquentWidget(QWidget):
         if self.panel.isVisible() and not self.rebuild_timer.isActive():
             self.rebuild_timer.start()
 
+    def _refresh_loaded_reports(self):
+        from ..session import _list_saved_reports
+        target = self._loaded_session_dir or self.engine.last_session_dir
+        self._loaded_reports = _list_saved_reports(Path(target)) if target and Path(target).exists() else []
+
+    def _sync_drawer_chrome(self):
+        in_hist = (self.drawer_tab == "history")
+        self.tab_transcript.setChecked(not in_hist)
+        self.tab_history.setChecked(in_hist)
+        self.drawer_stack.setCurrentIndex(1 if in_hist else 0)
+        self.lbl_session_tag.setText("" if in_hist else self._loaded_session_label)
+        self.lbl_hist_count.setVisible(in_hist)
+        self.btn_hist_refresh.setVisible(in_hist)
+        self.btn_gen.setVisible(not in_hist)
+        self.btn_copy.setVisible(not in_hist)
+        self.btn_folder.setToolTip("Open sessions folder" if in_hist else "Open session folder")
+        if in_hist:
+            self.chk_raw.hide()
+            self.btn_back.hide()
+            self.history_banner.setVisible(self.engine.busy)
+
+    def _set_drawer_tab(self, tab: str):
+        self.drawer_tab = "history" if tab == "history" else "transcript"
+        self._sync_drawer_chrome()
+        if self.drawer_tab == "history":
+            self._refresh_history()
+        else:
+            self._rebuild()
+
+    def _refresh_history(self):
+        query = self.history_search.text() if hasattr(self, "history_search") else ""
+        sessions = list_sessions(self.s.resolved_sessions_dir(), query=query)
+        self.history_list.clear()
+        cur_dir = None
+        if self._loaded_session_dir:
+            try:
+                cur_dir = Path(self._loaded_session_dir).resolve()
+            except OSError:
+                cur_dir = None
+        elif self.engine.last_session_dir:
+            try:
+                cur_dir = Path(self.engine.last_session_dir).resolve()
+            except OSError:
+                cur_dir = None
+
+        busy = self.engine.busy
+        self.history_banner.setVisible(busy)
+        for meta in sessions:
+            try:
+                is_active = cur_dir is not None and Path(meta["dir"]).resolve() == cur_dir
+            except OSError:
+                is_active = False
+            row_w = _SessionRowWidget(meta, active=is_active, locked=busy)
+            item = QListWidgetItem(self.history_list)
+            item.setData(Qt.UserRole, meta)
+            item.setSizeHint(QSize(0, 52))
+            self.history_list.addItem(item)
+            self.history_list.setItemWidget(item, row_w)
+
+        n = len(sessions)
+        self.lbl_hist_count.setText(f"{n} session{'s' if n != 1 else ''}")
+        empty = (n == 0)
+        self.history_list.setVisible(not empty)
+        self.history_empty.setText(
+            "No matching sessions." if (empty and query.strip()) else "No saved sessions yet."
+        )
+        self.history_empty.setVisible(empty)
+
+    def _on_history_item_clicked(self, item: QListWidgetItem):
+        meta = item.data(Qt.UserRole)
+        if meta:
+            self._open_history_session(meta)
+
+    def _open_history_session(self, meta: dict):
+        if self.engine.busy:
+            self._caption("Stop the active recording before opening a past session", "hint")
+            self.caption_reset.start()
+            return
+        data = self.engine.load_session(meta["dir"])
+        if not data:
+            self._caption("Could not open that session", "error")
+            self.caption_reset.start()
+            return
+        self._loaded_session_dir = Path(data["dir"])
+        self._loaded_session_label = data["date_label"]
+        self._loaded_session_rtl = bool(data["rtl"])
+        self._loaded_reports = list(data.get("reports") or [])
+        self._scroll_to_top_once = True
+        self.view_mode = "transcript"
+        self._set_drawer_tab("transcript")
+
+    def _open_saved_report_item(self, rep_meta: dict):
+        if self.engine.open_saved_report(rep_meta):
+            self.view_mode = "report"
+            self._set_drawer_tab("transcript")
+
+    def _delete_history_session(self, meta: dict):
+        target = Path(meta["dir"])
+        if self.engine.busy and self.engine.session is not None:
+            try:
+                if Path(self.engine.session.dir).resolve() == target.resolve():
+                    self._caption("Cannot delete the active recording session", "hint")
+                    self.caption_reset.start()
+                    return
+            except OSError:
+                pass
+        dlg = _ConfirmDialog(
+            f"{APP_NAME} - Delete Session",
+            f'Delete session "{meta["date_label"]}" and all files inside its folder? This cannot be undone.',
+            ok_label="Delete",
+            parent=self,
+        )
+        if not dlg.exec():
+            return
+        if not delete_session(target, self.s.resolved_sessions_dir()):
+            self._caption("Could not delete session folder", "error")
+            self.caption_reset.start()
+            return
+        # If the deleted session was currently open in the viewer, reset state cleanly
+        if self._loaded_session_dir:
+            try:
+                if Path(self._loaded_session_dir).resolve() == target.resolve():
+                    self._loaded_session_dir = None
+                    self._loaded_session_label = ""
+                    self._loaded_session_rtl = None
+                    self._loaded_reports = []
+                    self.engine.last_session_dir = None
+                    self.engine.state.reset()
+            except OSError:
+                pass
+        self._refresh_history()
+
+    def _show_history_context_menu(self, pos: QPoint):
+        item = self.history_list.itemAt(pos)
+        if item is None:
+            return
+        meta = item.data(Qt.UserRole)
+        if not meta:
+            return
+        menu = QMenu(self)
+        act_open = menu.addAction("Open session", lambda m=meta: self._open_history_session(m))
+        act_open.setEnabled(not self.engine.busy)
+        menu.addAction("Open folder", lambda p=meta["dir"]: self._open(Path(p)))
+        menu.addSeparator()
+        menu.addAction("Delete session…", lambda m=meta: self._delete_history_session(m))
+        self._menu_open = True
+        try:
+            menu.exec(self.history_list.viewport().mapToGlobal(pos))
+        finally:
+            self._menu_open = False
+
     def _rebuild(self):
         if not self.panel.isVisible():
             return
-        rtl = self._is_rtl_language()
+        self._sync_drawer_chrome()
+        if self.drawer_tab == "history":
+            self.dirty = False
+            return
+        rtl = self._is_view_rtl()
         self._sync_view_direction()
         snap = self.engine.state.snapshot()
         rep = snap.get("report")
@@ -1531,7 +1949,9 @@ class EloquentWidget(QWidget):
             self.view_mode = "transcript"
             self.chk_raw.show()
             if has_rep and rep.get("status") == "done":
-                self.btn_back.setText(f"View {rep['label']} →")
+                short_lbl = _short_report_tag(rep["label"])
+                self.btn_back.setText(f"{short_lbl} →")
+                self.btn_back.setToolTip(f"View {rep['label']}")
                 self.btn_back.show()
             else:
                 self.btn_back.hide()
@@ -1543,7 +1963,11 @@ class EloquentWidget(QWidget):
             at_bottom = sb.value() >= sb.maximum() - 30
             keep = sb.value()
             self.view.setHtml(transcript_html(snap, self.show_raw, rtl=rtl))
-            sb.setValue(sb.maximum() if at_bottom else keep)
+            if self._scroll_to_top_once:
+                self._scroll_to_top_once = False
+                sb.setValue(0)
+            else:
+                sb.setValue(sb.maximum() if at_bottom else keep)
         self.dirty = False
 
     def _switch_view(self):
@@ -1551,12 +1975,27 @@ class EloquentWidget(QWidget):
         self._rebuild()
 
     def _show_gen_menu(self):
+        self._refresh_loaded_reports()
         multi = bool(self.engine.state.snapshot().get("multi_speaker")) or self.engine.speaker_edit_count() > 0
-        self.act_rename.setVisible(multi)
-        self.act_rename_sep.setVisible(multi)
+        menu = QMenu(self)
+        if self._loaded_reports:
+            saved_sub = menu.addMenu(f"Saved outputs ({len(self._loaded_reports)})")
+            for rep_meta in self._loaded_reports:
+                saved_sub.addAction(
+                    rep_meta["label"],
+                    lambda rm=rep_meta: self._open_saved_report_item(rm),
+                )
+            menu.addSeparator()
+        if multi:
+            menu.addAction("Rename speakers…", self.rename_speakers)
+            menu.addSeparator()
+        for fmt in REPORT_FORMATS:
+            menu.addAction(fmt["label"], lambda fid=fmt["id"]: self._trigger_gen(fid))
+        menu.addSeparator()
+        menu.addAction("Custom Prompt…", self._trigger_custom_gen)
         self._menu_open = True
         try:
-            self.gen_menu.exec(self.btn_gen.mapToGlobal(QPoint(0, self.btn_gen.height())))
+            menu.exec(self.btn_gen.mapToGlobal(QPoint(0, self.btn_gen.height())))
         finally:
             self._menu_open = False
             self._sync_island(animate=True)
@@ -1766,6 +2205,8 @@ class EloquentWidget(QWidget):
         self.panel.setVisible(show)
         self.btn_expand.setToolTip("Hide transcript" if show else "Show transcript")
         if show:
+            if self.drawer_tab == "history":
+                self._refresh_history()
             self._rebuild()
         self._sync_island(animate=True)
 
@@ -1789,7 +2230,10 @@ class EloquentWidget(QWidget):
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
 
     def _open_folder(self):
-        self._open(self.engine.last_session_dir or self.s.resolved_sessions_dir())
+        if self.drawer_tab == "history":
+            self._open(self.s.resolved_sessions_dir())
+        else:
+            self._open(self._loaded_session_dir or self.engine.last_session_dir or self.s.resolved_sessions_dir())
 
     def _make_shortcut(self):
         from ..hotkeys import spawn_listener
@@ -2081,7 +2525,7 @@ class EloquentWidget(QWidget):
             elif e.button() == Qt.LeftButton:
                 # Single-click on the pill header smoothly expands/collapses the Dynamic Island
                 local_y = e.position().y()
-                if not self.panel.isVisible() or local_y <= (SHADOW_PAD_TOP + 54):
+                if not self.panel.isVisible() or local_y <= (SHADOW_PAD_TOP + 38):
                     self.toggle_panel()
 
     def mouseDoubleClickEvent(self, e):

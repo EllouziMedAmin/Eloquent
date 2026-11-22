@@ -39,6 +39,39 @@ class State:
         if notify:
             self.emit("reset")
 
+    def load_saved_session(self, paragraphs: list[dict], report: Optional[dict] = None, notify: bool = True):
+        """Populate state from a saved session on disk (safe when idle)."""
+        with self.lock:
+            self.paragraphs = []
+            self.loose = []
+            self.partial = ""
+            self.error = ""
+            self.report = dict(report) if report else None
+            self.speaker_names = {}
+            self.next_id = 1
+            self.next_turn_id = 1
+            for item in paragraphs:
+                pid = self.next_id
+                tid = self.next_turn_id
+                self.next_id += 1
+                self.next_turn_id += 1
+                self.paragraphs.append({
+                    "id": pid,
+                    "time": item.get("time", ""),
+                    "raw": item.get("raw", ""),
+                    "clean": item.get("clean", ""),
+                    "tokens": item.get("tokens"),
+                    "status": "done",
+                    "note": "",
+                    "speaker": item.get("speaker", ""),
+                    "overlap": bool(item.get("overlap", False)),
+                    "seg_ids": [tid],
+                })
+            self.rev += 1
+        if notify:
+            self.emit("reset")
+            self.emit("paragraph", None)
+
     def alloc_turn_id(self) -> int:
         with self.lock:
             tid = self.next_turn_id
