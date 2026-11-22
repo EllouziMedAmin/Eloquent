@@ -29,9 +29,9 @@ import numpy as np
 
 from .audio import LoopbackCapture, MicCapture
 from .cleaner import Cleaner, DICTATION_PAUSE_SEC
-from .config import config_dir, is_arabic_speech
+from .config import config_dir, is_arabic_speech, normalize_overlap_mode
 from .diarizer import Diarizer, build_speaker_extractor, ensure_speaker_model
-from .llm import make_provider
+from .llm import make_overlap_provider, make_provider
 from .llm.prompts import build_format_instruction
 from .overlap import build_overlap_segmenter
 from .session import Session, load_session_data, write_session_files
@@ -92,11 +92,20 @@ class Engine:
         self.provider = None
         self.dict_provider = None
         self.compose_provider = None
+        self.overlap_provider = None
         self.compose_history = []
         self._diar_lock = threading.Lock()
         self._model_lock = threading.Lock()
         self._log_lock = threading.Lock()
         self._provider_key = None
+        self._overlap_provider_key = None
+        self._overlap_lock = threading.Lock()
+        self._overlap_epoch = 0
+        self._anchor_clips: dict[int, tuple[np.ndarray, float, str]] = {}
+        self._overlap_clips: dict[int, dict] = {}
+        self._overlap_inflight: set[int] = set()
+        self._overlap_q: "queue.Queue[tuple[int, int, bool]]" = queue.Queue()
+        self._overlap_worker: Optional[threading.Thread] = None
         self._listeners = []
         self._stop = threading.Event()
         self._paused = threading.Event()
@@ -222,9 +231,27 @@ class Engine:
         """(Re)create the LLM provider(s) when settings change. The key check runs in the background."""
         s = self.settings
         vocab = getattr(s, "custom_vocabulary", "")
-        for p in (self.provider, self.dict_provider, self.compose_provider):
+        for p in (self.provider, self.dict_provider, self.compose_provider, self.overlap_provider):
             if p is not None and hasattr(p, "custom_vocabulary"):
                 p.custom_vocabulary = vocab
+
+        ov_mode = normalize_overlap_mode(getattr(s, "overlap_mode", "off"))
+        if self.diarizer is not None:
+            self.diarizer.preserve_overlap_zones = (ov_mode != "off")
+        ov_key = (
+            ov_mode,
+            s.resolved_api_key(),
+            getattr(s, "overlap_audio_model", "auto"),
+            s.resolved_speech_language(),
+        )
+        if ov_key != self._overlap_provider_key or force:
+            self._overlap_provider_key = ov_key
+            self.overlap_provider, ov_reason = make_overlap_provider(s)
+            if self.overlap_provider is not None:
+                self.overlap_provider.log = self.log
+            elif ov_mode != "off" and ov_reason:
+                self.log(f"[overlap-audio] {ov_reason}", "warn")
+
         key = (s.cleanup, s.dictation_cleanup, bool(s.compose_hotkey),
                s.resolved_api_key(), s.llm_model, s.keep_fillers, s.resolved_speech_language())
         if key == self._provider_key and not force:
@@ -306,6 +333,7 @@ class Engine:
 
         self.state.reset()
         self._last_clusterer = None
+        self._reset_overlap_cache()
         if paste_mode:
             self.session = None
         else:
@@ -320,6 +348,8 @@ class Engine:
             arabic_mode=arabic,
             max_speakers=getattr(s, "max_speakers", 0),
             segmenter=self.segmenter,
+            on_segment_audio=self._on_diarizer_segment_audio,
+            preserve_overlap_zones=(normalize_overlap_mode(getattr(s, "overlap_mode", "off")) != "off"),
         ) if (use_diar and self.extractor is not None) else None
         if self.diarizer is not None:
             self.diarizer.start()
@@ -747,6 +777,7 @@ class Engine:
         self.state.set_partial("")
         if self.diarizer is not None:
             self.diarizer.flush_and_wait()
+        self._wait_pending_overlaps(timeout=10.0)
         self.cleaner.flush_and_wait()
         if self.session is not None:
             if self.diarizer is not None or self.state.snapshot().get("multi_speaker"):
@@ -1042,6 +1073,260 @@ class Engine:
                 write_session_files(Path(self.last_session_dir), self.state)
         return count
 
+    # ------------------------------------------------------------------ #
+    # optional Gemini Audio overlap separation (session RAM cache only)
+    # ------------------------------------------------------------------ #
+    def _reset_overlap_cache(self):
+        with self._overlap_lock:
+            self._overlap_epoch += 1
+            self._anchor_clips.clear()
+            self._overlap_clips.clear()
+            self._overlap_inflight.clear()
+
+    def _on_diarizer_segment_audio(self, records: list[dict]):
+        """Cache clean RAM voice anchors and overlapping audio clips for the active session."""
+        mode = normalize_overlap_mode(getattr(self.settings, "overlap_mode", "off"))
+        if mode == "off" or not records:
+            return
+
+        auto_submit: list[int] = []
+        with self._overlap_lock:
+            for rec in records:
+                tid = int(rec["turn_id"])
+                samples = rec.get("samples")
+                if samples is None or len(samples) == 0:
+                    continue
+                is_ov = bool(rec.get("overlap"))
+                vdur = float(rec.get("vdur", 0.0))
+                spk = rec.get("speaker", "")
+
+                if not is_ov and vdur >= 1.1 and len(samples) >= int(1.0 * SAMPLE_RATE):
+                    max_n = int(2.8 * SAMPLE_RATE)
+                    if len(samples) > max_n:
+                        mid = len(samples) // 2
+                        half = max_n // 2
+                        clip = samples[mid - half:mid - half + max_n].copy()
+                    else:
+                        clip = samples.copy()
+                    self._anchor_clips[tid] = (clip, vdur, spk)
+                    while len(self._anchor_clips) > 24:
+                        oldest_tid = next(iter(self._anchor_clips))
+                        del self._anchor_clips[oldest_tid]
+                elif is_ov and len(samples) >= int(0.8 * SAMPLE_RATE):
+                    ov_sec = float(rec.get("overlap_sec", 0.0))
+                    heavy = bool(rec.get("heavy_overlap", False))
+                    self._overlap_clips[tid] = {
+                        "samples": samples.copy(),
+                        "overlap_sec": ov_sec,
+                        "heavy": heavy,
+                        "stamp": rec.get("stamp", ""),
+                        "text": rec.get("text", ""),
+                    }
+                    while len(self._overlap_clips) > 50:
+                        oldest_ov = next(iter(self._overlap_clips))
+                        if oldest_ov not in self._overlap_inflight:
+                            del self._overlap_clips[oldest_ov]
+                        else:
+                            break
+                    if mode == "auto" and (heavy or ov_sec >= 0.70):
+                        auto_submit.append(tid)
+
+        for tid in auto_submit:
+            self.resolve_overlap(tid, auto=True)
+
+    def resolvable_overlap_ids(self) -> set[int]:
+        """Return turn IDs in the current session that can be separated via Gemini Audio."""
+        if normalize_overlap_mode(getattr(self.settings, "overlap_mode", "off")) == "off":
+            return set()
+        with self._overlap_lock:
+            return set(self._overlap_clips.keys())
+
+    def _collect_voice_anchors(self, recent_cids: list[str], max_anchors: int = 4) -> list[tuple[str, str, np.ndarray]]:
+        """Collect up to *max_anchors* clean speaker voice snippets from RAM for Gemini Audio."""
+        diar = self.diarizer
+        if diar is not None:
+            turn_spk = diar.turn_speaker_map()
+        elif self._last_clusterer is not None:
+            turn_spk = dict(self._last_clusterer._turn_prev_spk)
+        else:
+            turn_spk = {}
+
+        with self._overlap_lock:
+            snap_anchors = list(self._anchor_clips.items())
+
+        # Group clean anchor clips by each turn's CURRENT live canonical speaker ID
+        by_spk: dict[str, tuple[tuple[int, float], np.ndarray]] = {}
+        for tid, (clip, vdur, init_spk) in snap_anchors:
+            cid = turn_spk.get(tid) or init_spk
+            if not cid:
+                continue
+            # Strongly prefer confirmed >=1.8s clips closest to 2.6s, falling back to 1.1-1.8s when needed
+            score = (0 if vdur >= 1.8 else 1, abs(min(vdur, 4.0) - 2.6))
+            prev = by_spk.get(cid)
+            if prev is None or score < prev[0]:
+                by_spk[cid] = (score, clip)
+
+        ordered_cids: list[str] = []
+        for cid in recent_cids:
+            if cid in by_spk and cid not in ordered_cids:
+                ordered_cids.append(cid)
+        for cid in by_spk:
+            if cid not in ordered_cids:
+                ordered_cids.append(cid)
+
+        out: list[tuple[str, str, np.ndarray]] = []
+        for cid in ordered_cids[:max_anchors]:
+            disp = self.state.display_speaker(cid) or cid
+            out.append((cid, disp, by_spk[cid][1]))
+        return out
+
+    def _ensure_overlap_worker(self):
+        if self._overlap_worker is None or not self._overlap_worker.is_alive():
+            self._overlap_worker = threading.Thread(
+                target=self._run_overlap_worker, daemon=True, name="eloquent-overlap-audio",
+            )
+            self._overlap_worker.start()
+
+    def resolve_overlap(self, turn_id: int, auto: bool = False) -> tuple[bool, str]:
+        """Queue overlapping *turn_id* for Gemini Audio voice separation (non-blocking)."""
+        mode = normalize_overlap_mode(getattr(self.settings, "overlap_mode", "off"))
+        if mode == "off":
+            return False, "Enable overlap separation in Settings -> AI & Polishing"
+        self.refresh_provider()
+        provider = self.overlap_provider
+        if provider is None:
+            provider, reason = make_overlap_provider(self.settings, force=True)
+            if provider is None:
+                if not auto:
+                    self._emit("overlap_error", (turn_id, reason, False))
+                return False, reason
+            provider.log = self.log
+            self.overlap_provider = provider
+
+        with self._overlap_lock:
+            if turn_id not in self._overlap_clips:
+                return False, "Audio clip is no longer available for this line"
+            if turn_id in self._overlap_inflight:
+                return True, ""
+            self._overlap_inflight.add(turn_id)
+            epoch = self._overlap_epoch
+
+        self.state.set_overlap_state(turn_id, "resolving")
+        self._ensure_overlap_worker()
+        self._overlap_q.put((epoch, turn_id, bool(auto)))
+        return True, ""
+
+    def _wait_pending_overlaps(self, timeout: float = 10.0):
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        while time.monotonic() < deadline:
+            with self._overlap_lock:
+                busy = bool(self._overlap_inflight) or not self._overlap_q.empty()
+            if not busy:
+                return
+            time.sleep(0.1)
+
+    def _run_overlap_worker(self):
+        while True:
+            epoch, turn_id, auto = self._overlap_q.get()
+            try:
+                self._process_overlap_job(epoch, turn_id, auto)
+            except Exception as e:
+                self.log(f"[overlap-audio] worker error: {type(e).__name__}: {e}", "warn")
+            finally:
+                with self._overlap_lock:
+                    self._overlap_inflight.discard(turn_id)
+                self._overlap_q.task_done()
+
+    def _process_overlap_job(self, epoch: int, turn_id: int, auto: bool):
+        with self._overlap_lock:
+            if epoch != self._overlap_epoch:
+                return
+            clip_info = self._overlap_clips.get(turn_id)
+        if clip_info is None:
+            return
+
+        provider = self.overlap_provider
+        if provider is None:
+            self.state.set_overlap_state(turn_id, "")
+            return
+
+        ctx, local_txt, def_spk, recent_cids, prev_spk = self.state.overlap_context(turn_id)
+        anchors = self._collect_voice_anchors(recent_cids)
+        anchor_cids = {cid for cid, _, _ in anchors}
+
+        diar = self.diarizer
+        if diar is not None:
+            next_spk_num = diar.next_available_speaker_num(exclude_turn_id=turn_id)
+            turn_spk = diar.turn_speaker_map()
+        elif self._last_clusterer is not None:
+            next_spk_num = self._last_clusterer.next_available_speaker_num(exclude_turn_id=turn_id)
+            turn_spk = dict(self._last_clusterer._turn_prev_spk)
+        else:
+            next_spk_num = 0
+            turn_spk = {}
+
+        # Avoid showing a solo mixed-overlap phantom ID to Gemini when it has no clean turns yet
+        solo_cid = ""
+        if turn_id in turn_spk:
+            cand_cid = turn_spk[turn_id]
+            other_turns = [t for t, sp in turn_spk.items() if t != turn_id and sp == cand_cid]
+            if not other_turns and cand_cid not in anchor_cids:
+                solo_cid = cand_cid
+        known_speakers = [(cid, disp) for cid, disp in self.state.speakers() if cid != solo_cid]
+
+        try:
+            separated = provider.separate_overlap(
+                clip_info["samples"],
+                sample_rate=SAMPLE_RATE,
+                anchors=anchors,
+                known_speakers=known_speakers,
+                context=ctx,
+                local_text=local_txt or clip_info.get("text", ""),
+                default_speaker=prev_spk or (def_spk if def_spk != solo_cid else ""),
+                prev_speaker=prev_spk,
+                next_speaker_num=next_spk_num,
+                custom_vocabulary=getattr(self.settings, "custom_vocabulary", ""),
+                speech_language=self.settings.resolved_speech_language(),
+            )
+        except Exception as e:
+            err = f"{type(e).__name__}: {str(e)[:160]}"
+            with self._overlap_lock:
+                still_cur = (epoch == self._overlap_epoch)
+            if still_cur:
+                self.state.set_overlap_state(turn_id, "")
+                self.log(f"[overlap-audio] failed on turn #{turn_id}: {err}", "warn")
+                self._emit("overlap_error", (turn_id, str(e)[:140] or err, auto))
+            return
+
+        with self._overlap_lock:
+            if epoch != self._overlap_epoch:
+                return
+            if separated:
+                self._overlap_clips.pop(turn_id, None)
+
+        if not separated:
+            self.state.set_overlap_state(turn_id, "")
+            self.log(f"[overlap-audio] empty response for turn #{turn_id}", "warn")
+            self._emit("overlap_error", (turn_id, "Could not separate voices from this clip", auto))
+            return
+
+        if self.state.apply_overlap_resolution(turn_id, separated):
+            # Drop the contaminated mixed-overlap voiceprint from clusterer so it never reserves a phantom ID
+            if self.diarizer is not None:
+                self.diarizer.discard_resolved_turn(turn_id)
+            elif self._last_clusterer is not None:
+                self._last_clusterer.discard_turn(turn_id)
+            self._sync_session_files()
+            self.log(
+                f"[overlap-audio] separated turn #{turn_id} into {len(separated)} turn(s) via {provider.last_model}"
+            )
+            self._emit("overlap_resolved", {
+                "turn_id": turn_id,
+                "count": len(separated),
+                "model": provider.last_model,
+                "auto": auto,
+            })
+
     def load_session(self, session_dir: Path) -> Optional[dict]:
         """Load a saved session folder into State so it can be read, edited, or formatted."""
         if self.busy:
@@ -1051,6 +1336,7 @@ class Engine:
             return None
         data = load_session_data(d)
         self._last_clusterer = None
+        self._reset_overlap_cache()
         self.session = None
         self.last_session_dir = d
         self.state.load_saved_session(data["paragraphs"], report=data.get("report"))

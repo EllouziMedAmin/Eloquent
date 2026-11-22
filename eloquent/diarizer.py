@@ -397,6 +397,7 @@ def split_segment_by_speaker(samples: np.ndarray, words: list[dict],
                              text: str = "",
                              segmenter=None,
                              out_meta: Optional[list[dict]] = None,
+                             preserve_overlap_zones: bool = False,
                              ) -> list[tuple[int, int, str, np.ndarray, float, list[np.ndarray]]]:
     """Return `[(sample_start, sample_end, text, embedding_vec, voiced_dur, sub_vecs), ...]`.
 
@@ -423,13 +424,13 @@ def split_segment_by_speaker(samples: np.ndarray, words: list[dict],
 
     def _slice_overlap_meta(sa: int, sb: int) -> dict:
         if analysis is None:
-            return {"overlap": False, "heavy_overlap": False}
+            return {"overlap": False, "heavy_overlap": False, "overlap_sec": 0.0}
         t_a, t_b = sa / SAMPLE_RATE, sb / SAMPLE_RATE
-        has_ov, _ = analysis.has_overlap_in(t_a, t_b, min_overlap_sec=0.40)
+        has_ov, ov_sec = analysis.has_overlap_in(t_a, t_b, min_overlap_sec=0.40)
         if not has_ov:
-            return {"overlap": False, "heavy_overlap": False}
+            return {"overlap": False, "heavy_overlap": False, "overlap_sec": 0.0}
         _, clean_voiced, _ = analysis.strip_overlap(samples[sa:sb], t_a, t_b)
-        return {"overlap": True, "heavy_overlap": clean_voiced < 1.0}
+        return {"overlap": True, "heavy_overlap": clean_voiced < 1.0, "overlap_sec": float(ov_sec)}
 
     def _voiced_bounds(sa: int, sb: int, sub_words: list[dict], pad_sec: float = 0.08) -> tuple[float, float]:
         if not sub_words:
@@ -611,6 +612,28 @@ def split_segment_by_speaker(samples: np.ndarray, words: list[dict],
                     parts[i - 1:i + 2] = [(sa, sb, wa, wb, mv, md, [])]
                     continue
         i += 1
+
+    # When optional Gemini Audio overlap separation is enabled, keep unbroken overlap zones
+    # together instead of slicing right through simultaneous speech into tiny shards.
+    if preserve_overlap_zones and analysis is not None and len(parts) > 1 and analysis.overlap_spans:
+        def _cut_near_overlap(t_cut: float) -> bool:
+            return any((oa - 0.35) <= t_cut <= (ob + 0.35) for oa, ob in analysis.overlap_spans)
+
+        j = 0
+        while j < len(parts) - 1:
+            sa_a, sb_a, wa_a, wb_a, vec_a, dur_a, _ = parts[j]
+            sa_b, sb_b, wa_b, wb_b, vec_b, dur_b, _ = parts[j + 1]
+            ov_a = _slice_overlap_meta(sa_a, sb_a)["overlap"]
+            ov_b = _slice_overlap_meta(sa_b, sb_b)["overlap"]
+            t_cut = 0.5 * (sb_a + sa_b) / SAMPLE_RATE
+            if (ov_a and ov_b) or ((ov_a or ov_b) and _cut_near_overlap(t_cut)):
+                mv, md = _embed_slice(sa_a, sb_b, wa_a, wb_b)
+                if mv is None:
+                    mv = vec_a if dur_a >= dur_b else vec_b
+                    md = dur_a + dur_b
+                parts[j:j + 2] = [(sa_a, sb_b, wa_a, wb_b, mv, md, [])]
+                continue
+            j += 1
 
     out = []
     for sa, sb, a, b, vec, vdur, subs in parts:
@@ -1756,6 +1779,45 @@ class SpeakerClusterer:
 
         return id_to_spk
 
+    def discard_turn(self, turn_id: int) -> Optional[str]:
+        """Drop a mixed-overlap turn after Gemini Audio replaces it, freeing any solo phantom ID."""
+        removed_spk = None
+        kept_turns = []
+        for t in self.turns:
+            if t["id"] == turn_id:
+                removed_spk = t.get("speaker") or self._turn_prev_spk.get(turn_id)
+                continue
+            kept_turns.append(t)
+        if removed_spk is None and turn_id not in self._turn_prev_spk:
+            return None
+        self.turns = kept_turns
+        self._turn_prev_spk.pop(turn_id, None)
+        self._pinned_turns.pop(turn_id, None)
+        self._dissolved_prev_bridge.pop(turn_id, None)
+        for s in self._locked_anchors.values():
+            s.discard(turn_id)
+        for ls in self._must_link_sets:
+            ls.discard(turn_id)
+        if removed_spk and not any(t.get("speaker") == removed_spk for t in self.turns):
+            if removed_spk not in self._spk_names and not self._locked_anchors.get(removed_spk):
+                self._spk_centroids.pop(removed_spk, None)
+                self._centroids = [(lbl, c) for lbl, c in self._centroids if lbl != removed_spk]
+                self._established = [e for e in self._established if e[0] != removed_spk]
+        return removed_spk
+
+    def next_available_speaker_num(self, exclude_turn_id: Optional[int] = None) -> int:
+        """Return smallest unused `Speaker N` number, ignoring any solo ID owned only by *exclude_turn_id*."""
+        used = {
+            t.get("speaker", "")
+            for t in self.turns
+            if t.get("speaker") and (exclude_turn_id is None or t["id"] != exclude_turn_id)
+        }
+        reserved = used | set(self._spk_names.keys()) | set(self._locked_anchors.keys()) | self._retired_cids
+        k = 1
+        while f"Speaker {k}" in reserved:
+            k += 1
+        return k
+
 
 # --------------------------------------------------------------------------- #
 # Background worker thread integrated with Engine / State / Session
@@ -1763,7 +1825,8 @@ class SpeakerClusterer:
 class Diarizer(threading.Thread):
     def __init__(self, extractor, state, session=None, log=print,
                  arabic_mode: bool = False, max_speakers: int = 0,
-                 segmenter=None):
+                 segmenter=None, on_segment_audio=None,
+                 preserve_overlap_zones: bool = False):
         super().__init__(daemon=True, name="eloquent-diarizer")
         self.extractor = extractor
         self.state = state
@@ -1771,11 +1834,25 @@ class Diarizer(threading.Thread):
         self.log = log
         self.arabic_mode = bool(arabic_mode)
         self.segmenter = segmenter
+        self.on_segment_audio = on_segment_audio
+        self.preserve_overlap_zones = bool(preserve_overlap_zones)
         self.clusterer = SpeakerClusterer(arabic_mode=arabic_mode, max_speakers=max_speakers)
         self._cluster_lock = threading.Lock()
         self.q: "queue.Queue[Optional[tuple]]" = queue.Queue()
         self._stop_flag = False
         self._sync_needed = False
+
+    def turn_speaker_map(self) -> dict[int, str]:
+        with self._cluster_lock:
+            return dict(self.clusterer._turn_prev_spk)
+
+    def discard_resolved_turn(self, turn_id: int) -> Optional[str]:
+        with self._cluster_lock:
+            return self.clusterer.discard_turn(turn_id)
+
+    def next_available_speaker_num(self, exclude_turn_id: Optional[int] = None) -> int:
+        with self._cluster_lock:
+            return self.clusterer.next_available_speaker_num(exclude_turn_id=exclude_turn_id)
 
     def set_speaker_names(self, updates: dict[str, str],
                           current_names: Optional[dict[str, str]] = None) -> None:
@@ -1893,6 +1970,7 @@ class Diarizer(threading.Thread):
             samples, words, self._embed, known_speakers=known, text=text,
             segmenter=self.segmenter,
             out_meta=meta_list,
+            preserve_overlap_zones=self.preserve_overlap_zones,
         )
         if not parts:
             with self._cluster_lock:
@@ -1901,10 +1979,12 @@ class Diarizer(threading.Thread):
             return
 
         overlap_ids: set[int] = set()
+        audio_records: list[dict] = []
         if len(parts) == 1:
             sa, sb, ptxt, vec, vdur, subs = parts[0]
             meta = meta_list[0] if meta_list else {}
-            if meta.get("overlap"):
+            is_ov = bool(meta.get("overlap"))
+            if is_ov:
                 overlap_ids.add(seg_id)
             with self._cluster_lock:
                 old_by_spk = self.clusterer._speaker_turn_ids()
@@ -1914,10 +1994,23 @@ class Diarizer(threading.Thread):
                 )
                 id_remap = self.clusterer._compute_id_remap(old_by_spk, mapping)
             entries = [(seg_id, stamp, start_sec, ptxt or text, spk)]
+            if self.on_segment_audio is not None:
+                audio_records.append({
+                    "turn_id": seg_id,
+                    "speaker": mapping.get(seg_id, spk),
+                    "stamp": stamp,
+                    "text": ptxt or text,
+                    "samples": samples[sa:sb],
+                    "vdur": float(vdur),
+                    "overlap": is_ov,
+                    "heavy_overlap": bool(meta.get("heavy_overlap")),
+                    "overlap_sec": float(meta.get("overlap_sec", 0.0)),
+                })
         else:
             from .state import fmt_time
             entries = []
             mapping = {}
+            pending_recs: list[dict] = []
             with self._cluster_lock:
                 old_by_spk = self.clusterer._speaker_turn_ids()
                 for idx, (sa, sb, ptxt, vec, vdur, subs) in enumerate(parts):
@@ -1925,19 +2018,40 @@ class Diarizer(threading.Thread):
                     sub_start = start_sec + sa / SAMPLE_RATE
                     sub_stamp = stamp if idx == 0 else fmt_time(sub_start)
                     turn_id = seg_id if idx == 0 else self.state.alloc_turn_id()
-                    if meta.get("overlap"):
+                    is_ov = bool(meta.get("overlap"))
+                    if is_ov:
                         overlap_ids.add(turn_id)
                     spk, mapping = self.clusterer.add_and_cluster(
                         turn_id, sub_start, vdur, vec, subs,
                         bridge_hint=bool(meta.get("heavy_overlap")),
                     )
                     entries.append((turn_id, sub_stamp, sub_start, ptxt, spk))
+                    if self.on_segment_audio is not None:
+                        pending_recs.append({
+                            "turn_id": turn_id,
+                            "speaker": spk,
+                            "stamp": sub_stamp,
+                            "text": ptxt,
+                            "samples": samples[sa:sb],
+                            "vdur": float(vdur),
+                            "overlap": is_ov,
+                            "heavy_overlap": bool(meta.get("heavy_overlap")),
+                            "overlap_sec": float(meta.get("overlap_sec", 0.0)),
+                        })
                 id_remap = self.clusterer._compute_id_remap(old_by_spk, mapping)
+            for rec in pending_recs:
+                rec["speaker"] = mapping.get(rec["turn_id"], rec["speaker"])
+                audio_records.append(rec)
 
         self.state.apply_diarization(
             seg_id, entries, mapping, old_by_spk=old_by_spk, id_remap=id_remap,
             overlap_ids=overlap_ids,
         )
+        if audio_records and self.on_segment_audio is not None:
+            try:
+                self.on_segment_audio(audio_records)
+            except Exception as e:
+                self.log(f"[overlap-audio] callback error: {type(e).__name__}: {e}", "warn")
         self._sync_needed = True
 
     def flush_and_wait(self, timeout: float = 30.0) -> None:

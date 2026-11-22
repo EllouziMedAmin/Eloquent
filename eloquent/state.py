@@ -99,6 +99,7 @@ class State:
                 "ts": time.time(), "text": text,
                 "speaker": speaker, "spk_ready": spk_ready,
                 "gap_before": gap_before, "overlap": False,
+                "overlap_state": "",
             })
             self.partial = ""
             self.rev += 1
@@ -125,7 +126,7 @@ class State:
                         "id": tid, "t": st, "start_sec": t0,
                         "ts": orig_ts if j == 0 else now, "text": txt,
                         "speaker": mapping.get(tid, spk), "spk_ready": True,
-                        "overlap": (tid in ov_set),
+                        "overlap": (tid in ov_set), "overlap_state": "",
                     }
                     for j, (tid, st, t0, txt, spk) in enumerate(parts)
                 ]
@@ -386,6 +387,224 @@ class State:
             self.emit("speakers", None)
         return changed
 
+    # -- overlap audio separation side ------------------------------------
+    def set_overlap_state(self, turn_id: int, ov_state: str) -> bool:
+        """Set transient overlap resolution state (`''`, `'resolving'`, `'resolved'`) for *turn_id*."""
+        changed = False
+        with self.lock:
+            for x in self.loose:
+                if x["id"] == turn_id:
+                    if x.get("overlap_state", "") != ov_state:
+                        x["overlap_state"] = ov_state
+                        changed = True
+                    break
+            else:
+                for p in self.paragraphs:
+                    sids = p.get("seg_ids") or ()
+                    if turn_id in sids:
+                        if p.get("overlap_state", "") != ov_state:
+                            p["overlap_state"] = ov_state
+                            changed = True
+                        for it in p.get("segs") or ():
+                            if it["id"] == turn_id:
+                                it["overlap_state"] = ov_state
+                        break
+            if changed:
+                self.rev += 1
+        if changed:
+            self.emit("paragraph", None)
+        return changed
+
+    def overlap_context(self, turn_id: int) -> tuple[str, str, str, list[str], str]:
+        """Return `(prior_context, local_text, default_speaker_cid, recent_speaker_cids, prev_speaker_cid)`."""
+        with self.lock:
+            multi = self._multi_speaker_locked()
+            prev_items: list[tuple[str, str, str]] = []  # (cid, disp, text)
+            local_text = ""
+            default_spk = ""
+            recent_cids: list[str] = []
+
+            def _add_recent(cid: str):
+                if cid and cid not in recent_cids:
+                    recent_cids.append(cid)
+
+            found = False
+            for pi, p in enumerate(self.paragraphs):
+                sids = p.get("seg_ids") or ()
+                if turn_id in sids:
+                    found = True
+                    default_spk = p.get("speaker", "")
+                    segs = p.get("segs") or ()
+                    seg_hit = next((it for it in segs if it["id"] == turn_id), None)
+                    local_text = (seg_hit["text"] if seg_hit else (p.get("raw") or p.get("clean") or "")).strip()
+                    for prev_p in self.paragraphs[max(0, pi - 3):pi]:
+                        t = (prev_p.get("clean") or prev_p.get("raw") or "").strip()
+                        sp = prev_p.get("speaker", "")
+                        if t:
+                            prev_items.append((sp, self._disp_spk(sp), t))
+                    for sp, _, _ in reversed(prev_items):
+                        _add_recent(sp)
+                    _add_recent(default_spk)
+                    for near_p in self.paragraphs[pi + 1:pi + 4]:
+                        _add_recent(near_p.get("speaker", ""))
+                    break
+
+            if not found:
+                for li, x in enumerate(self.loose):
+                    if x["id"] == turn_id:
+                        found = True
+                        default_spk = x.get("speaker", "")
+                        local_text = (x.get("text") or "").strip()
+                        for prev_p in self.paragraphs[-3:]:
+                            t = (prev_p.get("clean") or prev_p.get("raw") or "").strip()
+                            sp = prev_p.get("speaker", "")
+                            if t:
+                                prev_items.append((sp, self._disp_spk(sp), t))
+                        for prev_x in self.loose[max(0, li - 2):li]:
+                            t = (prev_x.get("text") or "").strip()
+                            sp = prev_x.get("speaker", "")
+                            if t:
+                                prev_items.append((sp, self._disp_spk(sp), t))
+                        for sp, _, _ in reversed(prev_items):
+                            _add_recent(sp)
+                        _add_recent(default_spk)
+                        for near_x in self.loose[li + 1:li + 3]:
+                            _add_recent(near_x.get("speaker", ""))
+                        break
+
+            for cid, _ in self._speakers_locked():
+                _add_recent(cid)
+
+            prev_spk = prev_items[-1][0] if prev_items else ""
+            ctx_lines = [
+                f"{disp}: {txt}" if (multi and disp) else txt
+                for _, disp, txt in prev_items[-3:]
+            ]
+            return "\n".join(ctx_lines)[-700:], local_text, default_spk, recent_cids, prev_spk
+
+    def apply_overlap_resolution(self, turn_id: int, separated: list[dict[str, str]]) -> bool:
+        """Replace overlapping turn *turn_id* with cleanly separated speaker turns from Gemini Audio."""
+        items = [
+            {"speaker": (it.get("speaker") or "").strip(), "text": (it.get("text") or "").strip()}
+            for it in (separated or ())
+            if (it.get("text") or "").strip()
+        ]
+        if not items:
+            return False
+
+        def _make_sep_para(stamp: str, orig_raw: str, spk: str, clean_txt: str) -> dict:
+            pid = self.next_id
+            self.next_id += 1
+            tid = self.next_turn_id
+            self.next_turn_id += 1
+            return {
+                "id": pid,
+                "time": stamp,
+                "raw": orig_raw,
+                "clean": clean_txt,
+                "tokens": [(w, False) for w in clean_txt.split()],
+                "status": "done",
+                "note": "",
+                "speaker": spk,
+                "overlap": False,
+                "overlap_state": "resolved",
+                "seg_ids": [tid],
+            }
+
+        changed = False
+        with self.lock:
+            # Case 1: turn is still in loose segments (keeps strict chronological order)
+            l_idx = next((i for i, x in enumerate(self.loose) if x["id"] == turn_id), None)
+            if l_idx is not None:
+                orig = self.loose[l_idx]
+                orig_raw = orig.get("text", "")
+                repl = []
+                for j, it in enumerate(items):
+                    ntid = self.next_turn_id
+                    self.next_turn_id += 1
+                    repl.append({
+                        "id": ntid,
+                        "t": orig["t"],
+                        "start_sec": orig.get("start_sec", 0.0),
+                        "ts": orig["ts"],
+                        "text": it["text"],
+                        "raw_overlap": orig_raw,
+                        "speaker": it["speaker"] or orig.get("speaker", ""),
+                        "spk_ready": True,
+                        "gap_before": orig.get("gap_before", 0.0) if j == 0 else 0.0,
+                        "overlap": False,
+                        "overlap_state": "resolved",
+                    })
+                self.loose[l_idx:l_idx + 1] = repl
+                changed = True
+            else:
+                # Case 2: turn is already inside a paragraph
+                p_idx = next((i for i, p in enumerate(self.paragraphs) if turn_id in (p.get("seg_ids") or ())), None)
+                if p_idx is not None:
+                    p = self.paragraphs[p_idx]
+                    segs = p.get("segs")
+                    if segs and len(segs) > 1:
+                        si = next((i for i, s in enumerate(segs) if s["id"] == turn_id), None)
+                    else:
+                        si = None
+
+                    if si is not None:
+                        before = segs[:si]
+                        target_seg = segs[si]
+                        after = segs[si + 1:]
+                        new_block: list[dict] = []
+
+                        def _wrap_segs(seg_slice: list[dict]) -> dict:
+                            pid = self.next_id
+                            self.next_id += 1
+                            raw_s = " ".join(s["text"] for s in seg_slice).strip()
+                            return {
+                                "id": pid,
+                                "time": seg_slice[0]["t"],
+                                "raw": raw_s,
+                                "clean": None,
+                                "tokens": None,
+                                "status": "raw",
+                                "note": "",
+                                "speaker": seg_slice[0].get("speaker", p.get("speaker", "")),
+                                "overlap": any(s.get("overlap") for s in seg_slice),
+                                "overlap_state": "",
+                                "seg_ids": [s["id"] for s in seg_slice],
+                                "segs": list(seg_slice),
+                            }
+
+                        if before:
+                            new_block.append(_wrap_segs(before))
+                        for it in items:
+                            new_block.append(_make_sep_para(
+                                target_seg["t"],
+                                target_seg["text"],
+                                it["speaker"] or target_seg.get("speaker", p.get("speaker", "")),
+                                it["text"],
+                            ))
+                        if after:
+                            new_block.append(_wrap_segs(after))
+                        self.paragraphs[p_idx:p_idx + 1] = new_block
+                    else:
+                        orig_raw = p.get("raw") or p.get("clean") or ""
+                        new_block = [
+                            _make_sep_para(
+                                p["time"],
+                                orig_raw,
+                                it["speaker"] or p.get("speaker", ""),
+                                it["text"],
+                            )
+                            for it in items
+                        ]
+                        self.paragraphs[p_idx:p_idx + 1] = new_block
+                    changed = True
+
+            if changed:
+                self.rev += 1
+        if changed:
+            self.emit("paragraph", None)
+        return changed
+
     # -- cleaner side -----------------------------------------------------
     def touch(self, kind: str, data=None):
         """Call after mutating paragraphs/error under `lock` (and after releasing it)."""
@@ -491,6 +710,16 @@ class State:
             self.emit("paragraph", None)
         return changed
 
+    @staticmethod
+    def _para_overlap_tid(p: dict) -> Optional[int]:
+        if not p.get("overlap"):
+            return None
+        for it in p.get("segs") or ():
+            if it.get("overlap"):
+                return it["id"]
+        sids = p.get("seg_ids") or ()
+        return sids[0] if sids else None
+
     def _build(self) -> dict:
         return {
             "rev": self.rev,
@@ -503,7 +732,9 @@ class State:
                 {"id": x["id"], "t": x["t"], "text": x["text"],
                  "speaker": self._disp_spk(x.get("speaker", "")),
                  "speaker_id": x.get("speaker", ""),
-                 "overlap": bool(x.get("overlap", False))}
+                 "overlap": bool(x.get("overlap", False)),
+                 "overlap_state": x.get("overlap_state", ""),
+                 "overlap_tid": x["id"] if x.get("overlap") else None}
                 for x in self.loose
             ],
             "paragraphs": [
@@ -511,7 +742,9 @@ class State:
                  "status": p["status"], "note": p["note"],
                  "speaker": self._disp_spk(p.get("speaker", "")),
                  "speaker_id": p.get("speaker", ""),
-                 "overlap": bool(p.get("overlap", False))}
+                 "overlap": bool(p.get("overlap", False)),
+                 "overlap_state": p.get("overlap_state", ""),
+                 "overlap_tid": self._para_overlap_tid(p)}
                 for p in self.paragraphs
             ],
         }
