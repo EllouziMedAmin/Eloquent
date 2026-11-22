@@ -11,6 +11,7 @@ from . import APP_NAME
 
 ROOT = Path(__file__).resolve().parent.parent          # repo folder when run from source
 DEFAULT_LLM_MODEL = "auto"
+DEFAULT_OVERLAP_AUDIO_MODEL = "auto"
 
 LLM_MODELS = (
     ("auto", "Auto (Smart Free Tier)"),
@@ -23,6 +24,21 @@ LLM_MODELS = (
     ("gemma-4-31b-it", "Gemma 4 31B Dense (14.4K/day)"),
 )
 
+OVERLAP_MODES = (
+    ("off", "Off (100% local audio)"),
+    ("manual", "On demand (click overlap badge)"),
+    ("auto", "Automatic (live background)"),
+)
+
+OVERLAP_AUDIO_MODELS = (
+    ("auto", "Auto (Gemini Audio)"),
+    ("gemini-3.6-flash", "Gemini 3.6 Flash (Best accuracy, 20/day)"),
+    ("gemini-4-hydrogen", "Gemini 4 Hydrogen (Strong accuracy)"),
+    ("gemini-3.8-flash", "Gemini 3.8 Flash (20/day)"),
+    ("gemini-3.5-flash-lite", "Gemini 3.5 Flash-Lite (Fast, 500/day)"),
+    ("gemini-3.1-flash-lite", "Gemini 3.1 Flash-Lite (Fast, 500/day)"),
+)
+
 SPEECH_LANGUAGES = (
     ("parakeet", "25 European languages (Parakeet v3, Default)"),
     ("arabic", "Arabic & Dialects (Cohere, Vulkan / CPU)"),
@@ -33,6 +49,12 @@ ISLAND_SIZES = (
     ("medium", "Medium"),
     ("large", "Large"),
 )
+
+
+def normalize_overlap_mode(value: Optional[str]) -> str:
+    """Normalize overlap audio separation mode to ``'off'``, ``'manual'``, or ``'auto'``."""
+    v = str(value or "").strip().lower()
+    return v if v in ("off", "manual", "auto") else "off"
 
 
 def normalize_island_size(value: Optional[str]) -> str:
@@ -76,6 +98,9 @@ class Settings:
     chunk_sentences: int = 3
     idle_flush: float = 6.0
     min_similarity: float = 0.5
+    # --- overlap audio separation (optional) ---
+    overlap_mode: str = "off"         # "off" | "manual" | "auto"
+    overlap_audio_model: str = DEFAULT_OVERLAP_AUDIO_MODEL
     # --- speech ---
     speech_language: str = "parakeet"  # "parakeet" (25 European languages) | "arabic" (Cohere Arabic GGUF)
     threads: int = 0                  # 0 = auto
@@ -124,6 +149,8 @@ class Settings:
                     setattr(s, k, v)
             s.speech_language = normalize_speech_language(s.speech_language)
             s.island_size = normalize_island_size(s.island_size)
+            s.overlap_mode = normalize_overlap_mode(s.overlap_mode)
+            s.overlap_audio_model = (str(s.overlap_audio_model or "").strip() or DEFAULT_OVERLAP_AUDIO_MODEL)
             try:
                 ms = int(s.max_speakers or 0)
             except (TypeError, ValueError):

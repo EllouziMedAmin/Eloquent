@@ -12,8 +12,9 @@ from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDialog,
 
 from .. import APP_NAME
 from ..audio import AUDIO_SOURCES, list_input_devices, list_loopback_devices
-from ..config import (DEFAULT_LLM_MODEL, ISLAND_SIZES, LLM_MODELS, SPEECH_LANGUAGES, is_arabic_speech,
-                      normalize_island_size, normalize_speech_language)
+from ..config import (DEFAULT_LLM_MODEL, DEFAULT_OVERLAP_AUDIO_MODEL, ISLAND_SIZES, LLM_MODELS,
+                      OVERLAP_AUDIO_MODELS, OVERLAP_MODES, SPEECH_LANGUAGES, is_arabic_speech,
+                      normalize_island_size, normalize_overlap_mode, normalize_speech_language)
 from ..hotkeys import parse_hotkey
 from ..textutil import format_custom_vocabulary, parse_custom_vocabulary
 
@@ -894,6 +895,43 @@ class SettingsDialog(QDialog):
         lay.addWidget(self._fillers_row)
         pl.addLayout(self._section("Gemini & polishing", card))
 
+        # Optional overlapping speech separation card (dedicated Gemini Audio provider)
+        ov_card, ov_lay = self._card()
+        self.overlap_mode = _ComboBox()
+        for key, label in OVERLAP_MODES:
+            self.overlap_mode.addItem(label, key)
+        cur_ov = normalize_overlap_mode(getattr(s, "overlap_mode", "off"))
+        self.overlap_mode.setCurrentIndex(max(0, self.overlap_mode.findData(cur_ov)))
+        self.overlap_mode.currentIndexChanged.connect(self._sync_overlap_ui)
+        self.overlap_mode_hint = _label("", "hint", wrap=True)
+        ov_lay.addLayout(self._field("Separate overlapping voices", self.overlap_mode))
+        ov_lay.addWidget(self.overlap_mode_hint)
+
+        self.overlap_model = _ComboBox()
+        self.overlap_model.setEditable(True)
+        self.overlap_model.setInsertPolicy(QComboBox.NoInsert)
+        self._ov_model_label_to_id: dict[str, str] = {}
+        for mid, mlabel in OVERLAP_AUDIO_MODELS:
+            self.overlap_model.addItem(mlabel, mid)
+            self._ov_model_label_to_id[mlabel] = mid
+        cur_ovm = (getattr(s, "overlap_audio_model", DEFAULT_OVERLAP_AUDIO_MODEL) or DEFAULT_OVERLAP_AUDIO_MODEL).strip()
+        idx_ovm = self.overlap_model.findData(cur_ovm)
+        if idx_ovm >= 0:
+            self.overlap_model.setCurrentIndex(idx_ovm)
+        else:
+            self.overlap_model.setEditText(cur_ovm)
+        self.overlap_model.currentTextChanged.connect(self._sync_overlap_model_hint)
+        self.overlap_model_hint = _label("", "hint", wrap=True)
+        self.overlap_model_box = QWidget()
+        omb = QVBoxLayout(self.overlap_model_box)
+        omb.setContentsMargins(0, 2, 0, 0)
+        omb.setSpacing(4)
+        omb.addLayout(self._field("Overlap audio model", self.overlap_model))
+        omb.addWidget(self.overlap_model_hint)
+        ov_lay.addWidget(self.overlap_model_box)
+        pl.addLayout(self._section("Overlapping speech (optional)", ov_card))
+        self._sync_overlap_ui()
+
         # Personal dictionary card
         v_card, v_lay = self._card()
         self._vocab_value = getattr(s, "custom_vocabulary", "")
@@ -1076,15 +1114,49 @@ class SettingsDialog(QDialog):
             self.set_vocabulary(dlg.vocabulary_string())
 
     def _sync_llm_enabled(self):
-        on = (
+        text_on = (
             self.cleanup.isChecked()
             or (hasattr(self, "dictation_cleanup") and self.dictation_cleanup.isChecked())
             or (hasattr(self, "compose_hotkey") and bool(self._hotkey_text(self.compose_hotkey)))
         )
-        for w in (self.key_box, self.model_box, self.fillers):
-            w.setEnabled(on)
+        ov_on = (
+            hasattr(self, "overlap_mode")
+            and normalize_overlap_mode(self.overlap_mode.currentData()) != "off"
+        )
+        self.key_box.setEnabled(text_on or ov_on)
+        for w in (self.model_box, self.fillers):
+            w.setEnabled(text_on)
         if hasattr(self, "_fillers_row"):
-            self._fillers_row.setEnabled(on)
+            self._fillers_row.setEnabled(text_on)
+
+    def selected_overlap_audio_model(self) -> str:
+        raw = self.overlap_model.currentText().strip()
+        if not raw:
+            return DEFAULT_OVERLAP_AUDIO_MODEL
+        return self._ov_model_label_to_id.get(raw, raw)
+
+    def _sync_overlap_model_hint(self):
+        mid = self.selected_overlap_audio_model()
+        if mid.lower() == "auto":
+            self.overlap_model_hint.setText(
+                "Separate audio-only chain (Gemini 3.6 Flash -> 4 Hydrogen -> 3.5 Flash-Lite) independent of your text model."
+            )
+        else:
+            self.overlap_model_hint.setText(
+                f"Pinned to {mid} for audio overlap separation only (requires a Gemini model with audio input)."
+            )
+
+    def _sync_overlap_ui(self):
+        mode = normalize_overlap_mode(self.overlap_mode.currentData())
+        hints = {
+            "off": "Off by default. Audio stays 100% local on your PC.",
+            "manual": "Click any overlap badge to separate voices with Gemini Audio (requires Identify speakers). Sends that short clip + brief speaker voice samples.",
+            "auto": "Automatically separates heavy overlaps in the background (+ clickable badges). Sends short overlapping clips + brief speaker voice samples.",
+        }
+        self.overlap_mode_hint.setText(hints.get(mode, ""))
+        self.overlap_model_box.setEnabled(mode != "off")
+        self._sync_overlap_model_hint()
+        self._sync_llm_enabled()
 
     def selected_llm_model(self) -> str:
         raw = self.model.currentText().strip()
@@ -1157,6 +1229,8 @@ class SettingsDialog(QDialog):
         s.llm_model = self.selected_llm_model() or s.llm_model
         s.cleanup = self.cleanup.isChecked()
         s.keep_fillers = self.fillers.isChecked()
+        s.overlap_mode = normalize_overlap_mode(self.overlap_mode.currentData())
+        s.overlap_audio_model = self.selected_overlap_audio_model() or DEFAULT_OVERLAP_AUDIO_MODEL
         s.custom_vocabulary = self.vocabulary()
         s.save_audio = self.audio.isChecked()
         s.diarize = self.diarize.isChecked()

@@ -239,25 +239,50 @@ def _speaker_badge(spk: str, esc, spk_id: str = "", item_ref: str = "") -> str:
             f'text-decoration:none">{esc(spk)}</a>&nbsp; ')
 
 
-def _overlap_badge(overlap: bool) -> str:
+def _overlap_badge(overlap: bool, ov_state: str = "", ov_tid: int = None, clickable: bool = False) -> str:
+    if ov_state == "resolving":
+        return ('<span dir="ltr" title="Separating overlapping voices with Gemini Audio…" '
+                'style="color:#a1a1aa;background:rgba(255,255,255,14);'
+                'border-radius:4px;padding:0 5px;font-size:10px;font-weight:600">'
+                'separating…</span>&nbsp; ')
+    if ov_state == "resolved":
+        return ('<span dir="ltr" title="Separated from overlapping speech with Gemini Audio '
+                '(check show raw for original local ASR)" '
+                'style="color:#6ee7b7;background:rgba(110,231,183,24);'
+                'border-radius:4px;padding:0 5px;font-size:10px;font-weight:600">'
+                'separated</span>&nbsp; ')
     if not overlap:
         return ""
+    if clickable and ov_tid is not None:
+        return (f'<a href="ov:{int(ov_tid)}" '
+                'title="Click to separate overlapping voices with Gemini Audio" '
+                'style="color:#f59e0b;background:rgba(245,158,11,42);'
+                'border-radius:4px;padding:0 5px;font-size:10px;font-weight:600;'
+                'text-decoration:none">overlap ✦</a>&nbsp; ')
     return ('<span dir="ltr" title="Multiple speakers talked at the same time here" '
             'style="color:#f59e0b;background:rgba(245,158,11,36);'
             'border-radius:4px;padding:0 5px;font-size:10px;font-weight:600">'
             'overlap</span>&nbsp; ')
 
 
-def transcript_html(snap: dict, show_raw: bool, rtl: bool = False) -> str:
+def transcript_html(snap: dict, show_raw: bool, rtl: bool = False,
+                    resolvable_overlap_ids: set[int] = None) -> str:
     esc = html.escape
     multi = bool(snap.get("multi_speaker"))
+    ov_clickable = resolvable_overlap_ids or set()
     dir_attr = 'dir="rtl" align="right"' if rtl else 'dir="ltr"'
     out = []
     for p in snap["paragraphs"]:
         pid = p.get("id")
         pref = f"p:{pid}" if pid is not None else ""
         badge = _speaker_badge(p.get("speaker", ""), esc, p.get("speaker_id", ""), item_ref=pref) if multi else ""
-        ov = _overlap_badge(bool(p.get("overlap")))
+        ov_tid = p.get("overlap_tid")
+        ov = _overlap_badge(
+            bool(p.get("overlap")),
+            ov_state=p.get("overlap_state", ""),
+            ov_tid=ov_tid,
+            clickable=(ov_tid is not None and ov_tid in ov_clickable),
+        )
         t_html = f'<span dir="ltr" style="color:#7d7d7d;font-size:11px">{esc(p["time"])}</span>'
         head = f'{badge}{ov}{t_html}'
         if p["status"] == "cleaning":
@@ -279,7 +304,13 @@ def transcript_html(snap: dict, show_raw: bool, rtl: bool = False) -> str:
         xid = x.get("id")
         xref = f"l:{xid}" if xid is not None else ""
         badge = _speaker_badge(x.get("speaker", ""), esc, x.get("speaker_id", ""), item_ref=xref) if multi else ""
-        ov = _overlap_badge(bool(x.get("overlap")))
+        ov_tid = x.get("overlap_tid")
+        ov = _overlap_badge(
+            bool(x.get("overlap")),
+            ov_state=x.get("overlap_state", ""),
+            ov_tid=ov_tid,
+            clickable=(ov_tid is not None and ov_tid in ov_clickable),
+        )
         t_html = f'<span dir="ltr" style="color:#7d7d7d;font-size:11px">{esc(x["t"])}</span>'
         out.append(f'<p style="margin:0 0 2px 0" {dir_attr}>{badge}{ov}{t_html}</p>'
                    f'<p style="margin:0 0 6px 0" {dir_attr}>{esc(x["text"])}</p>')
@@ -1530,6 +1561,18 @@ class EloquentWidget(QWidget):
             self.caption_reset.start()
         elif kind == "paste_done":
             self._on_paste_done(*data)
+        elif kind == "overlap_resolved":
+            self._mark_dirty()
+            if data and not data.get("auto") and self.engine.status == "idle" and not self.quitting:
+                n_turns = int(data.get("count") or 1)
+                self._caption(f"Separated overlapping speech ({n_turns} turn{'s' if n_turns != 1 else ''})", "hint")
+                self.caption_reset.start()
+        elif kind == "overlap_error":
+            self._mark_dirty()
+            _tid, err_msg, is_auto = data
+            if not is_auto and err_msg and not self.quitting:
+                self._caption(err_msg, "error")
+                self.caption_reset.start()
         elif kind in ("llm", "error"):
             self._update_llm_label()
             if self.engine.status == "idle" and not self.quitting:
@@ -2109,7 +2152,10 @@ class EloquentWidget(QWidget):
             sb = self.view.verticalScrollBar()
             at_bottom = sb.value() >= sb.maximum() - 30
             keep = sb.value()
-            self.view.setHtml(transcript_html(snap, self.show_raw, rtl=rtl))
+            self.view.setHtml(transcript_html(
+                snap, self.show_raw, rtl=rtl,
+                resolvable_overlap_ids=self.engine.resolvable_overlap_ids(),
+            ))
             if self._scroll_to_top_once:
                 self._scroll_to_top_once = False
                 sb.setValue(0)
@@ -2259,6 +2305,19 @@ class EloquentWidget(QWidget):
         return spk_id, item_kind, item_id
 
     def _on_anchor(self, url: QUrl):
+        raw = url.toString()
+        if raw.startswith("ov:"):
+            try:
+                turn_id = int(raw[3:])
+            except ValueError:
+                return
+            ok, msg = self.engine.resolve_overlap(turn_id, auto=False)
+            if ok:
+                self._rebuild()
+            elif msg:
+                self._caption(msg, "error" if "key" in msg.lower() else "hint")
+                self.caption_reset.start()
+            return
         spk_id, item_kind, item_id = self._parse_speaker_url(url)
         if not spk_id:
             return

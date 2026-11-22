@@ -66,28 +66,38 @@ class Cleaner(threading.Thread):
             if not segs:
                 return None
             now = time.time()
-            # Wait briefly (~6.0s max) for background diarizer before locking a chunk into a paragraph
+            # Wait briefly (~6.0s max) for background diarizer or automatic overlap separation
             ready_n = 0
             for s in segs:
-                if not self.flushing and not s.get("spk_ready", True) and (now - s["ts"]) < 6.0:
+                if not self.flushing and (
+                    not s.get("spk_ready", True) or s.get("overlap_state") == "resolving"
+                ) and (now - s["ts"]) < 6.0:
                     break
                 ready_n += 1
             if ready_n == 0:
                 return None
 
             first_spk = segs[0].get("speaker", "")
+            first_ov = bool(segs[0].get("overlap", False))
+            first_ov_st = segs[0].get("overlap_state", "")
             same_n = 0
             for s in segs[:ready_n]:
-                if same_n > 0 and s.get("speaker", "") != first_spk:
+                if same_n > 0 and (
+                    s.get("speaker", "") != first_spk
+                    or bool(s.get("overlap", False)) != first_ov
+                    or s.get("overlap_state", "") != first_ov_st
+                ):
                     break
                 same_n += 1
+            if first_ov or first_ov_st == "resolved":
+                same_n = 1
             speaker_switch = same_n < ready_n
 
             if self.compose and not self.flushing:
                 return None
 
             take = same_n
-            if self.flushing or speaker_switch:
+            if self.flushing or speaker_switch or first_ov_st == "resolved":
                 take = take if self.compose else min(take, self.max_seg)
             else:
                 grp = segs[:same_n]
@@ -109,16 +119,30 @@ class Cleaner(threading.Thread):
             del segs[:take]
             raw = _join_raw_segments(chunk, preserve_pauses=(self.dictation or self.compose))
             break_before = bool(chunk and chunk[0].get("gap_before", 0.0) >= DICTATION_PAUSE_SEC)
-            para = {
-                "id": st.next_id, "time": chunk[0]["t"], "raw": raw, "clean": None,
-                "tokens": None, "status": "cleaning" if self.provider else "raw",
-                "note": "", "speaker": first_spk, "break_before": break_before,
-                "overlap": any(s.get("overlap") for s in chunk),
-                "seg_ids": [s["id"] for s in chunk],
-                "segs": [{"id": s["id"], "t": s["t"], "text": s["text"],
-                          "speaker": s.get("speaker", ""), "overlap": bool(s.get("overlap"))}
-                         for s in chunk],
-            }
+            already_resolved = (first_ov_st == "resolved" and len(chunk) == 1)
+            if already_resolved:
+                clean_txt = chunk[0]["text"].strip()
+                orig_raw = (chunk[0].get("raw_overlap") or clean_txt).strip()
+                para = {
+                    "id": st.next_id, "time": chunk[0]["t"], "raw": orig_raw, "clean": clean_txt,
+                    "tokens": [(w, False) for w in clean_txt.split()], "status": "done",
+                    "note": "", "speaker": first_spk, "break_before": break_before,
+                    "overlap": False, "overlap_state": "resolved",
+                    "seg_ids": [chunk[0]["id"]],
+                }
+            else:
+                para = {
+                    "id": st.next_id, "time": chunk[0]["t"], "raw": raw, "clean": None,
+                    "tokens": None, "status": "cleaning" if self.provider else "raw",
+                    "note": "", "speaker": first_spk, "break_before": break_before,
+                    "overlap": any(s.get("overlap") for s in chunk),
+                    "overlap_state": first_ov_st,
+                    "seg_ids": [s["id"] for s in chunk],
+                    "segs": [{"id": s["id"], "t": s["t"], "text": s["text"],
+                              "speaker": s.get("speaker", ""), "overlap": bool(s.get("overlap")),
+                              "overlap_state": s.get("overlap_state", "")}
+                             for s in chunk],
+                }
             st.next_id += 1
             st.paragraphs.append(para)
         st.touch("paragraph", para["id"])
@@ -213,6 +237,10 @@ class Cleaner(threading.Thread):
                     break
                 time.sleep(0.2)
                 continue
+            if para.get("status") == "done" and para.get("overlap_state") == "resolved":
+                if not self.abort and self.session is not None:
+                    self.session.add_clean(para["clean"] or para["raw"])
+                continue
             raw = para["raw"]
             if self.provider is None:
                 fixed = apply_learned_replacements(raw, self.custom_vocabulary) if self.custom_vocabulary else raw
@@ -220,14 +248,19 @@ class Cleaner(threading.Thread):
             else:
                 result, note = self._clean(raw, self._context(para), self._upcoming_context(para))
             tokens = mark_changes(raw, result) if result else None   # outside the lock
+            replaced = False
             with self.state.lock:
-                if para["raw"] != raw:
+                if para not in self.state.paragraphs:
+                    replaced = True
+                elif para["raw"] != raw:
                     if para.get("status") == "cleaning":
                         para["status"] = "raw"
                 elif result:
                     para.update(clean=result, tokens=tokens, status="done")
                 else:
                     para.update(status="raw", note=note)
+            if replaced:
+                continue
             self.state.touch("paragraph", para["id"])
             if not self.abort and self.session is not None:
                 self.session.add_clean(result or raw)
