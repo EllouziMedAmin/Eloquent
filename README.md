@@ -17,9 +17,9 @@ Built for **voice dictation into any app, Ask AI writing at your cursor, meeting
 
 Optionally, a free **Google AI Studio (Gemini API)** key powers smart Free-Tier routing (`Auto` across Gemini 3.5/3.6 Flash, Flash-Lite, and Gemma 4 with automatic rate-limit fallback) to polish transcripts in the background, power **Dictate** / **Ask AI at cursor**, and generate **Meeting Minutes, Lecture Notes (with LaTeX math), Summaries, Bullet Points, or Reports** at the end of a session.
 
-<!-- Add your 20s demo GIF or video here:
-![Eloquent Demo](docs/demo.gif)
--->
+<p align="center">
+  <img src="docs/demo.gif" alt="Eloquent Demo" width="780">
+</p>
 
 ---
 
