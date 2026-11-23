@@ -241,12 +241,12 @@ def _speaker_badge(spk: str, esc, spk_id: str = "", item_ref: str = "") -> str:
 
 def _overlap_badge(overlap: bool, ov_state: str = "", ov_tid: int = None, clickable: bool = False) -> str:
     if ov_state == "resolving":
-        return ('<span dir="ltr" title="Separating overlapping voices with Gemini Audio…" '
+        return ('<span dir="ltr" title="Separating overlapping voices with AI audio…" '
                 'style="color:#a1a1aa;background:rgba(255,255,255,14);'
                 'border-radius:4px;padding:0 5px;font-size:10px;font-weight:600">'
                 'separating…</span>&nbsp; ')
     if ov_state == "resolved":
-        return ('<span dir="ltr" title="Separated from overlapping speech with Gemini Audio '
+        return ('<span dir="ltr" title="Separated from overlapping speech with AI audio '
                 '(check show raw for original local ASR)" '
                 'style="color:#6ee7b7;background:rgba(110,231,183,24);'
                 'border-radius:4px;padding:0 5px;font-size:10px;font-weight:600">'
@@ -255,7 +255,7 @@ def _overlap_badge(overlap: bool, ov_state: str = "", ov_tid: int = None, clicka
         return ""
     if clickable and ov_tid is not None:
         return (f'<a href="ov:{int(ov_tid)}" '
-                'title="Click to separate overlapping voices with Gemini Audio" '
+                'title="Click to separate overlapping voices with AI audio" '
                 'style="color:#f59e0b;background:rgba(245,158,11,42);'
                 'border-radius:4px;padding:0 5px;font-size:10px;font-weight:600;'
                 'text-decoration:none">overlap ✦</a>&nbsp; ')
